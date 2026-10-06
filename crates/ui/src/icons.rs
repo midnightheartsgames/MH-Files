@@ -95,6 +95,37 @@ pub fn grid(painter: &Painter, rect: Rect, color: Color32) {
     }
 }
 
+/// Колонки Миллера: три столбца, последний — со стрелкой вглубь.
+pub fn columns(painter: &Painter, rect: Rect, color: Color32) {
+    let frame = Rect::from_min_max(p(rect, 0.04, 0.12), p(rect, 0.96, 0.88));
+    painter.rect_stroke(frame, CornerRadius::same(2), stroke(rect, color), egui_inside());
+    for x in [0.35, 0.65] {
+        polyline(painter, rect, color, &[(x, 0.14), (x, 0.86)]);
+    }
+    polyline(painter, rect, color, &[(0.76, 0.38), (0.86, 0.5), (0.76, 0.62)]);
+}
+
+/// Архив: коробка с «молнией».
+pub fn archive(painter: &Painter, rect: Rect, color: Color32) {
+    let body = Rect::from_min_max(p(rect, 0.14, 0.18), p(rect, 0.86, 0.9));
+    painter.rect_stroke(body, CornerRadius::same(2), stroke(rect, color), egui_inside());
+    for (i, y) in [0.28, 0.42, 0.56].into_iter().enumerate() {
+        let x = if i % 2 == 0 { 0.44 } else { 0.56 };
+        polyline(painter, rect, color, &[(x, y), (x, y + 0.08)]);
+    }
+    let lock = Rect::from_min_max(p(rect, 0.4, 0.66), p(rect, 0.6, 0.8));
+    painter.rect_stroke(lock, CornerRadius::same(1), stroke(rect, color), egui_inside());
+}
+
+/// Дубликаты: два листа со сдвигом.
+pub fn duplicates(painter: &Painter, rect: Rect, color: Color32) {
+    let back = Rect::from_min_max(p(rect, 0.3, 0.08), p(rect, 0.9, 0.7));
+    let front = Rect::from_min_max(p(rect, 0.1, 0.3), p(rect, 0.7, 0.92));
+    painter.rect_stroke(back, CornerRadius::same(2), stroke(rect, color), egui_inside());
+    painter.rect_filled(front, CornerRadius::same(2), theme::PANEL);
+    painter.rect_stroke(front, CornerRadius::same(2), stroke(rect, color), egui_inside());
+}
+
 fn egui_inside() -> eframe::egui::StrokeKind {
     eframe::egui::StrokeKind::Inside
 }

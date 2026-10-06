@@ -86,7 +86,12 @@ commands! {
     ClearSelection => "Снять выделение", ["deselect"], [];
     QuickLook => "Быстрый просмотр", ["preview", "quick look"], ["Space"];
     ViewDetails => "Вид: таблица", ["details", "list"], ["Ctrl+1"];
-    ViewGrid => "Вид: плитки", ["grid", "thumbnails"], ["Ctrl+2"];
+        ViewGrid => "Вид: плитки", ["grid", "thumbnails"], ["Ctrl+2"];
+    ViewColumns => "Вид: колонки", ["columns", "miller", "колонки миллера"], ["Ctrl+3"];
+    Extract => "Извлечь…", ["extract", "unzip", "распаковать"], ["Ctrl+Shift+E"];
+    ExtractHere => "Извлечь в папку рядом", ["extract here", "unzip here", "распаковать сюда"], [];
+    FindDuplicates => "Найти дубликаты", ["duplicates", "дубли", "одинаковые"], [];
+    SelectExtraCopies => "Отметить лишние копии", ["select duplicates", "лишние"], [];
     ToggleHidden => "Показывать скрытые", ["hidden"], ["Ctrl+H"];
     ToggleInspector => "Инспектор", ["inspector", "preview pane"], ["Alt+P"];
     ToggleSidebar => "Боковая панель", ["sidebar"], ["Ctrl+B"];

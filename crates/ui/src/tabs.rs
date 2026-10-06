@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use mh_files_core::Entry;
+use mh_files_core::duplicates::Group;
 use mh_files_core::history::History;
 use mh_files_core::layout::PaneId;
 use mh_files_core::listing::{Listing, LoadState, ViewOptions};
@@ -12,7 +13,10 @@ use mh_files_core::location::Location;
 use mh_files_core::selection::Selection;
 use mh_files_core::session::{TabSession, ViewMode};
 use mh_files_core::sort::{SortColumn, SortOrder};
-use mh_files_fs::{CancelToken, DirWatch, IndexResults, Indexer, SearchQuery, Ticket, Workers};
+use mh_files_fs::{
+    CancelToken, DirWatch, DuplicateOptions, DuplicateProgress, IndexResults, Indexer, SearchQuery,
+    Ticket, Workers,
+};
 
 /// Как часто досортировывать список, пока он ещё грузится.
 const REFRESH_EVERY: Duration = Duration::from_millis(120);
@@ -75,6 +79,19 @@ impl IndexView {
     }
 }
 
+/// Поиск дубликатов во вкладке.
+#[derive(Debug, Clone, Default)]
+pub struct DuplicatesView {
+    pub progress: Option<DuplicateProgress>,
+    pub groups: Vec<Group>,
+    /// Номер группы каждого файла — для полос в списке.
+    pub group_of: std::collections::HashMap<PathBuf, usize>,
+    pub error: Option<String>,
+    pub done: bool,
+    /// Какую копию оставлять при «Отметить лишние».
+    pub keep: mh_files_core::duplicates::Keep,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchProgress {
     pub scanned: usize,
@@ -97,6 +114,12 @@ pub struct Tab {
     pub focus_address: bool,
     pub search: Option<SearchProgress>,
     pub index: Option<IndexView>,
+    pub duplicates: Option<DuplicatesView>,
+    /// Вид «Колонки»: какое место было в каждой колонке в прошлом кадре — чтобы прокрутить
+    /// колонку к дороге сюда только при смене места.
+    pub columns_shown: Vec<Option<Location>>,
+    /// Встать на первую строку, когда список загрузится (вход в папку стрелкой вправо).
+    pub select_first: bool,
     /// Вид списка, как его задали настройки и пользователь. Поиск по дискам показывает
     /// скрытое независимо от него (см. [`options_for`]).
     pub options: ViewOptions,
@@ -132,7 +155,11 @@ pub struct Tab {
 }
 
 impl Tab {
-    pub fn new(id: u64, location: Location, view: ViewMode, options: ViewOptions) -> Tab {
+    pub fn new(id: u64, location: Location, view: ViewMode, mut options: ViewOptions) -> Tab {
+        // Новая вкладка поиска или дубликатов — в порядке выдачи.
+        if ranked(&location) && options.sort == SortOrder::default() {
+            options.sort = SortOrder { column: SortColumn::Relevance, descending: false };
+        }
         let listing = Listing::new(options_for(&location, options));
         Tab {
             id,
@@ -149,6 +176,9 @@ impl Tab {
             focus_address: false,
             search: None,
             index: None,
+            duplicates: None,
+            columns_shown: Vec::new(),
+            select_first: false,
             rename: None,
             scroll_to: None,
             grid_columns: 1,
@@ -203,20 +233,19 @@ impl Tab {
             self.reload(workers, true);
             return;
         }
-        // Поднимаясь выше, выделить папку, из которой пришли.
-        self.pending_select = match (&self.location, &location) {
-            (Location::Dir(from), Location::Dir(to)) if from.parent() == Some(to.as_path()) => {
-                Some(from.clone())
-            }
-            (Location::Dir(from), Location::Computer) if from.parent().is_none() => None,
-            _ => None,
+        // Поднимаясь выше, выделить папку (или архив), из которой пришли.
+        self.pending_select = if self.location.parent().as_ref() == Some(&location) {
+            self.location.own_path()
+        } else {
+            None
         };
+        self.select_first = false;
         if record {
             self.history.visit(self.location.clone());
         }
-        // Выдача поиска по дискам упорядочена по совпадению; в папках — обычная сортировка.
-        let to_index = matches!(location, Location::Index { .. });
-        if to_index != matches!(self.location, Location::Index { .. }) {
+        // Выдача поиска по дискам и дубликаты упорядочены сами; в папках — обычная сортировка.
+        let to_index = ranked(&location);
+        if to_index != ranked(&self.location) {
             if to_index {
                 self.options.sort = SortOrder { column: SortColumn::Relevance, descending: false };
             } else if self.options.sort.column == SortColumn::Relevance {
@@ -271,6 +300,27 @@ impl Tab {
                 let query = SearchQuery { text: query, include_hidden: self.options.show_hidden };
                 self.cancel = Some(workers.search(ticket, root, query));
             }
+            Location::Archive { archive, inner } => {
+                self.watch = None;
+                if soft && self.listing.state != LoadState::Loading {
+                    self.staging = Some(Vec::new());
+                } else {
+                    self.staging = None;
+                    self.listing.reset();
+                }
+                self.cancel = Some(workers.list_archive(ticket, archive, inner));
+            }
+            Location::Duplicates { roots } => {
+                self.watch = None;
+                self.staging = None;
+                self.listing.reset();
+                self.duplicates = Some(DuplicatesView::default());
+                let options = DuplicateOptions {
+                    include_hidden: self.options.show_hidden,
+                    ..DuplicateOptions::default()
+                };
+                self.cancel = Some(workers.duplicates(ticket, roots, options));
+            }
             Location::Index { query } => {
                 // Сам поиск запускает окно в конце кадра: у вкладки нет доступа к индексу.
                 self.watch = None;
@@ -291,6 +341,90 @@ impl Tab {
         if !matches!(self.location, Location::Index { .. }) {
             self.index = None;
         }
+        if !matches!(self.location, Location::Duplicates { .. }) {
+            self.duplicates = None;
+        }
+    }
+
+    pub fn on_duplicates_progress(&mut self, ticket: Ticket, progress: DuplicateProgress) {
+        if self.current(ticket)
+            && let Some(view) = &mut self.duplicates
+        {
+            view.progress = Some(progress);
+        }
+    }
+
+    pub fn on_duplicates_done(&mut self, ticket: Ticket, result: Result<Vec<Group>, String>) {
+        if !self.current(ticket) {
+            return;
+        }
+        self.cancel = None;
+        let Some(view) = &mut self.duplicates else { return };
+        view.done = true;
+        let groups = match result {
+            Ok(groups) => groups,
+            Err(error) => {
+                view.error = Some(error);
+                Vec::new()
+            }
+        };
+        let mut entries = Vec::new();
+        for (number, group) in groups.iter().enumerate() {
+            for member in &group.files {
+                let parent: std::sync::Arc<std::path::Path> =
+                    std::sync::Arc::from(member.path.parent().unwrap_or(&member.path));
+                let name = member.path.file_name().unwrap_or_default().to_string_lossy();
+                view.group_of.insert(member.path.clone(), number);
+                entries.push(Entry {
+                    name: name.into_owned(),
+                    parent,
+                    kind: mh_files_core::EntryKind::File,
+                    size: group.size,
+                    modified: member.modified,
+                    created: None,
+                    attributes: Default::default(),
+                });
+            }
+        }
+        view.groups = groups;
+        self.listing.replace(entries);
+        self.listing.state = LoadState::Done;
+        self.after_change();
+    }
+
+    /// Убрать из результатов исчезнувшие файлы (удалили лишние копии). Группы, где осталась
+    /// одна копия, уходят целиком.
+    pub fn forget_paths(&mut self, gone: &[PathBuf]) {
+        let Some(view) = &mut self.duplicates else { return };
+        if gone.is_empty() {
+            return;
+        }
+        for group in &mut view.groups {
+            group.files.retain(|m| !gone.contains(&m.path));
+        }
+        let lonely: Vec<PathBuf> = view
+            .groups
+            .iter()
+            .filter(|g| g.files.len() < 2)
+            .flat_map(|g| g.files.iter().map(|m| m.path.clone()))
+            .collect();
+        view.groups.retain(|g| g.files.len() > 1);
+        view.group_of.clear();
+        for (number, group) in view.groups.iter().enumerate() {
+            for member in &group.files {
+                view.group_of.insert(member.path.clone(), number);
+            }
+        }
+        for path in gone.iter().chain(&lonely) {
+            self.listing.remove(path);
+        }
+        self.listing.refresh();
+        self.after_change();
+    }
+
+    /// Применить отложенное выделение сразу, если объект уже в списке.
+    pub fn reveal_pending(&mut self) {
+        self.after_change();
     }
 
     /// Новый текст в поле поиска по дискам. История не пополняется на каждую букву.
@@ -473,6 +607,12 @@ impl Tab {
             self.scroll_to = Some(row);
             self.pending_select = None;
         }
+        if self.select_first && !self.listing.is_empty() {
+            self.select_first = false;
+            if self.selection.cursor().is_none() {
+                self.cursor_to(0, Default::default());
+            }
+        }
         self.selection.retain_visible(&self.listing);
         if self.listing.state != LoadState::Loading {
             self.pending_select = None;
@@ -549,6 +689,11 @@ impl Tab {
 
 /// В поиске по дискам скрытое отбирает сам индекс (с учётом `hidden:да` в запросе), список
 /// показывает всё, что пришло.
+/// Места, где порядок задаёт выдача, а не сортировка.
+fn ranked(location: &Location) -> bool {
+    matches!(location, Location::Index { .. } | Location::Duplicates { .. })
+}
+
 fn options_for(location: &Location, mut options: ViewOptions) -> ViewOptions {
     if matches!(location, Location::Index { .. }) {
         options.show_hidden = true;

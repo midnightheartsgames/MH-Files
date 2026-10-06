@@ -152,6 +152,18 @@ pub fn decode_scaled(path: &Path, max_side: u32, limit: u64) -> Result<Bitmap, S
     Ok(Bitmap { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() })
 }
 
+/// То же для картинки в памяти (из архива, страница PDF).
+pub fn decode_bytes(bytes: &[u8], max_side: u32) -> Result<Bitmap, String> {
+    let image = image::load_from_memory(bytes).map_err(|e| e.to_string())?;
+    let image = if image.width() > max_side || image.height() > max_side {
+        image.thumbnail(max_side, max_side)
+    } else {
+        image
+    };
+    let rgba = image.to_rgba8();
+    Ok(Bitmap { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() })
+}
+
 /// Размеры картинки по заголовку, без декодирования.
 pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()

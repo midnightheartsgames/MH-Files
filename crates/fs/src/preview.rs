@@ -4,9 +4,10 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mh_files_platform::thumbs::{self, Bitmap, ImageMode};
+use mh_files_platform::{media, pdf};
 
-use crate::CancelToken;
-use crate::images::{decodable, decode_scaled, dimensions};
+use crate::images::{decodable, decode_bytes, decode_scaled, dimensions};
+use crate::{CancelToken, archive};
 
 #[derive(Debug, Clone)]
 pub struct PreviewRequest {
@@ -18,6 +19,8 @@ pub struct PreviewRequest {
     pub text_limit: usize,
     /// Картинки больше — не декодировать.
     pub image_limit: u64,
+    /// Страница многостраничного документа (PDF), с нуля.
+    pub page: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -26,6 +29,18 @@ pub enum Preview {
         bitmap: Bitmap,
         /// Исходные размеры, если известны.
         dimensions: Option<(u32, u32)>,
+        /// Документ со страницами: показанная страница (с нуля) и сколько всего.
+        pages: Option<(u32, u32)>,
+        /// Свойства из Windows: длительность, кадр, исполнитель, камера…
+        info: Vec<(String, String)>,
+    },
+    /// Картинки нет, но есть свойства (аудио без обложки, документ).
+    Info(Vec<(String, String)>),
+    /// Архив: сколько внутри и сколько займёт распакованным.
+    Archive {
+        dirs: usize,
+        files: usize,
+        bytes: u64,
     },
     Text {
         text: String,
@@ -49,25 +64,149 @@ pub enum Preview {
 const FOLDER_LIMIT: usize = 50_000;
 
 pub fn load(request: &PreviewRequest, cancel: &CancelToken) -> Preview {
+    // Записи архива: такого пути на диске нет.
+    if std::fs::symlink_metadata(&request.path).is_err()
+        && let Some((archive, inner)) = archive::split(&request.path)
+    {
+        return in_archive(request, &archive, &inner);
+    }
     if request.is_dir {
         return folder(&request.path, cancel);
     }
     let name = request.path.file_name().unwrap_or_default().to_string_lossy();
     let ext = mh_files_core::entry::extension_of(&name);
-    if decodable(&ext) {
-        return match decode_scaled(&request.path, request.max_side, request.image_limit) {
-            Ok(bitmap) => Preview::Image { bitmap, dimensions: dimensions(&request.path) },
+    if archive::is_archive_ext(&ext) {
+        return match archive::folder_totals(&request.path, "") {
+            Ok((dirs, files, bytes)) => Preview::Archive { dirs, files, bytes },
             Err(error) => Preview::Error(error),
         };
+    }
+    if decodable(&ext) {
+        return match decode_scaled(&request.path, request.max_side, request.image_limit) {
+            Ok(bitmap) => Preview::Image {
+                bitmap,
+                dimensions: dimensions(&request.path),
+                pages: None,
+                info: info(&request.path, &ext),
+            },
+            Err(error) => Preview::Error(error),
+        };
+    }
+    if ext == "pdf"
+        && let Ok(preview) = pdf_page(request)
+    {
+        return preview;
     }
     if text_like(&ext) || sniff_text(&request.path) {
         return text(&request.path, request.text_limit);
     }
-    // Видео, PDF, документы — эскиз Shell, если для типа есть обработчик.
+    // Видео, аудио, документы — эскиз Shell (кадр, обложка, первая страница) и свойства.
+    let info = info(&request.path, &ext);
     match thumbs::shell_image(&request.path, request.max_side, ImageMode::Thumbnail) {
-        Ok(bitmap) => Preview::Image { bitmap, dimensions: None },
+        Ok(bitmap) => Preview::Image { bitmap, dimensions: None, pages: None, info },
+        Err(_) if !info.is_empty() => Preview::Info(info),
         Err(_) => Preview::None("предпросмотр для этого типа не поддерживается".into()),
     }
+}
+
+/// Свойства из Windows — для медиа, фото и документов; у прочего их не спрашиваем: на
+/// каждом файле это лишнее обращение к обработчикам свойств.
+fn info(path: &Path, ext: &str) -> Vec<(String, String)> {
+    if !has_properties(ext) {
+        return Vec::new();
+    }
+    media::media_info(path).unwrap_or_default()
+}
+
+pub fn has_properties(ext: &str) -> bool {
+    matches!(
+        ext,
+        "mp4"
+            | "mkv"
+            | "avi"
+            | "mov"
+            | "wmv"
+            | "webm"
+            | "m4v"
+            | "mpg"
+            | "mpeg"
+            | "ts"
+            | "flv"
+            | "3gp"
+            | "mp3"
+            | "flac"
+            | "wav"
+            | "ogg"
+            | "opus"
+            | "m4a"
+            | "aac"
+            | "wma"
+            | "aiff"
+            | "jpg"
+            | "jpeg"
+            | "heic"
+            | "tif"
+            | "tiff"
+            | "png"
+            | "webp"
+            | "cr2"
+            | "nef"
+            | "arw"
+            | "dng"
+            | "pdf"
+            | "docx"
+            | "doc"
+            | "xlsx"
+            | "xls"
+            | "pptx"
+            | "ppt"
+            | "odt"
+    )
+}
+
+/// Страница PDF встроенным в Windows движком.
+fn pdf_page(request: &PreviewRequest) -> Result<Preview, String> {
+    let (png, count) = pdf::render_page(&request.path, request.page, request.max_side)?;
+    let bitmap = decode_bytes(&png, request.max_side)?;
+    let page = request.page.min(count.saturating_sub(1));
+    let info = info(&request.path, "pdf");
+    Ok(Preview::Image { bitmap, dimensions: None, pages: Some((page, count)), info })
+}
+
+/// Предпросмотр записи архива: картинки и текст читаются в память, остальное — после
+/// извлечения.
+fn in_archive(request: &PreviewRequest, archive: &Path, inner: &str) -> Preview {
+    if request.is_dir {
+        return match archive::folder_totals(archive, inner) {
+            Ok((dirs, files, bytes)) => Preview::Archive { dirs, files, bytes },
+            Err(error) => Preview::Error(error),
+        };
+    }
+    let name = request.path.file_name().unwrap_or_default().to_string_lossy();
+    let ext = mh_files_core::entry::extension_of(&name);
+    if decodable(&ext) {
+        return match archive::read(archive, inner, request.image_limit)
+            .and_then(|bytes| decode_bytes(&bytes, request.max_side))
+        {
+            Ok(bitmap) => {
+                Preview::Image { bitmap, dimensions: None, pages: None, info: Vec::new() }
+            }
+            Err(error) => Preview::Error(error),
+        };
+    }
+    if text_like(&ext) {
+        let limit = request.text_limit as u64;
+        return match archive::read(archive, inner, limit.saturating_mul(64)) {
+            Ok(mut bytes) => {
+                let truncated = bytes.len() > request.text_limit;
+                bytes.truncate(request.text_limit);
+                let (text, encoding) = decode_text(&bytes);
+                Preview::Text { text, truncated, encoding }
+            }
+            Err(error) => Preview::Error(error),
+        };
+    }
+    Preview::None("файл в архиве — извлеките его (Ctrl+Shift+E), чтобы посмотреть".into())
 }
 
 fn folder(path: &Path, cancel: &CancelToken) -> Preview {
@@ -242,6 +381,7 @@ mod tests {
             max_side: 256,
             text_limit: 5,
             image_limit: 1 << 20,
+            page: 0,
         };
         let cancel = CancelToken::default();
         match load(&request(dir.clone(), true), &cancel) {

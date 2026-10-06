@@ -20,26 +20,35 @@ pub struct State {
     cancel: Option<CancelToken>,
     preview: Option<Preview>,
     texture: Option<TextureHandle>,
+    /// Страница PDF.
+    page: u32,
 }
 
 impl State {
     pub fn open(app: &FilesApp) -> State {
-        let mut state =
-            State { path: None, generation: 0, cancel: None, preview: None, texture: None };
-        state.request(app);
+        let mut state = State {
+            path: None,
+            generation: 0,
+            cancel: None,
+            preview: None,
+            texture: None,
+            page: 0,
+        };
+        state.request(app, None);
         state
     }
 
-    /// Запросить предпросмотр объекта под курсором.
-    fn request(&mut self, app: &FilesApp) {
+    /// Запросить предпросмотр объекта под курсором; `page` — другая страница того же PDF.
+    fn request(&mut self, app: &FilesApp, page: Option<u32>) {
         let tab = app.tab();
         let Some(path) = tab.selection.cursor().cloned().or_else(|| tab.targets().first().cloned())
         else {
             return;
         };
-        if self.path.as_ref() == Some(&path) {
+        if self.path.as_ref() == Some(&path) && page.is_none() {
             return;
         }
+        self.page = page.unwrap_or(0);
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }
@@ -54,6 +63,7 @@ impl State {
             max_side: 2048,
             text_limit: app.settings.preview.text_limit_kb as usize * 1024 * 4,
             image_limit: u64::from(app.settings.preview.image_limit_mb) * 1024 * 1024,
+            page: self.page,
         };
         let ticket = Ticket { owner: OWNER_QUICK, generation: self.generation };
         self.cancel = Some(app.workers.preview(ticket, request));
@@ -98,11 +108,12 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     if step != 0 {
         app.tab_mut().move_cursor(step, Modifiers::default());
         if let Some(mut quick) = app.quick.take() {
-            quick.request(app);
+            quick.request(app, None);
             app.quick = Some(quick);
         }
     }
-    let Some(quick) = app.quick.take() else { return };
+    let Some(mut quick) = app.quick.take() else { return };
+    let mut turn = None;
     let screen = ctx.content_rect();
     let mut keep = true;
     egui::Area::new(Id::new("quick-backdrop"))
@@ -157,7 +168,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                     });
                     ui.add_space(10.0);
                     let height = ui.available_height() - 10.0;
-                    preview_ui::show(
+                    turn = preview_ui::show(
                         ui,
                         quick.preview.as_ref(),
                         quick.texture.as_ref(),
@@ -166,6 +177,21 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                     );
                 });
         });
+    // PageUp/PageDown листают страницы PDF.
+    if let Some(Preview::Image { pages: Some((page, count)), .. }) = &quick.preview {
+        let (page, count) = (*page, *count);
+        ctx.input_mut(|i| {
+            if i.consume_key(egui::Modifiers::NONE, Key::PageDown) && page + 1 < count {
+                turn = Some(page + 1);
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::PageUp) && page > 0 {
+                turn = Some(page - 1);
+            }
+        });
+    }
+    if let Some(page) = turn {
+        quick.request(app, Some(page));
+    }
     if keep {
         app.quick = Some(quick);
     }

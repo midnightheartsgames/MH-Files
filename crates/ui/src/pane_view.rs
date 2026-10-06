@@ -43,6 +43,9 @@ pub fn show(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
     if matches!(tab.location, Location::Index { .. }) {
         index_bar(ui, tab, app);
     }
+    if matches!(tab.location, Location::Duplicates { .. }) {
+        duplicates_bar(ui, tab, app);
+    }
     let rect = ui.available_rect_before_wrap();
     let mut content =
         ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
@@ -95,6 +98,8 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             Location::Computer => icons::computer(&painter, icon, theme::TEXT_SECONDARY),
             Location::Search { .. } => icons::search(&painter, icon, theme::TEXT_SECONDARY),
             Location::Index { .. } => icons::search(&painter, icon, theme::accent()),
+            Location::Archive { .. } => icons::archive(&painter, icon, theme::accent()),
+            Location::Duplicates { .. } => icons::duplicates(&painter, icon, theme::accent()),
             Location::Dir(_) => icons::folder(&painter, icon, theme::accent().gamma_multiply(0.8)),
         }
         let close_rect =
@@ -237,15 +242,12 @@ fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app:
             tab.focus_filter = true;
         }
     }
+    // Кнопка показывает следующий вид по кругу: таблица → плитки → колонки.
+    type Icon = fn(&egui::Painter, Rect, Color32);
     let (icon, tip, next) = match tab.view {
-        ViewMode::Details => {
-            (icons::grid as fn(&egui::Painter, Rect, Color32), "Плитки (Ctrl+2)", ViewMode::Grid)
-        }
-        ViewMode::Grid => (
-            icons::list as fn(&egui::Painter, Rect, Color32),
-            "Таблица (Ctrl+1)",
-            ViewMode::Details,
-        ),
+        ViewMode::Details => (icons::grid as Icon, "Плитки (Ctrl+2)", ViewMode::Grid),
+        ViewMode::Grid => (icons::columns as Icon, "Колонки (Ctrl+3)", ViewMode::Columns),
+        ViewMode::Columns => (icons::list as Icon, "Таблица (Ctrl+1)", ViewMode::Details),
     };
     if widgets::icon_button(ui, true, tip, icon).clicked() {
         tab.view = next;
@@ -642,6 +644,73 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     }
 }
 
+/// Ход поиска дубликатов, итог и отметка лишних копий.
+fn duplicates_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
+    use mh_files_core::duplicates::{Keep, totals};
+    use mh_files_fs::DuplicateProgress;
+    let Some(view) = &mut tab.duplicates else { return };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
+    let (text, color) = if let Some(error) = &view.error {
+        (error.clone(), theme::WARN)
+    } else if view.done {
+        let (groups, extra, wasted) = totals(&view.groups);
+        if groups == 0 {
+            ("Дубликатов нет".to_string(), theme::TEXT_SECONDARY)
+        } else {
+            (
+                format!(
+                    "Групп: {} · лишних копий: {} · можно освободить {}",
+                    format::count(groups),
+                    format::count(extra),
+                    format::size(wasted)
+                ),
+                theme::TEXT_PRIMARY,
+            )
+        }
+    } else {
+        let text = match view.progress {
+            None => "Обход папок…".to_string(),
+            Some(DuplicateProgress::Scanning { files }) => {
+                format!("Обход папок: {}", format::items(files))
+            }
+            Some(DuplicateProgress::Hashing { done, total }) => {
+                format!("Сравнение содержимого: {} из {}", format::size(done), format::size(total))
+            }
+        };
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
+        (text, theme::accent())
+    };
+    ui.painter().text(
+        rect.left_center() + vec2(12.0, 0.0),
+        Align2::LEFT_CENTER,
+        text,
+        theme::regular(13.5),
+        color,
+    );
+    if view.done && !view.groups.is_empty() {
+        let controls = Rect::from_min_max(
+            pos2(rect.right() - 420.0, rect.top() + 6.0),
+            rect.max - vec2(10.0, 6.0),
+        );
+        let mut child = ui.new_child(
+            egui::UiBuilder::new().max_rect(controls).layout(Layout::right_to_left(Align::Center)),
+        );
+        if child.button("Отметить лишние").on_hover_text("Delete отправит их в корзину").clicked()
+        {
+            app.actions.push(Action::Run(CommandId::SelectExtraCopies));
+        }
+        egui::ComboBox::from_id_salt(("dup-keep", tab.id))
+            .selected_text(view.keep.title())
+            .width(230.0)
+            .show_ui(&mut child, |ui| {
+                for keep in Keep::ALL {
+                    ui.selectable_value(&mut view.keep, keep, keep.title());
+                }
+            });
+    }
+}
+
 /// Состояние индекса одной фразой.
 pub fn index_state(status: &mh_files_fs::IndexStatus) -> String {
     use mh_files_fs::VolumeState;
@@ -706,6 +775,10 @@ fn list_view(
     }
     background.context_menu(|ui| background_menu(ui, app, tab));
 
+    if tab.view == ViewMode::Columns {
+        crate::columns::show(ui, pane, tab, app, focused);
+        return;
+    }
     if tab.listing.is_empty() {
         let message = match &tab.listing.state {
             LoadState::Loading => None,
@@ -754,6 +827,7 @@ fn list_view(
     match tab.view {
         ViewMode::Details => details(ui, pane, tab, app, focused),
         ViewMode::Grid => grid(ui, pane, tab, app, focused),
+        ViewMode::Columns => {}
     }
 }
 
@@ -765,8 +839,11 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
     }
     ui.separator();
     ui.menu_button("Вид", |ui| {
-        for (view, title) in [(ViewMode::Details, "Таблица"), (ViewMode::Grid, "Плитки")]
-        {
+        for (view, title) in [
+            (ViewMode::Details, "Таблица"),
+            (ViewMode::Grid, "Плитки"),
+            (ViewMode::Columns, "Колонки"),
+        ] {
             if ui.radio(tab.view == view, title).clicked() {
                 tab.view = view;
                 ui.close();
@@ -801,6 +878,7 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
         CommandId::ToggleHidden,
         CommandId::SelectAll,
         CommandId::FolderSizes,
+        CommandId::FindDuplicates,
         CommandId::Undo,
     ] {
         menu_item(ui, app, command);
@@ -827,6 +905,12 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool) {
         menu_item(ui, app, CommandId::OpenWith);
     }
     menu_item(ui, app, CommandId::QuickLook);
+    if app.available_cached(CommandId::Extract) {
+        menu_item(ui, app, CommandId::Extract);
+        if app.available_cached(CommandId::ExtractHere) {
+            menu_item(ui, app, CommandId::ExtractHere);
+        }
+    }
     ui.separator();
     for command in
         [CommandId::Cut, CommandId::Copy, CommandId::CopyToOtherPane, CommandId::MoveToOtherPane]
@@ -845,18 +929,19 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool) {
     if is_dir {
         menu_item(ui, app, CommandId::AddFavorite);
         menu_item(ui, app, CommandId::FolderSizes);
+        menu_item(ui, app, CommandId::FindDuplicates);
     }
     menu_item(ui, app, CommandId::RevealInExplorer);
     menu_item(ui, app, CommandId::WindowsMenu);
     menu_item(ui, app, CommandId::Properties);
 }
 
-fn row_height(app: &FilesApp) -> f32 {
+pub(crate) fn row_height(app: &FilesApp) -> f32 {
     if app.settings.appearance.compact { 22.0 } else { 27.0 }
 }
 
 /// Прокрутка, при которой строка `top..top+height` видна.
-fn scroll_for(tab: &Tab, top: f32, height: f32) -> f32 {
+pub(crate) fn scroll_for(tab: &Tab, top: f32, height: f32) -> f32 {
     let offset = tab.scroll_offset;
     let view = tab.viewport_height.max(height);
     if top < offset {
@@ -1007,14 +1092,18 @@ fn header(
 }
 
 #[derive(Clone, Copy)]
-enum Look {
-    Row { search: bool },
+pub(crate) enum Look {
+    Row {
+        search: bool,
+    },
     Tile,
+    /// Строка колонки Миллера: значок, имя, у папок — стрелка вглубь.
+    Column,
 }
 
 /// Строка таблицы или плитка: рисование и все взаимодействия с объектом.
 #[allow(clippy::too_many_arguments)]
-fn item(
+pub(crate) fn item(
     ui: &mut Ui,
     pane: mh_files_core::layout::PaneId,
     tab: &mut Tab,
@@ -1034,6 +1123,22 @@ fn item(
 
     let painter = ui.painter_at(rect);
     let radius = CornerRadius::same(4);
+    // Дубликаты: полоса группы слева и черта между группами.
+    if let Some(view) = &tab.duplicates
+        && let Some(&group) = view.group_of.get(&path)
+    {
+        let color =
+            if group % 2 == 0 { theme::accent() } else { theme::accent().gamma_multiply(0.4) };
+        painter.rect_filled(
+            Rect::from_min_size(rect.min + vec2(0.0, 2.0), vec2(3.0, rect.height() - 4.0)),
+            CornerRadius::same(1),
+            color,
+        );
+        let previous = row.checked_sub(1).and_then(|r| tab.listing.get(r)).map(|e| e.path());
+        if previous.is_some_and(|p| view.group_of.get(&p) != Some(&group)) {
+            painter.hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::CARD_STROKE));
+        }
+    }
     let fill = if drop_target {
         theme::accent().gamma_multiply(0.35)
     } else if selected {
@@ -1043,7 +1148,7 @@ fn item(
     } else {
         Color32::TRANSPARENT
     };
-    let body = if matches!(look, Look::Row { .. }) {
+    let body = if matches!(look, Look::Row { .. } | Look::Column) {
         rect.shrink2(vec2(2.0, 1.0))
     } else {
         rect.shrink(2.0)
@@ -1138,6 +1243,36 @@ fn item(
             }
             name_end = layout.name.1;
         }
+        Look::Column => {
+            let icon_size = (rect.height() - 9.0).clamp(14.0, 20.0);
+            let icon_rect = Rect::from_center_size(
+                pos2(rect.left() + 16.0, rect.center().y),
+                vec2(icon_size, icon_size),
+            );
+            paint_icon(ui, app, &entry, icon_rect, dim);
+            let right = if entry.is_dir() { rect.right() - 22.0 } else { rect.right() - 8.0 };
+            let name_rect = Rect::from_x_y_ranges((rect.left() + 30.0)..=right, rect.y_range());
+            if renaming {
+                rename_editor(ui, tab, app, name_rect.shrink2(vec2(0.0, 2.0)));
+            } else {
+                let galley =
+                    elided(ui, &shown_name, theme::regular(14.0), text_color, name_rect.width());
+                painter.galley(
+                    pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0),
+                    galley,
+                    text_color,
+                );
+            }
+            if entry.is_dir() {
+                let chevron = Rect::from_center_size(
+                    pos2(rect.right() - 12.0, rect.center().y),
+                    vec2(10.0, 10.0),
+                );
+                icons::chevron_right(&painter, chevron, theme::TEXT_DISABLED);
+            }
+            // Тянуть за имя — перенос файлов; рамки в колонке нет.
+            name_end = f32::INFINITY;
+        }
         Look::Tile => {
             let label_height = 34.0;
             let image_rect = Rect::from_min_max(
@@ -1191,8 +1326,8 @@ fn item(
     }
     if response.middle_clicked() && entry.is_dir() {
         app.actions.push(Action::FocusPane(pane));
-        app.actions
-            .push(Action::Open { location: Location::Dir(path.clone()), target: Target::NewTab });
+        let location = tab.location.enter(&path);
+        app.actions.push(Action::Open { location, target: Target::NewTab });
     }
     if response.secondary_clicked() && !selected {
         tab.selection.select_only(path.clone());
@@ -1206,7 +1341,11 @@ fn item(
         if !selected {
             tab.selection.select_only(path.clone());
         }
-        egui::DragAndDrop::set_payload(ui.ctx(), DragFiles { paths: tab.targets() });
+        let archive = match &tab.location {
+            Location::Archive { archive, .. } => Some(archive.clone()),
+            _ => None,
+        };
+        egui::DragAndDrop::set_payload(ui.ctx(), DragFiles { paths: tab.targets(), archive });
     }
     if entry.is_dir() {
         app.drop_zones.push(DropZone {
@@ -1250,7 +1389,7 @@ fn paint_texture(ui: &Ui, texture: &TextureHandle, rect: Rect, dim: bool) {
 }
 
 /// Значок объекта: системный, если есть, иначе свой.
-fn paint_icon(ui: &Ui, app: &mut FilesApp, entry: &Entry, rect: Rect, dim: bool) {
+pub(crate) fn paint_icon(ui: &Ui, app: &mut FilesApp, entry: &Entry, rect: Rect, dim: bool) {
     let pixels = rect.width() * ui.ctx().pixels_per_point();
     if let Some(texture) = app.images.icon(&app.workers, entry, pixels) {
         paint_texture(ui, &texture, rect, dim);

@@ -156,6 +156,26 @@ impl FilesApp {
             return false;
         }
         let select = Modifiers { ctrl: modifiers.ctrl, shift: modifiers.shift };
+        // Колонки: влево — к родителю, вправо — внутрь папки под курсором.
+        if tab.view == ViewMode::Columns && !modifiers.shift && !modifiers.ctrl {
+            match key {
+                Key::ArrowLeft => {
+                    self.actions.push(Action::Run(CommandId::GoUp));
+                    return true;
+                }
+                Key::ArrowRight => {
+                    let inside =
+                        tab.selection.cursor().and_then(|path| tab.entry(path)).and_then(|entry| {
+                            crate::columns::preview_location(&tab.location, entry)
+                        });
+                    if let Some(location) = inside {
+                        self.actions.push(Action::OpenSelect { location, select: None });
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         let grid = tab.view == ViewMode::Grid;
         let columns = tab.grid_columns.max(1) as isize;
         let page = tab.page_rows.max(1) as isize * if grid { columns } else { 1 };
@@ -224,6 +244,20 @@ impl FilesApp {
                 }
             }
             Action::SetView(view) => self.tab_mut().view = view,
+            Action::OpenSelect { location, select } => {
+                let workers = self.workers.clone();
+                let tab = self.tab_mut();
+                if tab.location != location {
+                    tab.navigate(location, &workers, true);
+                }
+                match select {
+                    Some(path) => {
+                        tab.pending_select = Some(path);
+                        tab.reveal_pending();
+                    }
+                    None => tab.select_first = true,
+                }
+            }
             Action::RemoveSavedSearch(index) => {
                 if index < self.settings.saved_searches.len() {
                     self.settings.saved_searches.remove(index);
@@ -257,7 +291,24 @@ impl FilesApp {
         let tab = self.tab();
         let has_targets = !tab.targets().is_empty();
         let has_dir = tab.dir().is_some();
+        let in_archive = matches!(tab.location, Location::Archive { .. });
+        let archive_selected = tab.targets().iter().any(|p| {
+            p.file_name()
+                .is_some_and(|n| mh_files_fs::archive::is_archive_name(&n.to_string_lossy()))
+        });
         match command {
+            // Архив только для чтения; его записей нет на диске.
+            Cut | Delete | DeletePermanent | Rename | BatchRename | MoveToOtherPane
+            | Properties | OpenWith | RevealInExplorer | WindowsMenu | AddFavorite
+            | FolderSizes
+                if in_archive =>
+            {
+                false
+            }
+            Extract => in_archive || archive_selected,
+            ExtractHere => archive_selected && !in_archive,
+            FindDuplicates => has_dir || has_targets && !in_archive,
+            SelectExtraCopies => tab.duplicates.as_ref().is_some_and(|d| !d.groups.is_empty()),
             _ if command.needs_targets() && !has_targets => false,
             GoBack => tab.history.can_back(),
             GoForward => tab.history.can_forward(),
@@ -378,6 +429,13 @@ impl FilesApp {
                     self.palette = Some(palette::State::search(dir));
                 }
             }
+            Extract => self.extract_command(false),
+            ExtractHere => self.extract_command(true),
+            FindDuplicates => self.find_duplicates(),
+            SelectExtraCopies => {
+                let keep = self.tab().duplicates.as_ref().map(|d| d.keep).unwrap_or_default();
+                self.select_extra_copies(keep);
+            }
             SearchEverywhere => {
                 if !matches!(self.tab().location, Location::Index { .. }) {
                     let query = String::new();
@@ -404,6 +462,12 @@ impl FilesApp {
             Reindex => {
                 self.indexer.rescan();
                 self.set_status("индекс перестраивается в фоне", Level::Info);
+            }
+            Copy if matches!(self.tab().location, Location::Archive { .. }) => {
+                self.copy_from_archive();
+            }
+            CopyToOtherPane if matches!(self.tab().location, Location::Archive { .. }) => {
+                self.extract_command(false);
             }
             Copy | Cut => {
                 let cut = command == Cut;
@@ -527,6 +591,7 @@ impl FilesApp {
             QuickLook => self.quick = Some(quick::State::open(self)),
             ViewDetails => self.tab_mut().view = ViewMode::Details,
             ViewGrid => self.tab_mut().view = ViewMode::Grid,
+            ViewColumns => self.tab_mut().view = ViewMode::Columns,
             ToggleHidden => {
                 self.settings.files.show_hidden = !self.settings.files.show_hidden;
                 self.refresh_view_options();
@@ -609,12 +674,19 @@ impl FilesApp {
 
     /// Открыть объекты: папки — переходом, файлы — программой по умолчанию.
     fn open_targets(&mut self, targets: &[PathBuf], target: Target) {
+        if self.open_in_archive(targets, target) {
+            return;
+        }
         let tab = self.tab();
-        let mut dirs = Vec::new();
+        let mut places = Vec::new();
         let mut files = Vec::new();
         for path in targets {
             match tab.entry(path) {
-                Some(entry) if entry.is_dir() => dirs.push(path.clone()),
+                Some(entry) if entry.is_dir() => places.push(Location::Dir(path.clone())),
+                // zip и 7z открываются как папки; в программе — «Открыть с помощью».
+                Some(entry) if mh_files_fs::archive::is_archive_name(&entry.name) => {
+                    places.push(Location::Archive { archive: path.clone(), inner: String::new() })
+                }
                 Some(_) => files.push(path.clone()),
                 None => {}
             }
@@ -623,10 +695,10 @@ impl FilesApp {
             self.workers.shell(ShellJob::Open(file));
         }
         // Несколько папок — каждая в своей вкладке.
-        let many = dirs.len() > 1;
-        for dir in dirs {
+        let many = places.len() > 1;
+        for place in places {
             let target = if many && target == Target::Current { Target::NewTab } else { target };
-            self.open_location(Location::Dir(dir), target);
+            self.open_location(place, target);
         }
     }
 

@@ -13,3 +13,11 @@ parking_lot.workspace = true
 image.workspace = true
 encoding_rs.workspace = true
 mh-files-platform.workspace = true
+zip.workspace = true
+sevenz-rust2.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+# Тесты собирают 7z сами.
+sevenz-rust2 = { workspace = true, features = ["compress"] }

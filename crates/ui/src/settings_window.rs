@@ -380,6 +380,16 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
             &mut s.preview.thumbnails,
         );
     });
+    card(ui, "Обработчики Windows", |ui| {
+        switch_row(
+            ui,
+            "Документы через обработчики предпросмотра",
+            Some(
+                "Word, Excel, PowerPoint, Visio и другие — тем же, что показывает Проводник. Обработчик работает в отдельном процессе и не задерживает окно.",
+            ),
+            &mut s.preview.handlers,
+        );
+    });
     card(ui, "Инспектор и быстрый просмотр", |ui| {
         row(ui, "Читать текста, КБ", |ui| {
             ui.add(egui::DragValue::new(&mut s.preview.text_limit_kb).range(4..=4096));
@@ -541,7 +551,7 @@ fn about(ui: &mut Ui) {
     card(ui, "Сторонние компоненты", |ui| {
         ui.label(
             RichText::new(
-                "Шрифт Cuprum — SIL Open Font License 1.1. Интерфейс — egui (MIT/Apache-2.0). Нечёткий поиск — nucleo-matcher (MPL-2.0).",
+                "Шрифт Cuprum — SIL Open Font License 1.1. Интерфейс — egui (MIT/Apache-2.0). Нечёткий поиск — nucleo-matcher (MPL-2.0). Архивы — zip (MIT) и sevenz-rust2 (Apache-2.0), хэш дубликатов — BLAKE3 (Apache-2.0).",
             )
             .color(theme::TEXT_SECONDARY),
         );

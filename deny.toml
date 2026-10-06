@@ -26,6 +26,8 @@ allow = [
     "BSL-1.0",
     "ISC",
     "MIT",
+    # ppmd-rust (метод PPMd в 7z): «CC0-1.0 OR MIT-0» — MIT без требования указывать авторство.
+    "MIT-0",
     # nucleo-matcher (нечёткий поиск). Копилефт на уровне файлов: крейт используется без
     # изменений, его исходники открыты на crates.io — для MIT-программы это допустимо.
     "MPL-2.0",
@@ -34,6 +36,8 @@ allow = [
     "Unicode-3.0",
     "Unlicense",
     "Zlib",
+    # libbz2-rs-sys (BZip2 в 7z, перенос libbzip2 на Rust): разрешительная лицензия в духе BSD.
+    "bzip2-1.0.6",
 ]
 
 [licenses.private]

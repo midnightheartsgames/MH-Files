@@ -18,6 +18,8 @@ pub enum ViewMode {
     #[default]
     Details,
     Grid,
+    /// Колонки Миллера: родительские папки слева, содержимое папки под курсором справа.
+    Columns,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
