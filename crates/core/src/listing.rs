@@ -4,7 +4,9 @@
 //! мере загрузки. Наблюдатель за папкой правит отдельные записи — выделение и прокрутка при
 //! этом остаются, потому что выделение хранится путями, а не номерами строк.
 
-use std::path::Path;
+use std::cell::OnceCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::entry::Entry;
 use crate::filter::Filter;
@@ -43,6 +45,11 @@ pub struct Listing {
     entries: Vec<Entry>,
     /// Номера записей в `entries`, прошедших фильтр, в порядке показа.
     view: Vec<usize>,
+    /// Строка каждой записи в `view`; `usize::MAX` — скрыта.
+    rows: Vec<usize>,
+    /// Путь → номер записи. Строится лениво при первом поиске после изменения списка:
+    /// выделение и курсор хранятся путями, и поиск строки должен быть O(1) даже на 100 000.
+    index: OnceCell<HashMap<PathBuf, usize>>,
     options: ViewOptions,
     filter: Filter,
     pub state: LoadState,
@@ -65,6 +72,8 @@ impl Listing {
     pub fn reset(&mut self) {
         self.entries.clear();
         self.view.clear();
+        self.rows.clear();
+        self.index = OnceCell::new();
         self.state = LoadState::Loading;
     }
 
@@ -131,6 +140,17 @@ impl Listing {
         self.view.sort_by(|&a, &b| {
             compare(&entries[a], &entries[b], options.sort, options.folders_first)
         });
+        self.rows = vec![usize::MAX; self.entries.len()];
+        for (row, &index) in self.view.iter().enumerate() {
+            self.rows[index] = row;
+        }
+        self.index = OnceCell::new();
+    }
+
+    fn index(&self) -> &HashMap<PathBuf, usize> {
+        self.index.get_or_init(|| {
+            self.entries.iter().enumerate().map(|(i, entry)| (entry.path(), i)).collect()
+        })
     }
 
     /// Видимых строк.
@@ -163,12 +183,13 @@ impl Listing {
 
     /// Видимая строка записи с этим путём.
     pub fn row_of(&self, path: &Path) -> Option<usize> {
-        let name = path.file_name()?.to_str()?;
-        let parent = path.parent()?;
-        self.view.iter().position(|&i| {
-            let entry = &self.entries[i];
-            entry.name == name && *entry.parent == *parent
-        })
+        let &index = self.index().get(path)?;
+        self.rows.get(index).copied().filter(|&row| row != usize::MAX)
+    }
+
+    /// Запись с этим путём среди всех прочитанных, даже скрытая фильтром.
+    pub fn find(&self, path: &Path) -> Option<&Entry> {
+        self.index().get(path).map(|&index| &self.entries[index])
     }
 
     /// Первая видимая строка, чьё имя начинается с `prefix` (набор с клавиатуры), начиная
@@ -181,12 +202,14 @@ impl Listing {
         })
     }
 
-    /// Добавляет или обновляет запись (событие наблюдателя).
+    /// Добавляет или обновляет запись (событие наблюдателя). Строки пересчитывает
+    /// [`Listing::refresh`].
     pub fn upsert(&mut self, entry: Entry) {
         match self.entries.iter_mut().find(|e| e.name == entry.name && e.parent == entry.parent) {
             Some(existing) => *existing = entry,
             None => self.entries.push(entry),
         }
+        self.index = OnceCell::new();
     }
 
     /// Убирает запись по пути. `true`, если она была.
@@ -197,6 +220,7 @@ impl Listing {
         };
         let before = self.entries.len();
         self.entries.retain(|e| !(e.name == name && *e.parent == *parent));
+        self.index = OnceCell::new();
         before != self.entries.len()
     }
 

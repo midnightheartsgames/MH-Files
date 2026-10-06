@@ -128,12 +128,8 @@ impl Selection {
 
     /// После перечитывания: убрать то, чего больше нет или что скрыто фильтром.
     pub fn retain_visible(&mut self, listing: &Listing) {
-        if self.selected.is_empty() && self.cursor.is_none() {
-            return;
-        }
-        let visible: HashSet<PathBuf> = listing.iter().map(|entry| entry.path()).collect();
-        self.selected.retain(|path| visible.contains(path));
-        if self.cursor.as_ref().is_some_and(|c| !visible.contains(c)) {
+        self.selected.retain(|path| listing.row_of(path).is_some());
+        if self.cursor.as_ref().is_some_and(|c| listing.row_of(c).is_none()) {
             self.cursor = None;
         }
     }
@@ -142,14 +138,18 @@ impl Selection {
     /// (так F2 и Delete работают сразу после перехода стрелками).
     pub fn targets(&self, listing: &Listing) -> Vec<PathBuf> {
         if self.selected.is_empty() {
-            return self.cursor.iter().cloned().collect();
+            return self.cursor.iter().filter(|c| listing.row_of(c).is_some()).cloned().collect();
         }
-        listing.iter().map(|entry| entry.path()).filter(|p| self.selected.contains(p)).collect()
+        self.selected_paths(listing)
     }
 
-    /// Только выделенные пути в порядке показа, без подстановки курсора.
+    /// Только выделенные пути в порядке показа, без подстановки курсора. Стоит O(m log m)
+    /// от числа выделенных, а не от размера папки: зовётся каждый кадр.
     pub fn selected_paths(&self, listing: &Listing) -> Vec<PathBuf> {
-        listing.iter().map(|entry| entry.path()).filter(|p| self.selected.contains(p)).collect()
+        let mut rows: Vec<(usize, &PathBuf)> =
+            self.selected.iter().filter_map(|path| Some((listing.row_of(path)?, path))).collect();
+        rows.sort_unstable_by_key(|(row, _)| *row);
+        rows.into_iter().map(|(_, path)| path.clone()).collect()
     }
 
     fn add_range(&mut self, listing: &Listing, a: usize, b: usize) {

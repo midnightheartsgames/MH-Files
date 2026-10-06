@@ -1,0 +1,640 @@
+//! Выполнение команд и действий. Единственное место, где команда что-то делает.
+
+use std::path::PathBuf;
+
+use eframe::egui::{self, Key};
+use mh_files_core::layout::SplitDirection;
+use mh_files_core::location::Location;
+use mh_files_core::names;
+use mh_files_core::selection::Modifiers;
+use mh_files_core::session::{TabSession, ViewMode};
+use mh_files_core::settings::{Favorite, Group, NewTabLocation};
+use mh_files_fs::ShellJob;
+use mh_files_platform::clipboard::ClipboardFiles;
+use mh_files_platform::ops::FileOp;
+
+use crate::app::{Action, FilesApp, Followup, Level, Target, root_of};
+use crate::commands::CommandId;
+use crate::tabs::{InlineRename, Pane};
+use crate::{batch, dialogs, palette, quick, sidebar};
+
+/// Команды, которые работают и тогда, когда фокус в текстовом поле.
+const IN_TEXT: &[CommandId] = &[
+    CommandId::CommandPalette,
+    CommandId::GoTo,
+    CommandId::Settings,
+    CommandId::NewTab,
+    CommandId::CloseTab,
+    CommandId::NextTab,
+    CommandId::PrevTab,
+    CommandId::ToggleInspector,
+    CommandId::ToggleSidebar,
+    CommandId::Refresh,
+    CommandId::Filter,
+    CommandId::Search,
+];
+
+impl FilesApp {
+    pub(crate) fn handle_keys(&mut self, ctx: &egui::Context) {
+        let overlay = self.palette.is_some()
+            || self.dialog.is_some()
+            || self.batch.is_some()
+            || self.quick.is_some();
+        if overlay {
+            return;
+        }
+        let text_focus = ctx.egui_wants_keyboard_input();
+        let renaming = self.tab().rename.is_some();
+        let events = ctx.input(|i| i.events.clone());
+        let mut consumed = Vec::new();
+        for (index, event) in events.iter().enumerate() {
+            match event {
+                egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                    if !text_focus && !renaming && self.list_key(*key, *modifiers) {
+                        consumed.push(index);
+                        continue;
+                    }
+                    if let Some(command) = self.keymap.lookup(*key, *modifiers) {
+                        if (text_focus || renaming) && !IN_TEXT.contains(&command) {
+                            continue;
+                        }
+                        self.actions.push(Action::Run(command));
+                        consumed.push(index);
+                    }
+                }
+                egui::Event::Text(text) if !text_focus && !renaming => {
+                    let modifiers = ctx.input(|i| i.modifiers);
+                    if !modifiers.ctrl && !modifiers.alt && !text.trim().is_empty() {
+                        self.tab_mut().type_ahead(text);
+                        consumed.push(index);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !consumed.is_empty() {
+            ctx.input_mut(|input| {
+                let mut index = 0;
+                input.events.retain(|_| {
+                    let keep = !consumed.contains(&index);
+                    index += 1;
+                    keep
+                });
+            });
+        }
+    }
+
+    /// Стрелки и прочая навигация по списку. `true` — клавиша обработана.
+    fn list_key(&mut self, key: Key, modifiers: egui::Modifiers) -> bool {
+        if modifiers.alt {
+            return false;
+        }
+        let tab = self.tab_mut();
+        if matches!(tab.location, Location::Computer) {
+            return false;
+        }
+        let select = Modifiers { ctrl: modifiers.ctrl, shift: modifiers.shift };
+        let grid = tab.view == ViewMode::Grid;
+        let columns = tab.grid_columns.max(1) as isize;
+        let page = tab.page_rows.max(1) as isize * if grid { columns } else { 1 };
+        match key {
+            Key::ArrowDown => tab.move_cursor(if grid { columns } else { 1 }, select),
+            Key::ArrowUp => tab.move_cursor(if grid { -columns } else { -1 }, select),
+            Key::ArrowRight if grid => tab.move_cursor(1, select),
+            Key::ArrowLeft if grid => tab.move_cursor(-1, select),
+            Key::PageDown => tab.move_cursor(page, select),
+            Key::PageUp => tab.move_cursor(-page, select),
+            Key::Home => tab.cursor_to(0, select),
+            Key::End => tab.cursor_to(usize::MAX, select),
+            Key::Space if modifiers.ctrl => tab.selection.toggle_cursor(),
+            Key::Escape => {
+                if tab.filter_open {
+                    tab.filter_open = false;
+                    tab.set_filter(String::new());
+                } else {
+                    tab.selection.clear();
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub(crate) fn run_actions(&mut self, ctx: &egui::Context) {
+        let mut guard = 0;
+        while !self.actions.is_empty() && guard < 64 {
+            guard += 1;
+            let actions = std::mem::take(&mut self.actions);
+            for action in actions {
+                self.apply(ctx, action);
+            }
+        }
+    }
+
+    fn apply(&mut self, ctx: &egui::Context, action: Action) {
+        let workers = self.workers.clone();
+        match action {
+            Action::Run(command) => self.execute(ctx, command),
+            Action::Open { location, target } => self.open_location(location, target),
+            Action::FocusPane(pane) => {
+                if self.pane(pane).is_some() {
+                    self.focused = pane;
+                }
+            }
+            Action::SelectTab { pane, index } => {
+                if let Some(pane) = self.pane_mut(pane)
+                    && index < pane.tabs.len()
+                {
+                    pane.active = index;
+                }
+                self.focused = pane;
+            }
+            Action::CloseTab { pane, index } => self.close_tab(pane, index),
+            Action::NewTabIn(pane) => {
+                self.focused = pane;
+                self.execute(ctx, CommandId::NewTab);
+            }
+            Action::SetSort { pane, column } => {
+                if let Some(pane) = self.pane_mut(pane) {
+                    let tab = pane.tab_mut();
+                    let mut options = tab.listing.options();
+                    options.sort = options.sort.toggled(column);
+                    tab.set_options(options);
+                }
+            }
+            Action::SetView(view) => self.tab_mut().view = view,
+            Action::CommitRename { tab, path, new_name } => self.commit_rename(tab, path, new_name),
+            Action::Drop { paths, dest, copy } => self.drop_files(paths, dest, copy),
+            Action::AddFavorites { group, paths } => self.add_favorites(group, paths),
+            Action::Sidebar(edit) => {
+                sidebar::apply_edit(&mut self.settings.groups, edit);
+                self.save_settings();
+            }
+            Action::CrumbMenu { pane, dir, at } => {
+                let generation = self.crumb_menu.as_ref().map_or(0, |m| m.generation) + 1;
+                let ticket = mh_files_fs::Ticket { owner: crate::app::OWNER_CRUMBS, generation };
+                workers.complete(ticket, dir.clone(), String::new());
+                self.crumb_menu =
+                    Some(crate::app::CrumbMenu { pane, dir, at, names: None, generation });
+            }
+            Action::Shell(job) => workers.shell(job),
+            Action::Status(text, level) => self.set_status(text, level),
+        }
+    }
+
+    /// Доступна ли команда сейчас — для палитры и меню.
+    pub fn available(&self, command: CommandId) -> bool {
+        use CommandId::*;
+        let tab = self.tab();
+        let has_targets = !tab.targets().is_empty();
+        let has_dir = tab.dir().is_some();
+        match command {
+            _ if command.needs_targets() && !has_targets => false,
+            GoBack => tab.history.can_back(),
+            GoForward => tab.history.can_forward(),
+            GoUp => tab.location.parent().is_some(),
+            Paste | NewFolder | OpenTerminal => has_dir,
+            Search => has_dir,
+            CopyToOtherPane | MoveToOtherPane | OpenInOtherPane => {
+                has_targets && self.other_pane().is_some()
+            }
+            ClosePane => self.panes.len() > 1,
+            ReopenTab => !self.closed.is_empty(),
+            BatchRename => has_targets,
+            _ => true,
+        }
+    }
+
+    pub fn execute(&mut self, ctx: &egui::Context, command: CommandId) {
+        use CommandId::*;
+        let workers = self.workers.clone();
+        let targets = self.tab().targets();
+        let dir = self.tab().dir();
+        if command.needs_targets() && targets.is_empty() {
+            return;
+        }
+        match command {
+            Open => self.open_targets(&targets, Target::Current),
+            OpenInNewTab => self.open_targets(&targets, Target::NewTab),
+            OpenInOtherPane => self.open_targets(&targets, Target::OtherPane),
+            OpenWith => workers.shell(ShellJob::OpenWith(targets[0].clone())),
+            GoBack => {
+                let tab = self.tab_mut();
+                if let Some(location) = tab.history.back(tab.location.clone()) {
+                    tab.navigate(location, &workers, false);
+                }
+            }
+            GoForward => {
+                let tab = self.tab_mut();
+                if let Some(location) = tab.history.forward(tab.location.clone()) {
+                    tab.navigate(location, &workers, false);
+                }
+            }
+            GoUp => {
+                if let Some(parent) = self.tab().location.parent() {
+                    self.open_location(parent, Target::Current);
+                }
+            }
+            GoComputer => self.open_location(Location::Computer, Target::Current),
+            GoHome => self.open_location(self.home_location(), Target::Current),
+            Refresh => {
+                self.tab_mut().reload(&workers, true);
+                if matches!(self.tab().location, Location::Computer) {
+                    workers.drives();
+                }
+            }
+            EditAddress => {
+                let tab = self.tab_mut();
+                let text = match &tab.location {
+                    Location::Dir(path) => path.display().to_string(),
+                    _ => String::new(),
+                };
+                tab.address = Some(text);
+                tab.focus_address = true;
+            }
+            GoTo => self.palette = Some(palette::State::goto(self)),
+            CommandPalette => self.palette = Some(palette::State::commands()),
+            Filter => {
+                let tab = self.tab_mut();
+                tab.filter_open = true;
+                tab.focus_filter = true;
+            }
+            Search => {
+                if let Some(dir) = dir {
+                    self.palette = Some(palette::State::search(dir));
+                }
+            }
+            Copy | Cut => {
+                let cut = command == Cut;
+                self.cut = if cut { targets.iter().cloned().collect() } else { Default::default() };
+                workers.shell(ShellJob::SetClipboard { paths: targets.clone(), cut });
+                let verb = if cut { "вырезано" } else { "скопировано" };
+                self.set_status(
+                    format!("{verb}: {}", mh_files_core::format::items(targets.len())),
+                    Level::Info,
+                );
+            }
+            Paste => {
+                if let Some(dest) = dir {
+                    workers.shell(ShellJob::ReadClipboard { dest });
+                }
+            }
+            CopyToOtherPane | MoveToOtherPane => {
+                let dest =
+                    self.other_pane().and_then(|id| self.pane(id)).and_then(|p| p.tab().dir());
+                match dest {
+                    Some(dest) => {
+                        let op = if command == CopyToOtherPane {
+                            FileOp::Copy { sources: targets, dest }
+                        } else {
+                            FileOp::Move { sources: targets, dest }
+                        };
+                        self.ops.submit(op);
+                    }
+                    None => self.set_status("в соседней панели не папка", Level::Error),
+                }
+            }
+            CopyPath => {
+                let text: Vec<String> = targets.iter().map(|p| p.display().to_string()).collect();
+                ctx.copy_text(text.join("\r\n"));
+                self.set_status("путь скопирован", Level::Info);
+            }
+            CopyName => {
+                let text: Vec<String> = targets
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                ctx.copy_text(text.join("\r\n"));
+            }
+            Rename => {
+                if targets.len() > 1 {
+                    self.execute(ctx, BatchRename);
+                } else {
+                    let path = targets[0].clone();
+                    let tab = self.tab_mut();
+                    if let Some(row) = tab.listing.row_of(&path) {
+                        let name = tab.listing.get(row).map(|e| e.name.clone()).unwrap_or_default();
+                        tab.scroll_to = Some(row);
+                        tab.rename = Some(InlineRename { path, text: name, fresh: true });
+                    }
+                }
+            }
+            BatchRename => {
+                let tab = self.tab();
+                let items: Vec<_> = targets
+                    .iter()
+                    .filter_map(|path| tab.entry(path))
+                    .map(|entry| mh_files_core::rename::Item {
+                        path: entry.path(),
+                        is_dir: entry.is_dir(),
+                        modified: entry.modified,
+                        created: entry.created,
+                    })
+                    .collect();
+                let siblings = batch::siblings(tab);
+                self.batch = Some(batch::State::new(items, siblings));
+            }
+            Delete => {
+                if self.settings.files.confirm_recycle {
+                    self.dialog = Some(dialogs::Dialog::delete(targets, false));
+                } else {
+                    self.ops.submit(FileOp::Delete { paths: targets, permanent: false });
+                }
+            }
+            DeletePermanent => self.dialog = Some(dialogs::Dialog::delete(targets, true)),
+            NewFolder => {
+                if let Some(parent) = dir {
+                    let tab = self.tab();
+                    let existing: Vec<&str> =
+                        tab.listing.all().iter().map(|e| e.name.as_str()).collect();
+                    let name = names::unique_name("Новая папка", &existing);
+                    let id = self.ops.submit(FileOp::NewFolder { parent, name });
+                    let tab_id = self.tab().id;
+                    self.followups.insert(id, Followup::RenameCreated { tab: tab_id });
+                }
+            }
+            Properties => {
+                let paths = if targets.is_empty() { dir.into_iter().collect() } else { targets };
+                if !paths.is_empty() {
+                    workers.shell(ShellJob::Properties(paths));
+                }
+            }
+            OpenTerminal => {
+                if let Some(dir) = dir {
+                    workers
+                        .shell(ShellJob::Terminal { dir, command: self.settings.terminal.clone() });
+                }
+            }
+            RevealInExplorer => workers.shell(ShellJob::Reveal(targets[0].clone())),
+            AddFavorite => {
+                let tab = self.tab();
+                let dirs: Vec<PathBuf> = targets
+                    .iter()
+                    .filter(|p| tab.entry(p).is_some_and(|e| e.is_dir()))
+                    .cloned()
+                    .collect();
+                let paths = if dirs.is_empty() { dir.into_iter().collect() } else { dirs };
+                self.add_favorites(0, paths);
+            }
+            SelectAll => {
+                let tab = self.tab_mut();
+                tab.selection.select_all(&tab.listing);
+            }
+            InvertSelection => {
+                let tab = self.tab_mut();
+                tab.selection.invert(&tab.listing);
+            }
+            ClearSelection => self.tab_mut().selection.clear(),
+            QuickLook => self.quick = Some(quick::State::open(self)),
+            ViewDetails => self.tab_mut().view = ViewMode::Details,
+            ViewGrid => self.tab_mut().view = ViewMode::Grid,
+            ToggleHidden => {
+                self.settings.files.show_hidden = !self.settings.files.show_hidden;
+                self.refresh_view_options();
+                self.save_settings();
+                let state = if self.settings.files.show_hidden {
+                    "показаны"
+                } else {
+                    "скрыты"
+                };
+                self.set_status(format!("скрытые файлы {state}"), Level::Info);
+            }
+            ToggleInspector => {
+                self.settings.panes.show_inspector = !self.settings.panes.show_inspector;
+                self.save_settings();
+            }
+            ToggleSidebar => {
+                self.settings.panes.show_sidebar = !self.settings.panes.show_sidebar;
+                self.save_settings();
+            }
+            ZoomIn | ZoomOut | ZoomReset => {
+                let scale = &mut self.settings.appearance.font_scale;
+                *scale = match command {
+                    ZoomIn => *scale + 0.1,
+                    ZoomOut => *scale - 0.1,
+                    _ => 1.0,
+                };
+                let settings = std::mem::take(&mut self.settings).sanitized();
+                self.apply_settings(ctx, settings);
+            }
+            NewTab => {
+                let location = match self.settings.panes.new_tab {
+                    NewTabLocation::Same => self.tab().location.clone(),
+                    NewTabLocation::Home => self.home_location(),
+                    NewTabLocation::Computer => Location::Computer,
+                };
+                self.open_location(location, Target::NewTab);
+            }
+            CloseTab => {
+                let pane = self.focused;
+                let index = self.focused_pane().active;
+                self.close_tab(pane, index);
+            }
+            ReopenTab => {
+                if let Some(session) = self.closed.pop() {
+                    let tab = self.make_tab(&session);
+                    let pane = self.focused_pane_mut();
+                    pane.tabs.insert(pane.active + 1, tab);
+                    pane.active += 1;
+                }
+            }
+            DuplicateTab => {
+                let session = self.tab().session();
+                let tab = self.make_tab(&session);
+                let pane = self.focused_pane_mut();
+                pane.tabs.insert(pane.active + 1, tab);
+                pane.active += 1;
+            }
+            NextTab | PrevTab => {
+                let pane = self.focused_pane_mut();
+                let n = pane.tabs.len();
+                pane.active = if command == NextTab {
+                    (pane.active + 1) % n
+                } else {
+                    (pane.active + n - 1) % n
+                };
+            }
+            SplitRight | SplitDown => {
+                let direction = if command == SplitRight {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                };
+                self.split(direction);
+            }
+            ClosePane => self.close_pane(self.focused),
+            NextPane => self.focused = self.layout.next_pane(self.focused, false),
+            Settings => self.settings_window.open(&self.settings),
+        }
+    }
+
+    /// Открыть объекты: папки — переходом, файлы — программой по умолчанию.
+    fn open_targets(&mut self, targets: &[PathBuf], target: Target) {
+        let tab = self.tab();
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
+        for path in targets {
+            match tab.entry(path) {
+                Some(entry) if entry.is_dir() => dirs.push(path.clone()),
+                Some(_) => files.push(path.clone()),
+                None => {}
+            }
+        }
+        for file in files {
+            self.workers.shell(ShellJob::Open(file));
+        }
+        // Несколько папок — каждая в своей вкладке.
+        let many = dirs.len() > 1;
+        for dir in dirs {
+            let target = if many && target == Target::Current { Target::NewTab } else { target };
+            self.open_location(Location::Dir(dir), target);
+        }
+    }
+
+    pub fn open_location(&mut self, location: Location, target: Target) {
+        let workers = self.workers.clone();
+        self.remember(&location);
+        match target {
+            Target::Current => self.tab_mut().navigate(location, &workers, true),
+            Target::NewTab => {
+                let view = self.tab().view;
+                let tab = self.make_tab(&TabSession { location, view, sort: Default::default() });
+                let pane = self.focused_pane_mut();
+                pane.tabs.insert(pane.active + 1, tab);
+                pane.active += 1;
+            }
+            Target::OtherPane => {
+                if self.other_pane().is_none() {
+                    self.split(SplitDirection::Horizontal);
+                } else if let Some(other) = self.other_pane() {
+                    self.focused = other;
+                }
+                self.tab_mut().navigate(location, &workers, true);
+            }
+        }
+    }
+
+    fn split(&mut self, direction: SplitDirection) {
+        let id = mh_files_core::layout::PaneId(self.new_id());
+        let session = self.tab().session();
+        let tab = self.make_tab(&session);
+        if self.layout.split(self.focused, direction, id) {
+            self.panes.push(Pane { id, tabs: vec![tab], active: 0 });
+            self.focused = id;
+        }
+    }
+
+    fn close_pane(&mut self, id: mh_files_core::layout::PaneId) {
+        if self.panes.len() > 1 && self.layout.remove(id) {
+            if let Some(index) = self.panes.iter().position(|p| p.id == id) {
+                let mut pane = self.panes.remove(index);
+                for tab in &mut pane.tabs {
+                    tab.stop();
+                    self.closed.push(tab.session());
+                }
+            }
+            self.focused = self.layout.panes()[0];
+        }
+    }
+
+    fn close_tab(&mut self, pane_id: mh_files_core::layout::PaneId, index: usize) {
+        let Some(pane) = self.pane_mut(pane_id) else { return };
+        if pane.tabs.len() == 1 {
+            self.close_pane(pane_id);
+            return;
+        }
+        let mut tab = pane.tabs.remove(index);
+        if pane.active > index || pane.active >= pane.tabs.len() {
+            pane.active = pane.active.saturating_sub(1);
+        }
+        tab.stop();
+        self.closed.push(tab.session());
+        if self.closed.len() > 32 {
+            self.closed.remove(0);
+        }
+    }
+
+    fn commit_rename(&mut self, tab_id: u64, path: PathBuf, new_name: String) {
+        let new_name = new_name.trim().to_string();
+        let old = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        if new_name == old || new_name.is_empty() {
+            return;
+        }
+        if let Err(error) = names::validate(&new_name) {
+            self.set_status(format!("«{new_name}»: {error}"), Level::Error);
+            return;
+        }
+        let id = self.ops.submit(FileOp::Rename { path, new_name });
+        self.followups.insert(id, Followup::SelectCreated { tab: tab_id });
+    }
+
+    pub(crate) fn paste_files(&mut self, dest: PathBuf, files: Option<ClipboardFiles>) {
+        let Some(files) = files.filter(|f| !f.paths.is_empty()) else {
+            self.set_status("в буфере обмена нет файлов", Level::Info);
+            return;
+        };
+        if files.cut {
+            let id = self.ops.submit(FileOp::Move { sources: files.paths, dest });
+            self.followups.insert(id, Followup::ClearClipboard);
+        } else {
+            self.ops.submit(FileOp::Copy { sources: files.paths, dest });
+        }
+    }
+
+    fn drop_files(&mut self, paths: Vec<PathBuf>, dest: PathBuf, copy: Option<bool>) {
+        let sources: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|p| p.parent() != Some(dest.as_path()) && *p != dest)
+            .collect();
+        if sources.is_empty() {
+            return;
+        }
+        if let Some(inside) = sources.iter().find(|p| dest.starts_with(p)) {
+            self.set_status(
+                format!("нельзя положить папку в саму себя: {}", inside.display()),
+                Level::Error,
+            );
+            return;
+        }
+        // Как в Проводнике: на тот же диск — перемещение, на другой — копирование.
+        let copy = copy.unwrap_or_else(|| sources.iter().any(|p| root_of(p) != root_of(&dest)));
+        let op = if copy { FileOp::Copy { sources, dest } } else { FileOp::Move { sources, dest } };
+        self.ops.submit(op);
+    }
+
+    fn add_favorites(&mut self, group: usize, paths: Vec<PathBuf>) {
+        if self.settings.groups.is_empty() {
+            self.settings.groups.push(Group {
+                name: "Избранное".into(),
+                collapsed: false,
+                items: Vec::new(),
+            });
+        }
+        let group = group.min(self.settings.groups.len() - 1);
+        let known_files: Vec<PathBuf> = self
+            .panes
+            .iter()
+            .flat_map(|pane| pane.tabs.iter())
+            .flat_map(|tab| tab.listing.all().iter())
+            .filter(|entry| !entry.is_dir())
+            .map(|entry| entry.path())
+            .collect();
+        let items = &mut self.settings.groups[group].items;
+        let mut added = 0;
+        for path in paths {
+            if known_files.contains(&path) || items.iter().any(|f| f.path == path) {
+                continue;
+            }
+            let name = mh_files_core::location::path_label(&path);
+            items.push(Favorite { name, path });
+            added += 1;
+        }
+        if added > 0 {
+            self.save_settings();
+            self.set_status(
+                format!("добавлено в «{}»", self.settings.groups[group].name),
+                Level::Info,
+            );
+        }
+    }
+}

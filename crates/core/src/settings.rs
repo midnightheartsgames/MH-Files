@@ -41,6 +41,8 @@ pub struct Appearance {
     pub grid_size: f32,
     pub accent: [u8; 3],
     pub animations: bool,
+    /// Значки файлов из Windows; выключено — свои значки в стиле MH.
+    pub system_icons: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -129,6 +131,7 @@ impl Default for Appearance {
             grid_size: 112.0,
             accent: ACCENT,
             animations: true,
+            system_icons: true,
         }
     }
 }
