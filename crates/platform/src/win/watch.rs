@@ -163,7 +163,7 @@ fn parse(dir: &Path, raw: &[u8]) -> Vec<WatchEvent> {
         let start = offset + 12;
         let Some(name) = raw.get(start..start + name_len as usize) else { break };
         let units: Vec<u16> =
-            name.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect();
+            name.as_chunks::<2>().0.iter().map(|pair| u16::from_le_bytes(*pair)).collect();
         let path = dir.join(OsString::from_wide(&units));
 
         match windows::Win32::Storage::FileSystem::FILE_ACTION(action) {

@@ -138,7 +138,7 @@ fn only_top_left(bitmap: &Bitmap, side: usize) -> bool {
     if width <= side && bitmap.height as usize <= side {
         return false;
     }
-    bitmap.rgba.chunks_exact(4).enumerate().all(|(i, px)| {
+    bitmap.rgba.as_chunks::<4>().0.iter().enumerate().all(|(i, px)| {
         let (x, y) = (i % width, i / width);
         (x < side && y < side) || px[3] == 0
     })
@@ -156,11 +156,13 @@ fn icon_to_bitmap(icon: HICON) -> Result<Bitmap, String> {
 
     if !info.hbmColor.is_invalid() {
         let (width, height, mut bgra) = read_bitmap(info.hbmColor)?;
-        if bgra.chunks_exact(4).all(|px| px[3] == 0) {
+        if bgra.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
             // Значок без альфы: прозрачность только в маске (белое — прозрачно).
             match read_bitmap(info.hbmMask) {
                 Ok((mw, mh, mask)) if mw == width && mh >= height => {
-                    for (px, m) in bgra.chunks_exact_mut(4).zip(mask.chunks_exact(4)) {
+                    for (px, m) in
+                        bgra.as_chunks_mut::<4>().0.iter_mut().zip(mask.as_chunks::<4>().0.iter())
+                    {
                         px[3] = if m[0] == 0 { 255 } else { 0 };
                     }
                 }
@@ -180,7 +182,13 @@ fn icon_to_bitmap(icon: HICON) -> Result<Bitmap, String> {
     let half = (width * height * 4) as usize;
     let (and, xor) = mask.split_at(half);
     let mut bgra = vec![0u8; half];
-    for ((px, a), x) in bgra.chunks_exact_mut(4).zip(and.chunks_exact(4)).zip(xor.chunks_exact(4)) {
+    for ((px, a), x) in bgra
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(and.as_chunks::<4>().0.iter())
+        .zip(xor.as_chunks::<4>().0.iter())
+    {
         let transparent = a[0] != 0;
         let white = x[0] != 0;
         match (transparent, white) {
@@ -249,14 +257,14 @@ fn read_bitmap(bitmap: HBITMAP) -> Result<(u32, u32, Vec<u8>), String> {
 
 /// Картинка без альфы (все нули) — непрозрачная.
 fn opaque_if_no_alpha(bgra: &mut [u8]) {
-    if bgra.chunks_exact(4).all(|px| px[3] == 0) {
-        bgra.chunks_exact_mut(4).for_each(|px| px[3] = 255);
+    if bgra.as_chunks::<4>().0.iter().all(|px| px[3] == 0) {
+        bgra.as_chunks_mut::<4>().0.iter_mut().for_each(|px| px[3] = 255);
     }
 }
 
 /// BGRA → RGBA; премультиплицированные цвета делятся обратно на альфу.
 fn to_rgba(width: u32, height: u32, mut px: Vec<u8>, premultiplied: bool) -> Bitmap {
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0.iter_mut() {
         p.swap(0, 2);
         let a = p[3] as u32;
         if premultiplied && a > 0 && a < 255 {
