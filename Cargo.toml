@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/fs", "crates/platform", "crates/ui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+# Крейты не публикуются: дистрибутив — один exe.
+publish = false
+repository = "https://github.com/midnightheartsgames/MH-Files"
+
+[workspace.dependencies]
+mh-files-core = { path = "crates/core" }
+mh-files-fs = { path = "crates/fs" }
+mh-files-platform = { path = "crates/platform" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+nucleo-matcher = "0.3"
+regex = { version = "1", default-features = false, features = ["std", "unicode"] }
+uuid = { version = "1", features = ["v4"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "webp", "tiff"] }
+encoding_rs = "0.8"
+lru = "0.18"
+eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
+raw-window-handle = "0.6"
+windows = "0.62"
+
+[profile.release]
+lto = "thin"
+debug = 1
+
+# Картинки в предпросмотре декодируются и в отладочной сборке — без оптимизаций это секунды.
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
