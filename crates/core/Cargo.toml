@@ -13,3 +13,4 @@ chrono.workspace = true
 nucleo-matcher.workspace = true
 regex.workspace = true
 uuid.workspace = true
+memchr.workspace = true

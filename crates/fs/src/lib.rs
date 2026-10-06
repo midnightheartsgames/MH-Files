@@ -20,6 +20,7 @@ use mh_files_platform::folders::KnownFolder;
 use mh_files_platform::shell::MenuChoice;
 
 pub mod images;
+pub mod indexer;
 pub mod listing;
 pub mod preview;
 pub mod read;
@@ -31,6 +32,7 @@ pub mod transfer;
 pub mod watch;
 
 pub use images::{ImageKey, ImageKind, ImageResult};
+pub use indexer::{IndexResults, IndexStatus, Indexer, VolumeState, VolumeStatus};
 pub use preview::{Preview, PreviewRequest};
 pub use search::SearchQuery;
 pub use shell::ShellJob;
@@ -135,6 +137,16 @@ pub enum Event {
     Menu {
         paths: Vec<PathBuf>,
         choice: Result<MenuChoice, String>,
+    },
+    /// Итог поиска по индексу дисков.
+    IndexResults {
+        ticket: Ticket,
+        result: Result<IndexResults, String>,
+    },
+    /// Индекс изменился: состояние (обход, число записей) и, если `content`, содержимое —
+    /// открытые результаты стоит обновить.
+    IndexChanged {
+        content: bool,
     },
 }
 

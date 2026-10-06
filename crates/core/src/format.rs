@@ -59,7 +59,20 @@ pub fn date_full(time: SystemTime) -> String {
 
 /// `1 объект`, `3 объекта`, `128 объектов`.
 pub fn items(count: usize) -> String {
-    format!("{count} {}", plural(count, "объект", "объекта", "объектов"))
+    format!("{} {}", self::count(count), plural(count, "объект", "объекта", "объектов"))
+}
+
+/// Число с разрядами через пробел: `1 234 567`.
+pub fn count(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Русское множественное число.
@@ -107,6 +120,9 @@ mod tests {
         assert_eq!(items(11), "11 объектов");
         assert_eq!(items(22), "22 объекта");
         assert_eq!(items(128), "128 объектов");
+        assert_eq!(items(12_345), "12 345 объектов");
+        assert_eq!(count(1_234_567), "1 234 567");
+        assert_eq!(count(999), "999");
     }
 
     #[test]

@@ -40,6 +40,9 @@ pub fn show(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
     if let Location::Search { root, query } = &tab.location {
         search_header(ui, tab.search.as_ref(), root, query, tab.listing.len());
     }
+    if matches!(tab.location, Location::Index { .. }) {
+        index_bar(ui, tab, app);
+    }
     let rect = ui.available_rect_before_wrap();
     let mut content =
         ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
@@ -91,6 +94,7 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
         match tab.location {
             Location::Computer => icons::computer(&painter, icon, theme::TEXT_SECONDARY),
             Location::Search { .. } => icons::search(&painter, icon, theme::TEXT_SECONDARY),
+            Location::Index { .. } => icons::search(&painter, icon, theme::accent()),
             Location::Dir(_) => icons::folder(&painter, icon, theme::accent().gamma_multiply(0.8)),
         }
         let close_rect =
@@ -545,6 +549,130 @@ fn search_header(
     );
 }
 
+/// Поле поиска по дискам и итог: сколько найдено, за сколько, в каком состоянии индекс.
+fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
+    let Some(view) = &mut tab.index else { return };
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
+    let field = Rect::from_min_size(rect.min + vec2(10.0, 6.0), vec2(rect.width() - 150.0, 30.0));
+    ui.painter().rect_filled(field, CornerRadius::same(5), theme::CARD);
+    ui.painter().rect_stroke(
+        field,
+        CornerRadius::same(5),
+        Stroke::new(1.0, theme::accent().gamma_multiply(0.6)),
+        egui::StrokeKind::Inside,
+    );
+    icons::search(
+        ui.painter(),
+        Rect::from_center_size(pos2(field.left() + 15.0, field.center().y), vec2(14.0, 14.0)),
+        theme::accent(),
+    );
+    let edit_rect = Rect::from_min_max(field.min + vec2(30.0, 0.0), field.max - vec2(8.0, 0.0));
+    let mut text = view.text.clone();
+    let edit = ui.place(
+        edit_rect,
+        egui::TextEdit::singleline(&mut text)
+            .id(Id::new(("index-query", tab.id)))
+                        .frame(egui::Frame::NONE)
+            .vertical_align(Align::Center)
+            .font(theme::regular(14.0))
+            .hint_text("Имя, маска или фильтры: ext:pdf size:>10mb dm:неделя type:папка in:\"C:\\Проекты\"")
+            .desired_width(edit_rect.width()),
+    );
+    if std::mem::take(&mut view.focus) {
+        edit.request_focus();
+    }
+    let leave = edit.has_focus()
+        && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowDown));
+    let save_rect = Rect::from_min_size(pos2(field.right() + 8.0, field.top()), vec2(130.0, 30.0));
+    let can_save = !text.trim().is_empty();
+    let save = ui.place(
+        save_rect,
+        egui::Button::new(RichText::new("Сохранить поиск").font(theme::regular(13.5)))
+            .corner_radius(CornerRadius::same(5)),
+    );
+    let save = save.on_hover_text("В боковую панель, раздел «Поиски»");
+    if save.clicked() && can_save {
+        app.actions.push(Action::Run(CommandId::SaveSearch));
+    }
+
+    let status = app.indexer.status();
+    let (line, color) = if let Some(error) = &view.error {
+        (error.clone(), theme::WARN)
+    } else if !status.enabled {
+        (
+            "Индекс выключен — включите его в настройках, раздел «Поиск по дискам»".to_string(),
+            theme::WARN,
+        )
+    } else if text.trim().is_empty() {
+        (
+            format!("В индексе {} · {}", format::items(status.entries()), index_state(&status)),
+            theme::TEXT_SECONDARY,
+        )
+    } else {
+        let shown = tab.listing.len();
+        let mut line = if view.total > shown {
+            format!(
+                "Найдено {} — показаны первые {}",
+                format::count(view.total),
+                format::count(shown)
+            )
+        } else {
+            format!("Найдено: {}", format::count(view.total))
+        };
+        line.push_str(&format!(" · {} мс", view.elapsed.as_millis()));
+        if status.busy() {
+            line.push_str(&format!(" · {} — результаты неполные", index_state(&status)));
+        }
+        (line, if status.busy() { theme::accent() } else { theme::TEXT_SECONDARY })
+    };
+    ui.painter().text(
+        pos2(rect.left() + 12.0, rect.bottom() - 13.0),
+        Align2::LEFT_CENTER,
+        line,
+        theme::regular(13.0),
+        color,
+    );
+    if text != view.text {
+        tab.set_index_query(text, &app.workers);
+    }
+    if leave {
+        edit.surrender_focus();
+        tab.cursor_to(0, Modifiers::default());
+    }
+}
+
+/// Состояние индекса одной фразой.
+pub fn index_state(status: &mh_files_fs::IndexStatus) -> String {
+    use mh_files_fs::VolumeState;
+    let mut parts = Vec::new();
+    for volume in &status.volumes {
+        let label = path_label(&volume.root);
+        match &volume.state {
+            VolumeState::Loading => parts.push(format!("{label}: загрузка")),
+            VolumeState::Scanning { dirs } => {
+                parts.push(format!("{label}: обход, папок {}", format::count(*dirs)))
+            }
+            VolumeState::CatchingUp { done, total } => parts.push(format!(
+                "{label}: досмотр изменений {}/{}",
+                format::count(*done),
+                format::count(*total)
+            )),
+            VolumeState::Failed(error) => parts.push(format!("{label}: {error}")),
+            VolumeState::Ready => {}
+        }
+    }
+    if parts.is_empty() {
+        if status.volumes.iter().all(|v| v.live) {
+            "обновляется на лету".to_string()
+        } else {
+            "готов".to_string()
+        }
+    } else {
+        parts.join(", ")
+    }
+}
+
 // ── Список ───────────────────────────────────────────────────────────────────────────
 
 fn list_view(
@@ -584,6 +712,26 @@ fn list_view(
             LoadState::Failed(error) => Some((error.clone(), theme::CRITICAL)),
             LoadState::Done if tab.listing.has_filter() => {
                 Some(("Ничего не подходит под фильтр".to_string(), theme::TEXT_SECONDARY))
+            }
+            LoadState::Done if matches!(tab.location, Location::Index { .. }) => {
+                let empty = matches!(&tab.location, Location::Index { query } if query.is_empty());
+                let searching = tab.index.as_ref().is_some_and(|v| v.searching || v.pending);
+                if empty {
+                    Some((
+                        "Поиск по именам на всех дисках. Пробел — «и», минус — «без»: отчёт -черновик"
+                            .to_string(),
+                        theme::TEXT_DISABLED,
+                    ))
+                } else if searching {
+                    None
+                } else if app.indexer.status().busy() {
+                    Some((
+                        "Пока не найдено: индекс ещё строится, выдача обновится сама".to_string(),
+                        theme::TEXT_SECONDARY,
+                    ))
+                } else {
+                    Some(("Ничего не найдено".to_string(), theme::TEXT_SECONDARY))
+                }
             }
             LoadState::Done if matches!(tab.location, Location::Search { .. }) => {
                 let done = tab.search.as_ref().is_some_and(|s| s.done);
@@ -626,27 +774,26 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
         }
     });
     ui.menu_button("Сортировка", |ui| {
-        let order = tab.listing.options().sort;
-        for column in [
+        let order = tab.options.sort;
+        let index = matches!(tab.location, Location::Index { .. });
+        let columns = [
+            SortColumn::Relevance,
             SortColumn::Name,
             SortColumn::Modified,
             SortColumn::Type,
             SortColumn::Size,
             SortColumn::Created,
-        ] {
+        ];
+        for column in columns.into_iter().filter(|&c| index || c != SortColumn::Relevance) {
             if ui.radio(order.column == column, column.title()).clicked() {
-                let mut options = tab.listing.options();
-                options.sort = order.toggled(column);
-                tab.set_options(options);
+                tab.set_sort(order.toggled(column));
                 ui.close();
             }
         }
         ui.separator();
         let mut descending = order.descending;
         if ui.checkbox(&mut descending, "По убыванию").changed() {
-            let mut options = tab.listing.options();
-            options.sort.descending = descending;
-            tab.set_options(options);
+            tab.set_sort(mh_files_core::sort::SortOrder { descending, ..order });
         }
     });
     for command in [
@@ -729,7 +876,7 @@ fn details(
     focused: bool,
 ) {
     let row_height = row_height(app);
-    let search = matches!(tab.location, Location::Search { .. });
+    let search = tab.location.is_search();
     header(ui, pane, tab, app, search);
     let mut scroll = ScrollArea::vertical().id_salt(("rows", tab.id)).auto_shrink([false, false]);
     if let Some(row) = tab.scroll_to.take() {
@@ -963,7 +1110,13 @@ fn item(
                 } else {
                     format::kind(&entry.extension(), entry.is_dir())
                 };
-                let galley = elided(ui, &kind, font.clone(), secondary, x1 - x0 - 12.0);
+                let width = x1 - x0 - 12.0;
+                // У пути важен конец — папка, в которой лежит файл.
+                let galley = if search {
+                    elided_start(ui, &kind, font.clone(), secondary, width)
+                } else {
+                    elided(ui, &kind, font.clone(), secondary, width)
+                };
                 painter.galley(
                     pos2(x0 + 8.0, rect.center().y - galley.size().y / 2.0),
                     galley,
@@ -1450,6 +1603,29 @@ fn drive_card(
 /// Однострочный текст с многоточием, если не помещается.
 pub fn elided(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<Galley> {
     wrapped(ui, text, font, color, width, 1)
+}
+
+/// Одна строка, не влезло — обрезается начало: `…\Проекты\Отчёты`.
+pub fn elided_start(ui: &Ui, text: &str, font: FontId, color: Color32, width: f32) -> Arc<Galley> {
+    let layout = |text: String| ui.painter().layout_no_wrap(text, font.clone(), color);
+    let full = layout(text.to_string());
+    if full.size().x <= width {
+        return full;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Сколько последних символов влезает вместе с многоточием: двоичный поиск.
+    let (mut low, mut high) = (0, chars.len());
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        let tail: String = chars[chars.len() - mid..].iter().collect();
+        if layout(format!("…{tail}")).size().x <= width {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    let tail: String = chars[chars.len() - low..].iter().collect();
+    layout(format!("…{tail}"))
 }
 
 pub fn wrapped(

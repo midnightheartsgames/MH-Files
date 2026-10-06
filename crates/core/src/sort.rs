@@ -14,6 +14,8 @@ pub enum SortColumn {
     Type,
     Size,
     Created,
+    /// Порядок выдачи поиска по дискам: лучшие совпадения первыми.
+    Relevance,
 }
 
 impl SortColumn {
@@ -24,6 +26,7 @@ impl SortColumn {
             SortColumn::Type => "Тип",
             SortColumn::Size => "Размер",
             SortColumn::Created => "Создан",
+            SortColumn::Relevance => "Совпадение",
         }
     }
 }
@@ -56,6 +59,11 @@ impl SortOrder {
 
 /// Сравнение двух записей. Папки первыми при `folders_first` — независимо от направления.
 pub fn compare(a: &Entry, b: &Entry, order: SortOrder, folders_first: bool) -> Ordering {
+    if order.column == SortColumn::Relevance {
+        // Порядок уже задан выдачей; сортировка устойчивая и его не меняет.
+        return Ordering::Equal;
+    }
+
     if folders_first && a.is_dir() != b.is_dir() {
         return if a.is_dir() { Ordering::Less } else { Ordering::Greater };
     }
@@ -65,6 +73,7 @@ pub fn compare(a: &Entry, b: &Entry, order: SortOrder, folders_first: bool) -> O
         SortColumn::Created => a.created.cmp(&b.created),
         SortColumn::Size => a.size.cmp(&b.size),
         SortColumn::Type => a.extension().cmp(&b.extension()),
+        SortColumn::Relevance => Ordering::Equal,
     };
     let ordering = primary.then_with(|| natural_cmp(&a.name, &b.name));
     if order.descending { ordering.reverse() } else { ordering }

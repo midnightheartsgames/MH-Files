@@ -50,6 +50,11 @@ impl Filter {
     }
 }
 
+/// Маска с `*` и `?` (уже в нижнем регистре) против имени (тоже в нижнем).
+pub fn glob_match(pattern: &[char], text: &[char]) -> bool {
+    glob(pattern, text)
+}
+
 /// Маска с `*` и `?` без рекурсии: жадный проход с откатом к последней звёздочке.
 fn glob(pattern: &[char], text: &[char]) -> bool {
     let (mut p, mut t) = (0, 0);

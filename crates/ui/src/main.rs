@@ -22,6 +22,7 @@ mod statusbar;
 mod storage;
 mod tabs;
 mod theme;
+mod titlebar;
 mod widgets;
 
 use eframe::egui::{IconData, ViewportBuilder};
@@ -35,6 +36,7 @@ fn main() -> eframe::Result {
         .with_app_id("mh-files")
         .with_inner_size([1280.0, 800.0])
         .with_min_inner_size([720.0, 420.0])
+        .with_decorations(!settings.appearance.custom_title_bar)
         .with_icon(app_icon());
     if let Some(window) = session.as_ref().and_then(|s| s.window) {
         // Окно на отключённом мониторе не восстанавливается — откроется по центру.

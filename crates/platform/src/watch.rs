@@ -28,6 +28,23 @@ pub struct Watcher {
 }
 
 impl Watcher {
+    /// Наблюдатель за папкой и всеми вложенными — для индекса диска. Вне Windows его нет:
+    /// индекс там обновляется пересканированием.
+    pub fn recursive(
+        dir: PathBuf,
+        on_events: Box<dyn Fn(Vec<WatchEvent>) + Send + 'static>,
+    ) -> Result<Watcher, String> {
+        #[cfg(windows)]
+        {
+            Ok(Watcher { _inner: crate::win::watch::DirWatcher::recursive(dir, on_events)? })
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (dir, on_events);
+            Err("наблюдение за деревом папок есть только в Windows".into())
+        }
+    }
+
     /// `on_events` вызывается из потока наблюдателя пачками событий.
     pub fn new(
         dir: PathBuf,

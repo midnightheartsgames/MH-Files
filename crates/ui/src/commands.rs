@@ -58,7 +58,10 @@ commands! {
     GoTo => "Перейти к папке (GoTo)", ["goto", "jump"], ["Ctrl+G", "Ctrl+P"];
     CommandPalette => "Палитра команд", ["commands", "palette"], ["Ctrl+Shift+P", "F1"];
     Filter => "Фильтр папки", ["filter", "find"], ["Ctrl+F"];
-    Search => "Поиск во вложенных папках", ["search", "найти"], ["Ctrl+Shift+F"];
+        Search => "Поиск во вложенных папках", ["search", "найти"], ["Ctrl+Shift+F"];
+    SearchEverywhere => "Поиск по дискам", ["everything", "везде", "index", "индекс"], ["Ctrl+E"];
+    SaveSearch => "Сохранить поиск", ["save search", "запомнить"], [];
+    Reindex => "Переиндексировать диски", ["reindex", "rescan", "индекс"], [];
     Copy => "Копировать", ["copy"], ["Ctrl+C"];
     Cut => "Вырезать", ["cut"], ["Ctrl+X"];
     Paste => "Вставить", ["paste"], ["Ctrl+V"];
@@ -320,10 +323,10 @@ mod tests {
         assert!(parse_shortcut("Ctrl+").is_none());
         assert!(parse_shortcut("Ctrl+P+Q").is_none());
         let mut overrides = BTreeMap::new();
-        overrides.insert("Rename".to_string(), vec!["Ctrl+E".to_string()]);
+        overrides.insert("Rename".to_string(), vec!["Ctrl+Y".to_string()]);
         let (keymap, _) = Keymap::new(&overrides);
         let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
-        assert_eq!(keymap.lookup(None, Key::E, ctrl), Lookup::Command(CommandId::Rename));
+        assert_eq!(keymap.lookup(None, Key::Y, ctrl), Lookup::Command(CommandId::Rename));
         assert_eq!(
             keymap.lookup(None, Key::F2, Modifiers::NONE),
             Lookup::None,

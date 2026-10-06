@@ -7,7 +7,7 @@
 
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::Arc;
 
 use windows::Win32::Foundation::{CloseHandle, ERROR_NOTIFY_ENUM_DIR, HANDLE, WAIT_OBJECT_0};
@@ -17,7 +17,7 @@ use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_OVERLAPPED, FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES,
     FILE_NOTIFY_CHANGE_CREATION, FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
     FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SIZE, FILE_SHARE_DELETE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, ReadDirectoryChangesW,
+    FILE_SHARE_WRITE, GetDriveTypeW, OPEN_EXISTING, ReadDirectoryChangesW,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Threading::{
@@ -28,9 +28,12 @@ use windows::core::{HRESULT, PCWSTR};
 use super::com::{describe, wide};
 use crate::watch::WatchEvent;
 
-/// 64 КиБ — предел для сетевых папок. `u32`, чтобы буфер был выровнен по DWORD, как требует
+/// 64 КиБ — предел для сетевых папок. Буфер из `u32`, чтобы он был выровнен по DWORD, как требует
 /// `ReadDirectoryChangesW`.
 const BUFFER_WORDS: usize = 64 * 1024 / 4;
+/// Для дерева целого локального диска: события сыплются пачками, а малый буфер переполняется и
+/// вынуждает полный пересмотр.
+const BIG_BUFFER_WORDS: usize = 512 * 1024 / 4;
 
 type Callback = Box<dyn Fn(Vec<WatchEvent>) + Send + 'static>;
 
@@ -39,7 +42,17 @@ pub struct DirWatcher {
 }
 
 impl DirWatcher {
+    /// Только сама папка, без вложенных.
     pub fn new(dir: PathBuf, on_events: Callback) -> Result<DirWatcher, String> {
+        DirWatcher::start(dir, on_events, false)
+    }
+
+    /// Папка со всем деревом внутри. Имена в событиях — относительные пути (`sub\file.txt`).
+    pub fn recursive(dir: PathBuf, on_events: Callback) -> Result<DirWatcher, String> {
+        DirWatcher::start(dir, on_events, true)
+    }
+
+    fn start(dir: PathBuf, on_events: Callback, subtree: bool) -> Result<DirWatcher, String> {
         let dir_w = wide(&dir);
         // SAFETY: строка живёт до конца вызова; описатель закрывает Handle.
         let handle = unsafe {
@@ -61,7 +74,7 @@ impl DirWatcher {
         let thread_stop = stop.clone();
         std::thread::Builder::new()
             .name("dir-watch".into())
-            .spawn(move || run(&dir, &handle, &io_event, &thread_stop, on_events))
+            .spawn(move || run(&dir, subtree, &handle, &io_event, &thread_stop, on_events))
             .map_err(|error| format!("поток наблюдателя не запущен: {error}"))?;
         Ok(DirWatcher { stop })
     }
@@ -74,8 +87,16 @@ impl Drop for DirWatcher {
     }
 }
 
-fn run(dir: &Path, handle: &Handle, io_event: &Handle, stop: &Handle, on_events: Callback) {
-    let mut buffer = vec![0u32; BUFFER_WORDS];
+fn run(
+    dir: &Path,
+    subtree: bool,
+    handle: &Handle,
+    io_event: &Handle,
+    stop: &Handle,
+    on_events: Callback,
+) {
+    let words = if subtree && !is_network(dir) { BIG_BUFFER_WORDS } else { BUFFER_WORDS };
+    let mut buffer = vec![0u32; words];
     let filter = FILE_NOTIFY_CHANGE_FILE_NAME
         | FILE_NOTIFY_CHANGE_DIR_NAME
         | FILE_NOTIFY_CHANGE_SIZE
@@ -94,7 +115,7 @@ fn run(dir: &Path, handle: &Handle, io_event: &Handle, stop: &Handle, on_events:
                 handle.0,
                 buffer.as_mut_ptr() as *mut _,
                 (buffer.len() * 4) as u32,
-                false,
+                subtree,
                 filter,
                 None,
                 Some(&mut overlapped),
@@ -192,6 +213,25 @@ fn parse(dir: &Path, raw: &[u8]) -> Vec<WatchEvent> {
         events.push(WatchEvent::Removed(orphan));
     }
     events
+}
+
+/// Сетевая ли папка: `\\server\share` или подключённая буква диска. Сеть отвергает буфер больше
+/// 64 КиБ, и наблюдатель сразу остановился бы.
+fn is_network(dir: &Path) -> bool {
+    // Значение DRIVE_REMOTE из winbase.h, как в drives.rs.
+    const DRIVE_REMOTE: u32 = 4;
+    match dir.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => true,
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                let root = wide(format!("{}:\\", letter as char));
+                // SAFETY: строка с нулём живёт до конца вызова.
+                unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == DRIVE_REMOTE }
+            }
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn new_event() -> Result<Handle, String> {
