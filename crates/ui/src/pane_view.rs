@@ -51,6 +51,7 @@ pub fn show(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
         ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
     match &tab.location {
         Location::Computer => computer_view(&mut content, app),
+        Location::Sort { .. } => crate::sorter::show(&mut content, tab, app),
         _ => list_view(&mut content, pane_id, tab, app, focused),
     }
 }
@@ -100,6 +101,7 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             Location::Index { .. } => icons::search(&painter, icon, theme::accent()),
             Location::Archive { .. } => icons::archive(&painter, icon, theme::accent()),
             Location::Duplicates { .. } => icons::duplicates(&painter, icon, theme::accent()),
+            Location::Sort { .. } => icons::sort(&painter, icon, theme::accent()),
             Location::Dir(_) => icons::folder(&painter, icon, theme::accent().gamma_multiply(0.8)),
         }
         let close_rect =
@@ -879,6 +881,7 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
         CommandId::SelectAll,
         CommandId::FolderSizes,
         CommandId::FindDuplicates,
+        CommandId::SortFolder,
         CommandId::Undo,
     ] {
         menu_item(ui, app, command);
@@ -930,6 +933,7 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool) {
         menu_item(ui, app, CommandId::AddFavorite);
         menu_item(ui, app, CommandId::FolderSizes);
         menu_item(ui, app, CommandId::FindDuplicates);
+        menu_item(ui, app, CommandId::SortFolder);
     }
     menu_item(ui, app, CommandId::RevealInExplorer);
     menu_item(ui, app, CommandId::WindowsMenu);

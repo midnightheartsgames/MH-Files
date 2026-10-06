@@ -20,6 +20,7 @@ pub mod selection;
 pub mod session;
 pub mod settings;
 pub mod sort;
+pub mod sorting;
 
 pub use entry::{Attributes, Entry, EntryKind};
 pub use listing::Listing;

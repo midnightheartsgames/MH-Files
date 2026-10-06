@@ -21,6 +21,7 @@ crossbeam-channel.workspace = true
 lru.workspace = true
 eframe.workspace = true
 raw-window-handle.workspace = true
+egui-phosphor.workspace = true
 
 # Под Linux программа собирается только для разработки и проверки интерфейса.
 [target.'cfg(target_os = "linux")'.dependencies]

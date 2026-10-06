@@ -205,6 +205,8 @@ pub struct FilesApp {
     next_id: u64,
     pub workers: Workers,
     pub indexer: Indexer,
+    /// Сортировщик: категории и журналы.
+    pub sorter: crate::sorter::Shared,
     /// Идущие извлечения из архивов.
     pub extractions: Vec<crate::archives::ExtractView>,
     pub next_extract: u64,
@@ -281,6 +283,7 @@ impl FilesApp {
             workers,
             indexer,
             column_cache: Default::default(),
+            sorter: crate::sorter::Shared::load(&storage::config_dir()),
             extractions: Vec::new(),
             next_extract: 0,
             events,
@@ -601,6 +604,15 @@ impl FilesApp {
                 }
             }
             Event::ExtractProgress { id, done, total } => self.on_extract_progress(id, done, total),
+            Event::SortScanProgress { ticket, files } => self.on_sort_scan_progress(ticket, files),
+            Event::SortScanned { ticket, plan } => self.on_sort_scanned(ticket, plan),
+            Event::SortProgress { ticket, done, total, current } => {
+                self.on_sort_progress(ticket, done, total, current)
+            }
+            Event::SortDone { ticket, report, journal } => {
+                self.on_sort_done(ticket, report, journal)
+            }
+            Event::SortLast { ticket, last } => self.on_sort_last(ticket, last),
             Event::Missing { owner, paths } => {
                 if let Some(tab) = self.tab_by_id(owner) {
                     tab.forget_paths(&paths);
@@ -807,6 +819,7 @@ impl FilesApp {
         self.handle_drops(&ctx);
         self.run_actions(&ctx);
         self.drive_index_tabs(&ctx);
+        self.drive_sorters();
         if self.settings.appearance.custom_title_bar {
             crate::titlebar::borders(&ctx);
         }

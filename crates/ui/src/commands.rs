@@ -90,7 +90,8 @@ commands! {
     ViewColumns => "Вид: колонки", ["columns", "miller", "колонки миллера"], ["Ctrl+3"];
     Extract => "Извлечь…", ["extract", "unzip", "распаковать"], ["Ctrl+Shift+E"];
     ExtractHere => "Извлечь в папку рядом", ["extract here", "unzip here", "распаковать сюда"], [];
-    FindDuplicates => "Найти дубликаты", ["duplicates", "дубли", "одинаковые"], [];
+        FindDuplicates => "Найти дубликаты", ["duplicates", "дубли", "одинаковые"], [];
+    SortFolder => "Разложить по папкам", ["sort", "mh sort", "сортировщик", "разобрать", "organize"], ["Ctrl+Shift+O"];
     SelectExtraCopies => "Отметить лишние копии", ["select duplicates", "лишние"], [];
     ToggleHidden => "Показывать скрытые", ["hidden"], ["Ctrl+H"];
     ToggleInspector => "Инспектор", ["inspector", "preview pane"], ["Alt+P"];

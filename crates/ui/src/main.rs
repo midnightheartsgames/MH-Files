@@ -20,6 +20,7 @@ mod preview_ui;
 mod quick;
 mod settings_window;
 mod sidebar;
+mod sorter;
 mod statusbar;
 mod storage;
 mod tabs;

@@ -60,6 +60,15 @@ Electron/WebView и фоновых служб.
 
 ![Дубликаты](docs/duplicates.png)
 
+## Добавлено в 0.5
+
+![Сортировщик](docs/sorter.png)
+
+* Сортировщик из [MH Sort](https://github.com/midnightheartsgames/MH-Sort) прямо в проводнике
+  (Ctrl+Shift+O): раскладывает папку по категориям и типам (`Видео\MP4`) с предпросмотром,
+  галочками по файлам и категориям, перемещением или копированием, отменой по журналу и
+  Ctrl+Z. `categories.json` — того же формата, категории MH Sort подхватываются сами.
+
 Подробности, архитектура, правила проекта и планы — в [PLAN.md](PLAN.md).
 
 ## Сборка
@@ -90,7 +99,7 @@ cargo check --workspace --target x86_64-pc-windows-gnu
 | `crates/platform` | Windows Shell, COM и Win32 за безопасным API |
 | `crates/ui` | интерфейс на eframe/egui, `MH-Files.exe` |
 
-Настройки и сеанс: `%APPDATA%\MH Files\`, снимки индекса: `%LOCALAPPDATA%\MH Files\index\`.
+Настройки, сеанс, категории сортировщика и его журналы: `%APPDATA%\MH Files\`, снимки индекса: `%LOCALAPPDATA%\MH Files\index\`.
 
 ## Лицензия
 
