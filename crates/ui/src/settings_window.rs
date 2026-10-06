@@ -400,7 +400,7 @@ fn about(ui: &mut Ui) {
     card(ui, "Сторонние компоненты", |ui| {
         ui.label(
             RichText::new(
-                "Шрифт Cuprum — SIL Open Font License 1.1. Интерфейс — egui (MIT/Apache-2.0).",
+                "Шрифт Cuprum — SIL Open Font License 1.1. Интерфейс — egui (MIT/Apache-2.0). Нечёткий поиск — nucleo-matcher (MPL-2.0).",
             )
             .color(theme::TEXT_SECONDARY),
         );
