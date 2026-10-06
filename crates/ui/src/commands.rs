@@ -47,8 +47,12 @@ commands! {
     GoBack => "Назад", ["back"], ["Alt+Left", "Backspace"];
     GoForward => "Вперёд", ["forward"], ["Alt+Right"];
     GoUp => "Вверх на уровень", ["up", "parent"], ["Alt+Up"];
-    GoComputer => "Этот компьютер", ["drives", "диски"], [];
-    GoHome => "Домашняя папка", ["home"], [];
+    GoComputer => "Этот компьютер", ["drives", "диски"], ["Alt+G C"];
+    GoHome => "Домашняя папка", ["home"], ["Alt+G H"];
+    GoDesktop => "Рабочий стол", ["desktop"], ["Alt+G E"];
+    GoDocuments => "Документы", ["documents"], ["Alt+G O"];
+    GoDownloads => "Загрузки", ["downloads"], ["Alt+G D"];
+    GoPictures => "Изображения", ["pictures"], ["Alt+G P"];
     Refresh => "Обновить", ["reload", "refresh"], ["F5", "Ctrl+R"];
     EditAddress => "Ввести путь", ["address", "path", "адрес"], ["Ctrl+L", "Alt+D"];
     GoTo => "Перейти к папке (GoTo)", ["goto", "jump"], ["Ctrl+G", "Ctrl+P"];
@@ -68,6 +72,9 @@ commands! {
     DeletePermanent => "Удалить насовсем", ["delete permanently", "shred"], ["Shift+Delete"];
     NewFolder => "Новая папка", ["new folder", "mkdir"], ["Ctrl+Shift+N"];
     Properties => "Свойства", ["properties"], ["Alt+Enter"];
+    WindowsMenu => "Меню Windows", ["context menu", "shell menu", "7-zip", "git"], ["Shift+F10"];
+    Undo => "Отменить", ["undo"], ["Ctrl+Z"];
+    FolderSizes => "Посчитать размеры папок", ["folder size", "размер"], ["Ctrl+Shift+S"];
     OpenTerminal => "Открыть терминал здесь", ["terminal", "console", "powershell"], ["Ctrl+Shift+T"];
     RevealInExplorer => "Показать в Проводнике", ["explorer", "reveal"], [];
     AddFavorite => "Добавить в избранное", ["favorite", "bookmark"], ["Ctrl+D"];
@@ -182,10 +189,40 @@ pub fn format_shortcut(shortcut: &KeyboardShortcut) -> String {
     parts.join("+")
 }
 
+/// Последовательность: одно сочетание или два подряд (`Alt+G D`).
+pub type Chord = Vec<KeyboardShortcut>;
+
+/// `Alt+G D` → два шага. Шаги разделяются пробелом.
+pub fn parse_chord(text: &str) -> Option<Chord> {
+    let steps: Option<Chord> = text.split_whitespace().map(parse_shortcut).collect();
+    steps.filter(|steps| (1..=2).contains(&steps.len()))
+}
+
+pub fn format_chord(chord: &[KeyboardShortcut]) -> String {
+    chord.iter().map(format_shortcut).collect::<Vec<_>>().join(" ")
+}
+
+/// Итог нажатия.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lookup {
+    None,
+    Command(CommandId),
+    /// Первый шаг последовательности: ждать второй.
+    Prefix(KeyboardShortcut),
+}
+
+fn matches(shortcut: &KeyboardShortcut, key: Key, modifiers: Modifiers) -> bool {
+    let ctrl = modifiers.ctrl || modifiers.command;
+    shortcut.logical_key == key
+        && (shortcut.modifiers.ctrl || shortcut.modifiers.command) == ctrl
+        && shortcut.modifiers.shift == modifiers.shift
+        && shortcut.modifiers.alt == modifiers.alt
+}
+
 /// Действующие сочетания: по умолчанию плюс свои из настроек.
 #[derive(Debug, Clone, Default)]
 pub struct Keymap {
-    bindings: Vec<(KeyboardShortcut, CommandId)>,
+    bindings: Vec<(Chord, CommandId)>,
 }
 
 impl Keymap {
@@ -204,8 +241,8 @@ impl Keymap {
                 None => command.default_keys().iter().map(|s| s.to_string()).collect(),
             };
             for text in texts {
-                match parse_shortcut(&text) {
-                    Some(shortcut) => bindings.push((shortcut, command)),
+                match parse_chord(&text) {
+                    Some(chord) => bindings.push((chord, command)),
                     None => errors.push(format!("«{text}» ({})", command.name())),
                 }
             }
@@ -213,32 +250,47 @@ impl Keymap {
         (Keymap { bindings }, errors)
     }
 
-    pub fn shortcuts(&self, command: CommandId) -> impl Iterator<Item = &KeyboardShortcut> {
+    pub fn chords(&self, command: CommandId) -> impl Iterator<Item = &Chord> {
         self.bindings.iter().filter(move |(_, c)| *c == command).map(|(s, _)| s)
     }
 
     /// Первое сочетание команды для подписи в меню.
     pub fn label(&self, command: CommandId) -> String {
-        self.shortcuts(command).next().map(format_shortcut).unwrap_or_default()
+        self.chords(command).next().map(|c| format_chord(c)).unwrap_or_default()
     }
 
     /// Все сочетания через запятую — для настроек.
     pub fn text(&self, command: CommandId) -> String {
-        self.shortcuts(command).map(format_shortcut).collect::<Vec<_>>().join(", ")
+        self.chords(command).map(|c| format_chord(c)).collect::<Vec<_>>().join(", ")
     }
 
-    /// Команда для нажатия с точным набором модификаторов.
-    pub fn lookup(&self, key: Key, modifiers: Modifiers) -> Option<CommandId> {
-        let ctrl = modifiers.ctrl || modifiers.command;
+    /// Что значит нажатие. `pending` — первый шаг уже нажатой последовательности.
+    pub fn lookup(
+        &self,
+        pending: Option<&KeyboardShortcut>,
+        key: Key,
+        modifiers: Modifiers,
+    ) -> Lookup {
+        if let Some(first) = pending {
+            return self
+                .bindings
+                .iter()
+                .find(|(chord, _)| {
+                    chord.len() == 2 && chord[0] == *first && matches(&chord[1], key, modifiers)
+                })
+                .map_or(Lookup::None, |(_, command)| Lookup::Command(*command));
+        }
+        if let Some((_, command)) = self
+            .bindings
+            .iter()
+            .find(|(chord, _)| chord.len() == 1 && matches(&chord[0], key, modifiers))
+        {
+            return Lookup::Command(*command);
+        }
         self.bindings
             .iter()
-            .find(|(s, _)| {
-                s.logical_key == key
-                    && (s.modifiers.ctrl || s.modifiers.command) == ctrl
-                    && s.modifiers.shift == modifiers.shift
-                    && s.modifiers.alt == modifiers.alt
-            })
-            .map(|(_, c)| *c)
+            .find(|(chord, _)| chord.len() == 2 && matches(&chord[0], key, modifiers))
+            .map_or(Lookup::None, |(chord, _)| Lookup::Prefix(chord[0]))
     }
 }
 
@@ -251,8 +303,13 @@ mod tests {
         let (keymap, errors) = Keymap::new(&BTreeMap::new());
         assert!(errors.is_empty(), "{errors:?}");
         let mut seen = std::collections::HashSet::new();
-        for (shortcut, command) in &keymap.bindings {
-            assert!(seen.insert(format_shortcut(shortcut)), "повтор у {command:?}");
+        for (chord, command) in &keymap.bindings {
+            assert!(seen.insert(format_chord(chord)), "повтор у {command:?}");
+        }
+        // Первый шаг последовательности не может быть самостоятельным сочетанием.
+        for (chord, command) in keymap.bindings.iter().filter(|(c, _)| c.len() == 2) {
+            let first = format_shortcut(&chord[0]);
+            assert!(!seen.contains(&first), "{first} у {command:?} — и команда, и начало");
         }
     }
 
@@ -266,8 +323,21 @@ mod tests {
         overrides.insert("Rename".to_string(), vec!["Ctrl+E".to_string()]);
         let (keymap, _) = Keymap::new(&overrides);
         let ctrl = Modifiers { ctrl: true, command: true, ..Modifiers::NONE };
-        assert_eq!(keymap.lookup(Key::E, ctrl), Some(CommandId::Rename));
-        assert_eq!(keymap.lookup(Key::F2, Modifiers::NONE), None, "свои заменяют стандартные");
+        assert_eq!(keymap.lookup(None, Key::E, ctrl), Lookup::Command(CommandId::Rename));
+        assert_eq!(
+            keymap.lookup(None, Key::F2, Modifiers::NONE),
+            Lookup::None,
+            "свои заменяют стандартные"
+        );
+        let alt = Modifiers { alt: true, ..Modifiers::NONE };
+        let Lookup::Prefix(first) = keymap.lookup(None, Key::G, alt) else { panic!() };
+        assert_eq!(
+            keymap.lookup(Some(&first), Key::D, Modifiers::NONE),
+            Lookup::Command(CommandId::GoDownloads)
+        );
+        assert_eq!(keymap.lookup(Some(&first), Key::Z, Modifiers::NONE), Lookup::None);
+        assert_eq!(format_chord(&parse_chord("alt+g  d").unwrap()), "Alt+G D");
+        assert!(parse_chord("A B C").is_none());
         assert_eq!(CommandId::from_key("BatchRename"), Some(CommandId::BatchRename));
     }
 }

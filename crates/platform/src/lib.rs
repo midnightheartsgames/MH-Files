@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 pub mod clipboard;
+pub mod dnd;
 pub mod drives;
 pub mod folders;
 pub mod ops;

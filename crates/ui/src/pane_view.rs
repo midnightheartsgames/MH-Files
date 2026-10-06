@@ -19,12 +19,12 @@ use mh_files_core::selection::Modifiers;
 use mh_files_core::session::ViewMode;
 use mh_files_core::sort::SortColumn;
 
-use crate::app::{Action, DragFiles, DropZone, FilesApp, Target};
+use crate::app::{Action, DragFiles, DragTab, DropZone, FilesApp, Target};
 use crate::commands::CommandId;
-use crate::tabs::{InlineRename, Pane, Tab};
+use crate::tabs::{Band, InlineRename, Pane, Tab};
 use crate::{icons, theme, widgets};
 
-const TAB_HEIGHT: f32 = 30.0;
+pub const TAB_HEIGHT: f32 = 30.0;
 const NAV_HEIGHT: f32 = 34.0;
 const HEADER_HEIGHT: f32 = 24.0;
 
@@ -68,7 +68,10 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
         let tab = &pane.tabs[index];
         let active = index == pane.active;
         let id = Id::new(("tab", tab.id));
-        let response = ui.interact(rect, id, Sense::click());
+        let response = ui.interact(rect, id, Sense::click_and_drag());
+        if response.drag_started() {
+            egui::DragAndDrop::set_payload(ui.ctx(), DragTab { pane: pane.id, tab: tab.id });
+        }
         let hovered = response.hovered();
         let fill = if active {
             theme::WINDOW_BACKGROUND
@@ -564,9 +567,14 @@ fn list_view(
             );
         }
     }
-    let background = ui.interact(area, Id::new(("list-bg", tab.id)), Sense::click());
+    let background = ui.interact(area, Id::new(("list-bg", tab.id)), Sense::click_and_drag());
     if background.clicked() {
         tab.selection.clear();
+    }
+    if background.drag_started()
+        && let Some(pos) = background.interact_pointer_pos()
+    {
+        start_band(ui, tab, pos);
     }
     background.context_menu(|ui| background_menu(ui, app, tab));
 
@@ -641,11 +649,22 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
             tab.set_options(options);
         }
     });
-    for command in [CommandId::Refresh, CommandId::ToggleHidden, CommandId::SelectAll] {
+    for command in [
+        CommandId::Refresh,
+        CommandId::ToggleHidden,
+        CommandId::SelectAll,
+        CommandId::FolderSizes,
+        CommandId::Undo,
+    ] {
         menu_item(ui, app, command);
     }
     ui.separator();
-    for command in [CommandId::AddFavorite, CommandId::OpenTerminal, CommandId::Properties] {
+    for command in [
+        CommandId::AddFavorite,
+        CommandId::OpenTerminal,
+        CommandId::WindowsMenu,
+        CommandId::Properties,
+    ] {
         menu_item(ui, app, command);
     }
 }
@@ -678,8 +697,10 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool) {
     ui.separator();
     if is_dir {
         menu_item(ui, app, CommandId::AddFavorite);
+        menu_item(ui, app, CommandId::FolderSizes);
     }
     menu_item(ui, app, CommandId::RevealInExplorer);
+    menu_item(ui, app, CommandId::WindowsMenu);
     menu_item(ui, app, CommandId::Properties);
 }
 
@@ -714,6 +735,8 @@ fn details(
     if let Some(row) = tab.scroll_to.take() {
         scroll =
             scroll.vertical_scroll_offset(scroll_for(tab, row as f32 * row_height, row_height));
+    } else if let Some(offset) = tab.scroll_request.take() {
+        scroll = scroll.vertical_scroll_offset(offset);
     }
     let count = tab.listing.len();
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -727,7 +750,9 @@ fn details(
     });
     tab.scroll_offset = output.state.offset.y;
     tab.viewport_height = output.inner_rect.height();
+    tab.list_top = output.inner_rect.top();
     tab.page_rows = ((output.inner_rect.height() / row_height) as usize).saturating_sub(1).max(1);
+    update_band(ui, tab, output.inner_rect, Geometry::Rows { height: row_height });
 }
 
 /// Положение столбцов в строке шириной `width`. В узкой панели сначала прячется «Тип»,
@@ -887,6 +912,8 @@ fn item(
     }
 
     let dim = app.cut.contains(&path) || entry.hidden();
+    // Где кончается столбец имени: потянуть строку правее — рамка, а не перенос файлов.
+    let mut name_end = f32::INFINITY;
     let text_color = if dim { theme::TEXT_DISABLED } else { theme::TEXT_PRIMARY };
     let shown_name = display_name(&entry, app.settings.files.show_extensions);
     let renaming = tab.rename.as_ref().is_some_and(|r| r.path == path);
@@ -943,15 +970,20 @@ fn item(
                     secondary,
                 );
             }
-            if !entry.is_dir() {
-                painter.text(
-                    pos2(layout.size.1 - 10.0, rect.center().y),
-                    Align2::RIGHT_CENTER,
-                    format::size_column(entry.size),
-                    font,
-                    secondary,
-                );
+            let size = if !entry.is_dir() {
+                Some(format::size_column(entry.size))
+            } else if let Some(size) = app.folder_sizes.get(&path) {
+                Some(format::size(size.bytes))
+            } else if app.sizes_pending.contains(&path) {
+                Some("…".to_string())
+            } else {
+                None
+            };
+            if let Some(size) = size {
+                let at = pos2(layout.size.1 - 10.0, rect.center().y);
+                painter.text(at, Align2::RIGHT_CENTER, size, font, secondary);
             }
+            name_end = layout.name.1;
         }
         Look::Tile => {
             let label_height = 34.0;
@@ -1012,7 +1044,12 @@ fn item(
     if response.secondary_clicked() && !selected {
         tab.selection.select_only(path.clone());
     }
-    if response.drag_started() && !renaming {
+    let press = ui.input(|i| i.pointer.press_origin());
+    if response.drag_started() && !renaming && press.is_some_and(|p| p.x > name_end) {
+        if let Some(pos) = press {
+            start_band(ui, tab, pos);
+        }
+    } else if response.drag_started() && !renaming {
         if !selected {
             tab.selection.select_only(path.clone());
         }
@@ -1109,6 +1146,8 @@ fn grid(
     if let Some(index) = tab.scroll_to.take() {
         let top = (index / columns) as f32 * tile_size.y;
         scroll = scroll.vertical_scroll_offset(scroll_for(tab, top, tile_size.y));
+    } else if let Some(offset) = tab.scroll_request.take() {
+        scroll = scroll.vertical_scroll_offset(offset);
     }
     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
     let output = scroll.show_rows(ui, tile_size.y, rows, |ui, range| {
@@ -1130,7 +1169,90 @@ fn grid(
     });
     tab.scroll_offset = output.state.offset.y;
     tab.viewport_height = output.inner_rect.height();
+    tab.list_top = output.inner_rect.top();
     tab.page_rows = ((output.inner_rect.height() / tile_size.y) as usize).max(1);
+    let geometry =
+        Geometry::Tiles { size: tile_size, columns, left: output.inner_rect.left() + 4.0 };
+    update_band(ui, tab, output.inner_rect, geometry);
+}
+
+// ── Рамка выделения ──────────────────────────────────────────────────────────────────
+
+/// Раскладка списка, по которой рамка находит строки или плитки.
+#[derive(Clone, Copy)]
+enum Geometry {
+    Rows { height: f32 },
+    Tiles { size: egui::Vec2, columns: usize, left: f32 },
+}
+
+/// Экран → координаты содержимого (прокрутка учтена).
+fn to_content(tab: &Tab, pos: egui::Pos2) -> egui::Pos2 {
+    pos2(pos.x, pos.y - tab.list_top + tab.scroll_offset)
+}
+
+fn start_band(ui: &Ui, tab: &mut Tab, pos: egui::Pos2) {
+    let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
+    let base = if ctrl { tab.selection.snapshot() } else { Default::default() };
+    tab.rename = None;
+    tab.band = Some(Band { origin: to_content(tab, pos), base });
+}
+
+/// Строки (или плитки), которые задевает прямоугольник в координатах содержимого.
+fn band_rows(area: Rect, geometry: Geometry, count: usize) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    match geometry {
+        Geometry::Rows { height } => {
+            let first = (area.top() / height).floor().max(0.0) as usize;
+            let last = ((area.bottom() / height).floor().max(0.0) as usize).min(count - 1);
+            (first..=last).collect()
+        }
+        Geometry::Tiles { size, columns, left } => {
+            let first_row = (area.top() / size.y).floor().max(0.0) as usize;
+            let last_row = (area.bottom() / size.y).floor().max(0.0) as usize;
+            let mut hit = Vec::new();
+            for row in first_row..=last_row {
+                for column in 0..columns {
+                    let x0 = left + column as f32 * size.x;
+                    let index = row * columns + column;
+                    if index < count && x0 + size.x > area.left() && x0 < area.right() {
+                        hit.push(index);
+                    }
+                }
+            }
+            hit
+        }
+    }
+}
+
+/// Тянется рамка: выделить задетое, прокрутить у края, нарисовать.
+fn update_band(ui: &mut Ui, tab: &mut Tab, view: Rect, geometry: Geometry) {
+    let Some(band) = &tab.band else { return };
+    let (down, pointer) = ui.input(|i| (i.pointer.primary_down(), i.pointer.latest_pos()));
+    let Some(pointer) = pointer.filter(|_| down) else {
+        tab.band = None;
+        return;
+    };
+    let origin = band.origin;
+    let base = band.base.clone();
+    let area = Rect::from_two_pos(origin, to_content(tab, pointer));
+    let rows = band_rows(area, geometry, tab.listing.len());
+    tab.selection.set_rows(&tab.listing, rows, &base);
+    // У края списка рамка сама прокручивает.
+    let edge = 24.0;
+    if pointer.y < view.top() + edge {
+        tab.scroll_request = Some((tab.scroll_offset - 14.0).max(0.0));
+    } else if pointer.y > view.bottom() - edge {
+        tab.scroll_request = Some(tab.scroll_offset + 14.0);
+    }
+    let start = pos2(origin.x, origin.y + tab.list_top - tab.scroll_offset);
+    let screen = Rect::from_two_pos(start, pointer).intersect(view);
+    let painter = ui.painter_at(view);
+    painter.rect_filled(screen, CornerRadius::same(2), theme::accent().gamma_multiply(0.12));
+    let stroke = Stroke::new(1.0, theme::accent());
+    painter.rect_stroke(screen, CornerRadius::same(2), stroke, egui::StrokeKind::Inside);
+    ui.ctx().request_repaint();
 }
 
 // ── Переименование в строке ──────────────────────────────────────────────────────────

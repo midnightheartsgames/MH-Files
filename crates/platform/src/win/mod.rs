@@ -2,8 +2,10 @@
 
 pub mod clipboard;
 pub mod com;
+pub mod dnd;
 pub mod drives;
 pub mod folders;
+pub mod menu;
 pub mod ops;
 pub mod shell;
 pub mod thumbs;

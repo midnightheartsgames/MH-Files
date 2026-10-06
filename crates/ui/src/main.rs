@@ -11,6 +11,7 @@ mod dialogs;
 mod icons;
 mod images;
 mod inspector;
+mod operations;
 mod palette;
 mod pane_view;
 mod preview_ui;
@@ -46,7 +47,17 @@ fn main() -> eframe::Result {
         }
         viewport = viewport.with_maximized(window.maximized);
     }
-    let options = eframe::NativeOptions { viewport, persist_window: false, ..Default::default() };
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut options =
+        eframe::NativeOptions { viewport, persist_window: false, ..Default::default() };
+    #[cfg(windows)]
+    {
+        // Ctrl+V с файлами в буфере и Shift+Delete egui забирает себе — их видит перехватчик.
+        options.event_loop_builder = Some(Box::new(|builder| {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            builder.with_msg_hook(mh_files_platform::window::message_hook);
+        }));
+    }
     eframe::run_native(
         "MH Files",
         options,

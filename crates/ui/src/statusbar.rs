@@ -1,6 +1,6 @@
 //! Строка состояния: сколько объектов, что выделено, ход операций, сообщения, вид.
 
-use eframe::egui::{Align, Layout, RichText, Ui};
+use eframe::egui::{Align, Layout, Popup, Rect, RichText, Sense, Spinner, Ui, pos2, vec2};
 use mh_files_core::format;
 use mh_files_core::location::Location;
 use mh_files_core::session::ViewMode;
@@ -38,11 +38,12 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
                 }
             }
         }
-        for (_, text) in &app.ops_running {
-            ui.add(eframe::egui::Spinner::new().size(12.0).color(theme::accent()));
-            ui.label(
-                RichText::new(format!("{text}…")).font(theme::regular(13.0)).color(theme::accent()),
-            );
+        if !app.operations.list.is_empty() {
+            operations(ui, app);
+        }
+        if let Some((first, _)) = app.pending_chord {
+            let text = format!("{} …", crate::commands::format_shortcut(&first));
+            ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::accent()));
         }
         if let Some(status) = &app.status {
             let color = match status.level {
@@ -87,4 +88,91 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             }
         });
     });
+}
+
+/// Текущая операция с полосой хода; по щелчку — список всех с паузой и отменой.
+fn operations(ui: &mut Ui, app: &mut FilesApp) {
+    let list = app.operations.list.clone();
+    let current = list.iter().find(|op| op.running).unwrap_or(&list[0]);
+    let paused = app.ops.is_paused(current.id);
+    let response = ui
+        .horizontal(|ui| {
+            if paused {
+                ui.label(RichText::new("пауза").font(theme::regular(13.0)).color(theme::WARN));
+            } else {
+                ui.add(Spinner::new().size(12.0).color(theme::accent()));
+            }
+            ui.label(
+                RichText::new(&current.label).font(theme::regular(13.0)).color(theme::accent()),
+            );
+            progress_bar(ui, current.progress.fraction(), 110.0);
+            if list.len() > 1 {
+                let more = format!("+{} в очереди", list.len() - 1);
+                ui.label(
+                    RichText::new(more).font(theme::regular(12.5)).color(theme::TEXT_SECONDARY),
+                );
+            }
+        })
+        .response
+        .interact(Sense::click())
+        .on_hover_text("Операции: пауза и отмена");
+    Popup::from_toggle_button_response(&response).show(|ui| {
+        ui.set_min_width(380.0);
+        for op in &list {
+            ui.horizontal(|ui| {
+                let paused = app.ops.is_paused(op.id);
+                let state = if !op.running {
+                    "в очереди"
+                } else if paused {
+                    "пауза"
+                } else {
+                    ""
+                };
+                ui.label(RichText::new(&op.label).font(theme::regular(14.0)));
+                if !state.is_empty() {
+                    ui.label(RichText::new(state).color(theme::TEXT_SECONDARY));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Отменить").clicked() {
+                        app.ops.cancel(op.id);
+                    }
+                    let toggle = if paused { "Продолжить" } else { "Пауза" };
+                    if op.running && ui.button(toggle).clicked() {
+                        app.ops.pause(op.id, !paused);
+                    }
+                });
+            });
+            progress_bar(ui, op.progress.fraction(), ui.available_width());
+            if let Some(item) = &op.progress.item {
+                ui.label(
+                    RichText::new(item.display().to_string())
+                        .font(theme::regular(12.0))
+                        .color(theme::TEXT_DISABLED),
+                );
+            }
+            ui.add_space(6.0);
+        }
+    });
+}
+
+/// Полоса хода; без известного объёма — бегущая.
+fn progress_bar(ui: &mut Ui, fraction: Option<f32>, width: f32) {
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 6.0), Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 3, theme::FIELD);
+    match fraction {
+        Some(fraction) => {
+            let mut filled = rect;
+            filled.set_width((rect.width() * fraction).max(rect.height()));
+            painter.rect_filled(filled, 3, theme::accent());
+        }
+        None => {
+            let t = ui.input(|i| i.time) as f32;
+            let span = rect.width() * 0.3;
+            let x = rect.left() + (t * 0.8).fract() * (rect.width() - span);
+            let part = Rect::from_min_size(pos2(x, rect.top()), vec2(span, rect.height()));
+            painter.rect_filled(part, 3, theme::accent());
+            ui.ctx().request_repaint();
+        }
+    }
 }

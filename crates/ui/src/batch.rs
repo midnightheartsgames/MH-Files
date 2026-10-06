@@ -11,9 +11,8 @@ use eframe::egui::{
 use mh_files_core::rename::{
     self, CaseMode, ExtensionRule, InsertAt, Item, Numbering, Rule, Status,
 };
-use mh_files_fs::Ticket;
 
-use crate::app::{FilesApp, OWNER_BATCH};
+use crate::app::FilesApp;
 use crate::tabs::Tab;
 use crate::{icons, theme, widgets};
 
@@ -175,9 +174,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         let state = app.batch.take().expect("окно открыто");
         if let Ok(names) = &state.names {
             match rename::plan(&state.items, names, &state.statuses) {
-                Ok(plan) if !plan.is_empty() => {
-                    app.workers.batch_rename(Ticket { owner: OWNER_BATCH, generation: 0 }, plan);
-                }
+                Ok(plan) if !plan.is_empty() => app.start_batch_rename(plan),
                 Ok(_) => {}
                 Err(error) => app.set_status(error, crate::app::Level::Error),
             }

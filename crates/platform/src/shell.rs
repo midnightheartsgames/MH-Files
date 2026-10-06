@@ -81,3 +81,42 @@ fn spawn(program: &str, args: &[&std::ffi::OsStr]) -> Result<(), String> {
         .map(|_| ())
         .map_err(|error| format!("{program}: {error}"))
 }
+
+/// Что выбрали в меню Windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuChoice {
+    /// Меню закрыли, ничего не выбрав.
+    Dismissed,
+    /// Выполнена команда; `verb` — её имя для Shell («delete», «cut», «7-Zip.Extract»…), если
+    /// расширение его сообщило. Нужен, чтобы MH Files сам обработал «Переименовать»,
+    /// «Вырезать» и т. п. без расхождений со своим состоянием.
+    Invoked { verb: Option<String> },
+}
+
+/// Контекстное меню Shell для объектов одной папки — с пунктами сторонних расширений
+/// (7-Zip, Git, VLC…), там, где сейчас курсор. Блокирует до закрытия меню; вызывать из
+/// фонового потока: окно меню принадлежит этому потоку.
+pub fn context_menu(paths: &[PathBuf]) -> Result<MenuChoice, String> {
+    #[cfg(windows)]
+    {
+        crate::win::menu::context_menu(paths)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = paths;
+        Err("меню Windows есть только в Windows".into())
+    }
+}
+
+/// Меню пустого места папки: «Создать ▸», «Вставить ярлык», пункты расширений.
+pub fn background_menu(dir: &Path) -> Result<MenuChoice, String> {
+    #[cfg(windows)]
+    {
+        crate::win::menu::background_menu(dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        Err("меню Windows есть только в Windows".into())
+    }
+}

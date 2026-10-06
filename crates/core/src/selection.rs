@@ -105,6 +105,34 @@ impl Selection {
         }
     }
 
+    /// Выделение как есть — основа для рамки с Ctrl.
+    pub fn snapshot(&self) -> HashSet<PathBuf> {
+        self.selected.clone()
+    }
+
+    /// Рамка мышью: выделены строки `rows` плюс `base` (рамка с Ctrl добавляет к прежнему).
+    pub fn set_rows(
+        &mut self,
+        listing: &Listing,
+        rows: impl IntoIterator<Item = usize>,
+        base: &HashSet<PathBuf>,
+    ) {
+        let mut selected = base.clone();
+        let mut last = None;
+        for row in rows {
+            if let Some(entry) = listing.get(row) {
+                let path = entry.path();
+                last = Some(path.clone());
+                selected.insert(path);
+            }
+        }
+        self.selected = selected;
+        if let Some(path) = last {
+            self.cursor = Some(path.clone());
+            self.anchor = Some(path);
+        }
+    }
+
     /// Ctrl+Space: переключить строку под курсором.
     pub fn toggle_cursor(&mut self) {
         if let Some(path) = self.cursor.clone()
@@ -210,6 +238,18 @@ mod tests {
         assert_eq!(names(&s, &l), ["b"], "без выделения цель — курсор");
         s.invert(&l);
         assert_eq!(s.len(), 5);
+    }
+
+    #[test]
+    fn band_selection_adds_to_base() {
+        let l = listing();
+        let mut s = Selection::default();
+        s.click(&l, 0, Modifiers::default());
+        let base = s.snapshot();
+        s.set_rows(&l, 2..=3, &base);
+        assert_eq!(names(&s, &l), ["a", "c", "d"]);
+        s.set_rows(&l, [4], &HashSet::new());
+        assert_eq!(names(&s, &l), ["e"]);
     }
 
     #[test]

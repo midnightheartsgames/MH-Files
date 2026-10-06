@@ -27,6 +27,10 @@ pub enum ShellJob {
     },
     /// Очистить буфер после вставки вырезанного.
     ClearClipboard,
+    /// Контекстное меню Windows для объектов.
+    ContextMenu(Vec<PathBuf>),
+    /// Меню Windows для пустого места папки.
+    BackgroundMenu(PathBuf),
 }
 
 pub(crate) fn run(workers: &Workers, job: ShellJob) {
@@ -46,6 +50,16 @@ pub(crate) fn run(workers: &Workers, job: ShellJob) {
         }
         ShellJob::ClearClipboard => {
             clipboard::clear();
+            return;
+        }
+        ShellJob::ContextMenu(paths) => {
+            let choice = shell::context_menu(&paths);
+            workers.send(Event::Menu { paths, choice });
+            return;
+        }
+        ShellJob::BackgroundMenu(dir) => {
+            let choice = shell::background_menu(&dir);
+            workers.send(Event::Menu { paths: vec![dir], choice });
             return;
         }
     };

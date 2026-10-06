@@ -58,19 +58,33 @@ impl LayoutNode {
 
     /// Делит панель `target` пополам; новая встаёт второй. `false` — такой панели нет.
     pub fn split(&mut self, target: PaneId, direction: SplitDirection, new: PaneId) -> bool {
+        self.split_at(target, direction, new, false)
+    }
+
+    /// То же, но новая панель может встать первой (слева или сверху) — бросок вкладки в
+    /// левый или верхний край панели.
+    pub fn split_at(
+        &mut self,
+        target: PaneId,
+        direction: SplitDirection,
+        new: PaneId,
+        new_first: bool,
+    ) -> bool {
         match self {
             LayoutNode::Pane(id) if *id == target => {
+                let (a, b) = if new_first { (new, target) } else { (target, new) };
                 *self = LayoutNode::Split {
                     direction,
                     ratio: 0.5,
-                    first: Box::new(LayoutNode::Pane(target)),
-                    second: Box::new(LayoutNode::Pane(new)),
+                    first: Box::new(LayoutNode::Pane(a)),
+                    second: Box::new(LayoutNode::Pane(b)),
                 };
                 true
             }
             LayoutNode::Pane(_) => false,
             LayoutNode::Split { first, second, .. } => {
-                first.split(target, direction, new) || second.split(target, direction, new)
+                first.split_at(target, direction, new, new_first)
+                    || second.split_at(target, direction, new, new_first)
             }
         }
     }
@@ -130,6 +144,8 @@ mod tests {
         assert_eq!(layout, LayoutNode::Pane(PaneId(3)));
         assert!(!layout.remove(PaneId(3)), "последняя панель остаётся");
         assert!(!layout.split(PaneId(9), SplitDirection::Vertical, PaneId(10)));
+        assert!(layout.split_at(PaneId(3), SplitDirection::Horizontal, PaneId(4), true));
+        assert_eq!(layout.panes(), [PaneId(4), PaneId(3)], "новая панель слева");
     }
 
     #[test]

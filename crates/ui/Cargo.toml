@@ -26,5 +26,9 @@ raw-window-handle.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { workspace = true, features = ["x11", "wayland"] }
 
+# Перехватчик сообщений Windows (`with_msg_hook`): та же версия, что внутри eframe.
+[target.'cfg(windows)'.dependencies]
+winit = { version = "0.30", default-features = false }
+
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3"
