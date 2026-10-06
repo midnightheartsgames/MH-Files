@@ -3,18 +3,21 @@
 use std::path::PathBuf;
 
 use eframe::egui::{self, Key};
-use mh_files_core::layout::SplitDirection;
+use mh_files_core::layout::{PaneId, SplitDirection};
 use mh_files_core::location::Location;
 use mh_files_core::names;
 use mh_files_core::selection::Modifiers;
 use mh_files_core::session::{TabSession, ViewMode};
 use mh_files_core::settings::{Favorite, Group, NewTabLocation};
-use mh_files_fs::ShellJob;
+use mh_files_fs::{ShellJob, Transfer};
 use mh_files_platform::clipboard::ClipboardFiles;
+use mh_files_platform::folders::KnownFolder;
 use mh_files_platform::ops::FileOp;
+use mh_files_platform::window::Intercepted;
 
-use crate::app::{Action, FilesApp, Followup, Level, Target, root_of};
-use crate::commands::CommandId;
+use crate::app::{Action, FilesApp, Level, TabTarget, Target, root_of};
+use crate::commands::{CommandId, Lookup};
+use crate::operations::Followup;
 use crate::tabs::{InlineRename, Pane};
 use crate::{batch, dialogs, palette, quick, sidebar};
 
@@ -36,6 +39,8 @@ const IN_TEXT: &[CommandId] = &[
 
 impl FilesApp {
     pub(crate) fn handle_keys(&mut self, ctx: &egui::Context) {
+        // Сбрасываются каждый кадр, даже когда открыт диалог: иначе сработают позже невпопад.
+        let intercepted = mh_files_platform::window::take_intercepted();
         let overlay = self.palette.is_some()
             || self.dialog.is_some()
             || self.batch.is_some()
@@ -45,22 +50,78 @@ impl FilesApp {
         }
         let text_focus = ctx.egui_wants_keyboard_input();
         let renaming = self.tab().rename.is_some();
+        if !text_focus && !renaming {
+            for shortcut in intercepted {
+                let command = match shortcut {
+                    Intercepted::Paste => CommandId::Paste,
+                    Intercepted::DeletePermanent => CommandId::DeletePermanent,
+                };
+                self.actions.push(Action::Run(command));
+            }
+        }
         let events = ctx.input(|i| i.events.clone());
         let mut consumed = Vec::new();
+        // Буква второго шага последовательности приходит и как текст — его не набирать.
+        let mut swallow_text = false;
         for (index, event) in events.iter().enumerate() {
             match event {
                 egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                    if !text_focus && !renaming && self.list_key(*key, *modifiers) {
+                    let pending = self.chord_pending();
+                    if pending.is_none()
+                        && !text_focus
+                        && !renaming
+                        && self.list_key(*key, *modifiers)
+                    {
                         consumed.push(index);
                         continue;
                     }
-                    if let Some(command) = self.keymap.lookup(*key, *modifiers) {
-                        if (text_focus || renaming) && !IN_TEXT.contains(&command) {
-                            continue;
+                    match self.keymap.lookup(pending.as_ref(), *key, *modifiers) {
+                        Lookup::Command(command) => {
+                            self.pending_chord = None;
+                            if (text_focus || renaming) && !IN_TEXT.contains(&command) {
+                                continue;
+                            }
+                            self.actions.push(Action::Run(command));
+                            consumed.push(index);
+                            swallow_text = pending.is_some();
                         }
-                        self.actions.push(Action::Run(command));
-                        consumed.push(index);
+                        Lookup::Prefix(first) if !text_focus && !renaming => {
+                            self.pending_chord = Some((first, std::time::Instant::now()));
+                            consumed.push(index);
+                            swallow_text = true;
+                        }
+                        Lookup::Prefix(_) => {}
+                        Lookup::None if pending.is_some() => {
+                            // Неизвестный второй шаг: последовательность сброшена, клавиша съедена.
+                            self.pending_chord = None;
+                            consumed.push(index);
+                            swallow_text = true;
+                        }
+                        Lookup::None => {}
                     }
+                }
+                // egui превращает Ctrl+C/X/V в отдельные события, а не в нажатия клавиш.
+                egui::Event::Copy if !text_focus && !renaming => {
+                    self.actions.push(Action::Run(CommandId::Copy));
+                    consumed.push(index);
+                }
+                egui::Event::Cut if !text_focus && !renaming => {
+                    // В Windows Shift+Delete тоже приходит как «Вырезать» — его ловит перехватчик.
+                    if ctx.input(|i| i.modifiers.ctrl || i.modifiers.command) {
+                        self.actions.push(Action::Run(CommandId::Cut));
+                    }
+                    consumed.push(index);
+                }
+                egui::Event::Paste(_) if !text_focus && !renaming => {
+                    // В Windows вставку видит перехватчик (и без текста в буфере).
+                    if !cfg!(windows) {
+                        self.actions.push(Action::Run(CommandId::Paste));
+                    }
+                    consumed.push(index);
+                }
+                egui::Event::Text(_) if swallow_text => {
+                    swallow_text = false;
+                    consumed.push(index);
                 }
                 egui::Event::Text(text) if !text_focus && !renaming => {
                     let modifiers = ctx.input(|i| i.modifiers);
@@ -179,6 +240,8 @@ impl FilesApp {
             }
             Action::Shell(job) => workers.shell(job),
             Action::Status(text, level) => self.set_status(text, level),
+            Action::MoveTab { from, tab, target } => self.move_tab(from, tab, target),
+            Action::FolderSizes(dirs) => self.request_folder_sizes(dirs),
         }
     }
 
@@ -201,6 +264,9 @@ impl FilesApp {
             ClosePane => self.panes.len() > 1,
             ReopenTab => !self.closed.is_empty(),
             BatchRename => has_targets,
+            Undo => self.operations.undo_label().is_some(),
+            WindowsMenu => cfg!(windows) && (has_targets || has_dir),
+            FolderSizes => has_dir,
             _ => true,
         }
     }
@@ -237,6 +303,46 @@ impl FilesApp {
             }
             GoComputer => self.open_location(Location::Computer, Target::Current),
             GoHome => self.open_location(self.home_location(), Target::Current),
+            GoDesktop | GoDocuments | GoDownloads | GoPictures => {
+                let wanted = match command {
+                    GoDesktop => KnownFolder::Desktop,
+                    GoDocuments => KnownFolder::Documents,
+                    GoDownloads => KnownFolder::Downloads,
+                    _ => KnownFolder::Pictures,
+                };
+                match self.places.iter().find(|(folder, _)| *folder == wanted) {
+                    Some((_, path)) => {
+                        self.open_location(Location::Dir(path.clone()), Target::Current)
+                    }
+                    None => self.set_status(format!("нет папки «{}»", wanted.title()), Level::Info),
+                }
+            }
+            Undo => self.undo(),
+            WindowsMenu => {
+                let job = if targets.is_empty() {
+                    dir.map(ShellJob::BackgroundMenu)
+                } else {
+                    Some(ShellJob::ContextMenu(targets))
+                };
+                if let Some(job) = job {
+                    workers.shell(job);
+                }
+            }
+            FolderSizes => {
+                let tab = self.tab();
+                // Выделенные папки, а без них — все папки списка.
+                let selected: Vec<PathBuf> = targets
+                    .iter()
+                    .filter(|p| tab.entry(p).is_some_and(|e| e.is_dir()))
+                    .cloned()
+                    .collect();
+                let dirs = if selected.is_empty() {
+                    tab.listing.iter().filter(|e| e.is_dir()).map(|e| e.path()).collect()
+                } else {
+                    selected
+                };
+                self.request_folder_sizes(dirs);
+            }
             Refresh => {
                 self.tab_mut().reload(&workers, true);
                 if matches!(self.tab().location, Location::Computer) {
@@ -284,12 +390,8 @@ impl FilesApp {
                     self.other_pane().and_then(|id| self.pane(id)).and_then(|p| p.tab().dir());
                 match dest {
                     Some(dest) => {
-                        let op = if command == CopyToOtherPane {
-                            FileOp::Copy { sources: targets, dest }
-                        } else {
-                            FileOp::Move { sources: targets, dest }
-                        };
-                        self.ops.submit(op);
+                        let copy = command == CopyToOtherPane;
+                        self.start_transfer(Transfer { sources: targets, dest, copy }, None);
                     }
                     None => self.set_status("в соседней панели не папка", Level::Error),
                 }
@@ -338,7 +440,7 @@ impl FilesApp {
                 if self.settings.files.confirm_recycle {
                     self.dialog = Some(dialogs::Dialog::delete(targets, false));
                 } else {
-                    self.ops.submit(FileOp::Delete { paths: targets, permanent: false });
+                    self.submit(FileOp::Delete { paths: targets, permanent: false }, None);
                 }
             }
             DeletePermanent => self.dialog = Some(dialogs::Dialog::delete(targets, true)),
@@ -348,9 +450,11 @@ impl FilesApp {
                     let existing: Vec<&str> =
                         tab.listing.all().iter().map(|e| e.name.as_str()).collect();
                     let name = names::unique_name("Новая папка", &existing);
-                    let id = self.ops.submit(FileOp::NewFolder { parent, name });
-                    let tab_id = self.tab().id;
-                    self.followups.insert(id, Followup::RenameCreated { tab: tab_id });
+                    let tab = self.tab().id;
+                    self.submit(
+                        FileOp::NewFolder { parent, name },
+                        Some(Followup::RenameCreated { tab }),
+                    );
                 }
             }
             Properties => {
@@ -554,6 +658,48 @@ impl FilesApp {
         }
     }
 
+    /// Перенести вкладку в другую панель или в новую панель рядом.
+    fn move_tab(&mut self, from: PaneId, tab_id: u64, target: TabTarget) {
+        let Some(source) = self.panes.iter().position(|p| p.id == from) else { return };
+        let Some(index) = self.panes[source].tabs.iter().position(|t| t.id == tab_id) else {
+            return;
+        };
+        let alone = self.panes[source].tabs.len() == 1;
+        match target {
+            TabTarget::Into(pane) if pane == from => return,
+            TabTarget::Split { pane, .. } if pane == from && alone => return,
+            _ => {}
+        }
+        let tab = self.panes[source].tabs.remove(index);
+        let pane = &mut self.panes[source];
+        if pane.active >= pane.tabs.len() || pane.active > index {
+            pane.active = pane.active.saturating_sub(1);
+        }
+        match target {
+            TabTarget::Into(pane_id) => {
+                if let Some(pane) = self.pane_mut(pane_id) {
+                    pane.tabs.push(tab);
+                    pane.active = pane.tabs.len() - 1;
+                }
+                self.focused = pane_id;
+            }
+            TabTarget::Split { pane, direction, first } => {
+                let id = PaneId(self.new_id());
+                if self.layout.split_at(pane, direction, id, first) {
+                    self.panes.push(Pane { id, tabs: vec![tab], active: 0 });
+                    self.focused = id;
+                }
+            }
+        }
+        // Панель без вкладок исчезает, её место занимает соседка.
+        if self.pane(from).is_some_and(|p| p.tabs.is_empty()) && self.layout.remove(from) {
+            self.panes.retain(|p| p.id != from);
+            if self.focused == from {
+                self.focused = self.layout.panes()[0];
+            }
+        }
+    }
+
     fn commit_rename(&mut self, tab_id: u64, path: PathBuf, new_name: String) {
         let new_name = new_name.trim().to_string();
         let old = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -564,8 +710,10 @@ impl FilesApp {
             self.set_status(format!("«{new_name}»: {error}"), Level::Error);
             return;
         }
-        let id = self.ops.submit(FileOp::Rename { path, new_name });
-        self.followups.insert(id, Followup::SelectCreated { tab: tab_id });
+        self.submit(
+            FileOp::Rename { path, new_name },
+            Some(Followup::SelectCreated { tab: tab_id }),
+        );
     }
 
     pub(crate) fn paste_files(&mut self, dest: PathBuf, files: Option<ClipboardFiles>) {
@@ -573,12 +721,9 @@ impl FilesApp {
             self.set_status("в буфере обмена нет файлов", Level::Info);
             return;
         };
-        if files.cut {
-            let id = self.ops.submit(FileOp::Move { sources: files.paths, dest });
-            self.followups.insert(id, Followup::ClearClipboard);
-        } else {
-            self.ops.submit(FileOp::Copy { sources: files.paths, dest });
-        }
+        let followup = files.cut.then_some(Followup::ClearClipboard);
+        let transfer = Transfer { sources: files.paths, dest, copy: !files.cut };
+        self.start_transfer(transfer, followup);
     }
 
     fn drop_files(&mut self, paths: Vec<PathBuf>, dest: PathBuf, copy: Option<bool>) {
@@ -598,8 +743,7 @@ impl FilesApp {
         }
         // Как в Проводнике: на тот же диск — перемещение, на другой — копирование.
         let copy = copy.unwrap_or_else(|| sources.iter().any(|p| root_of(p) != root_of(&dest)));
-        let op = if copy { FileOp::Copy { sources, dest } } else { FileOp::Move { sources, dest } };
-        self.ops.submit(op);
+        self.start_transfer(Transfer { sources, dest, copy }, None);
     }
 
     fn add_favorites(&mut self, group: usize, paths: Vec<PathBuf>) {

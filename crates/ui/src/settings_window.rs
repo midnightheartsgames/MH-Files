@@ -12,7 +12,7 @@ use mh_files_core::settings::{
 };
 
 use crate::app::FilesApp;
-use crate::commands::{CommandId, Keymap, format_shortcut, parse_shortcut};
+use crate::commands::{CommandId, Keymap, format_chord, parse_chord};
 use crate::widgets::{card, page_title, row, switch_row};
 use crate::{storage, theme, widgets};
 
@@ -74,10 +74,10 @@ impl State {
         for (&command, text) in &self.keys {
             let mut parsed = Vec::new();
             for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
-                let shortcut = parse_shortcut(part).ok_or_else(|| {
+                let chord = parse_chord(part).ok_or_else(|| {
                     format!("«{part}» у команды «{}» не разобрано", command.name())
                 })?;
-                let label = format_shortcut(&shortcut);
+                let label = format_chord(&chord);
                 if let Some(other) = seen.insert(label.clone(), command) {
                     return Err(format!(
                         "{label} — и у «{}», и у «{}»",
@@ -90,7 +90,7 @@ impl State {
             let defaults: Vec<String> = command
                 .default_keys()
                 .iter()
-                .filter_map(|k| parse_shortcut(k).map(|s| format_shortcut(&s)))
+                .filter_map(|k| parse_chord(k).map(|c| format_chord(&c)))
                 .collect();
             if parsed != defaults {
                 keys.insert(command.key().to_string(), parsed);
@@ -358,7 +358,7 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
 fn keys(ui: &mut Ui, keys: &mut BTreeMap<CommandId, String>) {
     widgets::hint(
         ui,
-        "Несколько сочетаний — через запятую. Пусто — без сочетания. Пример: Ctrl+Shift+P, F1.",
+        "Несколько сочетаний — через запятую, два шага подряд — через пробел. Пусто — без сочетания. Пример: Ctrl+Shift+P, F1 или Alt+G D.",
     );
     ui.add_space(8.0);
     for &command in CommandId::ALL {
@@ -368,7 +368,7 @@ fn keys(ui: &mut Ui, keys: &mut BTreeMap<CommandId, String>) {
             let defaults: Vec<String> = command
                 .default_keys()
                 .iter()
-                .filter_map(|k| parse_shortcut(k).map(|s| format_shortcut(&s)))
+                .filter_map(|k| parse_chord(k).map(|c| format_chord(&c)))
                 .collect();
             let default_text = defaults.join(", ");
             if *text != default_text

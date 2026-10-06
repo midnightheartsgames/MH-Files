@@ -27,10 +27,17 @@ features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_IO",
+    "Win32_System_LibraryLoader",
     "Win32_System_Variant",
     "Win32_UI_Controls",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+# Макрос `windows::core::implement` ссылается на `::windows_core` — крейт нужен напрямую,
+# версия та же, что у `windows`.
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.62"

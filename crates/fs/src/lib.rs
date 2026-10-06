@@ -17,6 +17,7 @@ use mh_files_platform::Waker;
 use mh_files_platform::clipboard::ClipboardFiles;
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
+use mh_files_platform::shell::MenuChoice;
 
 pub mod images;
 pub mod listing;
@@ -25,12 +26,16 @@ pub mod read;
 pub mod rename;
 pub mod search;
 pub mod shell;
+pub mod sizes;
+pub mod transfer;
 pub mod watch;
 
 pub use images::{ImageKey, ImageKind, ImageResult};
 pub use preview::{Preview, PreviewRequest};
 pub use search::SearchQuery;
 pub use shell::ShellJob;
+pub use sizes::DirSize;
+pub use transfer::{Conflict, Transfer};
 pub use watch::DirWatch;
 
 /// Чей это результат: владелец (обычно вкладка) и поколение его запроса.
@@ -114,6 +119,22 @@ pub enum Event {
     RenameDone {
         ticket: Ticket,
         result: Result<usize, String>,
+    },
+    /// Итог проверки копирования/перемещения: занятые имена в папке назначения.
+    Preflight {
+        transfer: Transfer,
+        conflicts: Vec<Conflict>,
+    },
+    /// Размер папки целиком.
+    FolderSize {
+        ticket: Ticket,
+        path: PathBuf,
+        size: DirSize,
+    },
+    /// Меню Windows закрыто; `paths` — для чего его открывали.
+    Menu {
+        paths: Vec<PathBuf>,
+        choice: Result<MenuChoice, String>,
     },
 }
 
@@ -218,6 +239,27 @@ impl Workers {
     /// Забыть заявки на картинки, которые больше не нужны (ушли из видимой области).
     pub fn retain_images(&self, keep: impl Fn(&ImageKey) -> bool) {
         self.images.retain(keep);
+    }
+
+    /// Найти конфликты имён перед копированием или перемещением.
+    pub fn preflight(&self, transfer: Transfer) {
+        self.spawn("preflight", move |workers| {
+            let conflicts = transfer::conflicts(&transfer);
+            workers.send(Event::Preflight { transfer, conflicts });
+        });
+    }
+
+    /// Посчитать размеры папок по очереди; каждый итог — отдельным событием.
+    pub fn folder_sizes(&self, ticket: Ticket, dirs: Vec<PathBuf>) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("folder-sizes", move |workers| {
+            for path in dirs {
+                let Some(size) = sizes::dir_size(&path, &token) else { return };
+                workers.send(Event::FolderSize { ticket, path, size });
+            }
+        });
+        cancel
     }
 
     pub fn batch_rename(&self, ticket: Ticket, plan: mh_files_core::rename::Plan) {

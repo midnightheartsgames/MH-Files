@@ -27,6 +27,15 @@ pub struct InlineRename {
     pub fresh: bool,
 }
 
+/// Рамка выделения. Начало хранится в координатах содержимого списка (с учётом прокрутки),
+/// чтобы рамка тянулась и при прокрутке.
+#[derive(Debug, Clone)]
+pub struct Band {
+    pub origin: eframe::egui::Pos2,
+    /// Выделенное до рамки: с Ctrl рамка добавляет к нему.
+    pub base: std::collections::HashSet<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchProgress {
     pub scanned: usize,
@@ -58,6 +67,12 @@ pub struct Tab {
     /// Прокрутка и высота видимой области в последнем кадре.
     pub scroll_offset: f32,
     pub viewport_height: f32,
+    /// Верх строк на экране в последнем кадре: от него считается рамка выделения.
+    pub list_top: f32,
+    /// Прокрутить к этому смещению в следующем кадре (рамка у края списка).
+    pub scroll_request: Option<f32>,
+    /// Выделение рамкой мышью, пока кнопка нажата.
+    pub band: Option<Band>,
     /// Выделить этот объект, когда он появится (папка, из которой поднялись).
     pub pending_select: Option<PathBuf>,
     generation: u64,
@@ -94,6 +109,9 @@ impl Tab {
             page_rows: 10,
             scroll_offset: 0.0,
             viewport_height: 0.0,
+            list_top: 0.0,
+            scroll_request: None,
+            band: None,
             pending_select: None,
             generation: 0,
             watch_generation: 0,

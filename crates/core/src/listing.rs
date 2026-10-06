@@ -224,6 +224,18 @@ impl Listing {
         before != self.entries.len()
     }
 
+    /// Посчитанный размер папки: попадает в столбец «Размер» и в сортировку по размеру.
+    /// `true` — такая папка есть в списке (нужен [`Listing::refresh`]).
+    pub fn set_dir_size(&mut self, path: &Path, bytes: u64) -> bool {
+        let Some(&index) = self.index().get(path) else { return false };
+        let entry = &mut self.entries[index];
+        if !entry.is_dir() {
+            return false;
+        }
+        entry.size = bytes;
+        true
+    }
+
     pub fn totals(&self) -> Totals {
         let mut totals = Totals::default();
         for entry in self.iter() {
@@ -300,5 +312,17 @@ mod tests {
         assert_eq!(l.row_of(Path::new("/test/b")), Some(1));
         assert_eq!(l.find_prefix("B", 0), Some(1));
         assert_eq!(l.find_prefix("a", 1), Some(0));
+    }
+
+    #[test]
+    fn folder_sizes_sort_by_size() {
+        let mut l =
+            listing(&[("small", EntryKind::Dir), ("big", EntryKind::Dir), ("f", EntryKind::File)]);
+        assert!(l.set_dir_size(Path::new("/test/big"), 500));
+        assert!(!l.set_dir_size(Path::new("/test/f"), 500), "только папки");
+        let options =
+            ViewOptions { sort: SortOrder::default().toggled(SortColumn::Size), ..l.options() };
+        l.set_options(options);
+        assert_eq!(names(&l), ["big", "small", "f"]);
     }
 }

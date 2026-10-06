@@ -184,6 +184,10 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
                 field(ui, "Атрибуты", &attributes.join(", "));
             }
         }
+        // Папка: размер целиком — по запросу, обход может быть долгим.
+        if entry.as_ref().is_none_or(Entry::is_dir) {
+            folder_size(ui, app, &path);
+        }
         ui.add_space(4.0);
         ui.label(RichText::new("Путь").font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
         let text = path.display().to_string();
@@ -223,4 +227,22 @@ fn group_digits(value: u64) -> String {
         result.push(c);
     }
     result
+}
+
+fn folder_size(ui: &mut Ui, app: &mut FilesApp, path: &std::path::Path) {
+    if let Some(size) = app.folder_sizes.get(path) {
+        let partial = if size.partial { " (без недоступных папок)" } else { "" };
+        let text = format!(
+            "{} · файлов: {}, папок: {}{partial}",
+            format::size(size.bytes),
+            size.files,
+            size.dirs
+        );
+        field(ui, "Размер целиком", &text);
+    } else if app.sizes_pending.contains(path) {
+        field(ui, "Размер целиком", "считается…");
+    } else if ui.button("Посчитать размер").clicked() {
+        app.actions.push(Action::FolderSizes(vec![path.to_path_buf()]));
+    }
+    ui.add_space(4.0);
 }

@@ -16,14 +16,15 @@ use mh_files_core::location::Location;
 use mh_files_core::session::{self, PaneSession, Session, TabSession, ViewMode, WindowGeometry};
 use mh_files_core::settings::Settings;
 use mh_files_core::sort::SortColumn;
-use mh_files_fs::{Event, Workers};
+use mh_files_fs::{CancelToken, DirSize, Event, Ticket, Workers};
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
-use mh_files_platform::ops::{Executor, OpEvent, OpId, OpOutcome};
+use mh_files_platform::ops::{Executor, OpEvent};
+use mh_files_platform::shell::MenuChoice;
 
 use crate::commands::{CommandId, Keymap};
 use crate::images::ImageCache;
-use crate::tabs::{InlineRename, Pane, Tab};
+use crate::tabs::{Pane, Tab};
 use crate::{
     batch, dialogs, inspector, palette, pane_view, quick, settings_window, sidebar, statusbar,
     storage, theme,
@@ -35,6 +36,10 @@ pub const OWNER_QUICK: u64 = u64::MAX - 2;
 pub const OWNER_PALETTE: u64 = u64::MAX - 3;
 pub const OWNER_CRUMBS: u64 = u64::MAX - 4;
 pub const OWNER_BATCH: u64 = u64::MAX - 5;
+pub const OWNER_SIZES: u64 = u64::MAX - 6;
+
+/// Как долго ждать второй шаг последовательности (`Alt+G` → `D`).
+const CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
 
 const SESSION_SAVE_EVERY: Duration = Duration::from_secs(5);
 const STATUS_TIME: Duration = Duration::from_secs(8);
@@ -91,6 +96,30 @@ impl Default for Columns {
     }
 }
 
+/// Где на экране панель: для броска вкладки (на полосу вкладок — в панель, в край — разбиение).
+#[derive(Debug, Clone, Copy)]
+pub struct PaneRegion {
+    pub pane: PaneId,
+    pub strip: Rect,
+    pub content: Rect,
+}
+
+/// Что перетаскивают: вкладку.
+#[derive(Debug, Clone, Copy)]
+pub struct DragTab {
+    pub pane: PaneId,
+    pub tab: u64,
+}
+
+/// Куда переносится вкладка.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabTarget {
+    /// В другую панель, последней вкладкой.
+    Into(PaneId),
+    /// Новой панелью рядом с `pane`.
+    Split { pane: PaneId, direction: SplitDirection, first: bool },
+}
+
 /// Список соседних папок под стрелкой строки пути.
 pub struct CrumbMenu {
     pub pane: PaneId,
@@ -100,34 +129,57 @@ pub struct CrumbMenu {
     pub generation: u64,
 }
 
-/// Что сделать после файловой операции.
-#[derive(Debug, Clone)]
-pub enum Followup {
-    /// Выделить созданное и сразу переименовать (новая папка).
-    RenameCreated { tab: u64 },
-    /// Выделить результат (переименование).
-    SelectCreated { tab: u64 },
-    /// Вставка вырезанного: очистить буфер обмена после успеха.
-    ClearClipboard,
-}
-
 #[derive(Debug, Clone)]
 pub enum Action {
     Run(CommandId),
-    Open { location: Location, target: Target },
+    Open {
+        location: Location,
+        target: Target,
+    },
     FocusPane(PaneId),
-    SelectTab { pane: PaneId, index: usize },
-    CloseTab { pane: PaneId, index: usize },
+    SelectTab {
+        pane: PaneId,
+        index: usize,
+    },
+    CloseTab {
+        pane: PaneId,
+        index: usize,
+    },
     NewTabIn(PaneId),
-    SetSort { pane: PaneId, column: SortColumn },
+    SetSort {
+        pane: PaneId,
+        column: SortColumn,
+    },
     SetView(ViewMode),
-    CommitRename { tab: u64, path: PathBuf, new_name: String },
-    Drop { paths: Vec<PathBuf>, dest: PathBuf, copy: Option<bool> },
-    AddFavorites { group: usize, paths: Vec<PathBuf> },
+    CommitRename {
+        tab: u64,
+        path: PathBuf,
+        new_name: String,
+    },
+    Drop {
+        paths: Vec<PathBuf>,
+        dest: PathBuf,
+        copy: Option<bool>,
+    },
+    AddFavorites {
+        group: usize,
+        paths: Vec<PathBuf>,
+    },
     Sidebar(sidebar::Edit),
-    CrumbMenu { pane: PaneId, dir: PathBuf, at: egui::Pos2 },
+    CrumbMenu {
+        pane: PaneId,
+        dir: PathBuf,
+        at: egui::Pos2,
+    },
     Shell(mh_files_fs::ShellJob),
     Status(String, Level),
+    MoveTab {
+        from: PaneId,
+        tab: u64,
+        target: TabTarget,
+    },
+    /// Посчитать размеры этих папок.
+    FolderSizes(Vec<PathBuf>),
 }
 
 pub struct FilesApp {
@@ -140,8 +192,7 @@ pub struct FilesApp {
     pub workers: Workers,
     events: Receiver<Event>,
     pub ops: Executor,
-    pub ops_running: Vec<(OpId, String)>,
-    pub followups: HashMap<OpId, Followup>,
+    pub operations: crate::operations::Operations,
     pub drives: Vec<DriveInfo>,
     pub places: Vec<(KnownFolder, PathBuf)>,
     pub recent: Vec<PathBuf>,
@@ -162,6 +213,14 @@ pub struct FilesApp {
     pub drop_hover: Option<PathBuf>,
     pub crumb_menu: Option<CrumbMenu>,
     pub columns: Columns,
+    /// Первый шаг последовательности клавиш и когда он нажат.
+    pub pending_chord: Option<(egui::KeyboardShortcut, Instant)>,
+    /// Посчитанные размеры папок (целиком) и те, что ещё считаются.
+    pub folder_sizes: HashMap<PathBuf, DirSize>,
+    pub sizes_pending: HashSet<PathBuf>,
+    sizes_cancel: Option<CancelToken>,
+    sizes_generation: u64,
+    pub pane_regions: Vec<PaneRegion>,
     /// Доступность команд на начало кадра: меню рисуются, пока панель вынута из списка.
     availability: HashMap<CommandId, bool>,
     session_json: String,
@@ -200,8 +259,7 @@ impl FilesApp {
             workers,
             events,
             ops,
-            ops_running: Vec::new(),
-            followups: HashMap::new(),
+            operations: Default::default(),
             drives: Vec::new(),
             places: Vec::new(),
             recent: Vec::new(),
@@ -220,6 +278,12 @@ impl FilesApp {
             drop_hover: None,
             crumb_menu: None,
             columns: Columns::default(),
+            pending_chord: None,
+            folder_sizes: HashMap::new(),
+            sizes_pending: HashSet::new(),
+            sizes_cancel: None,
+            sizes_generation: 0,
+            pane_regions: Vec::new(),
             availability: HashMap::new(),
             session_json: String::new(),
             session_checked: Instant::now(),
@@ -382,8 +446,18 @@ impl FilesApp {
                 }
             }
             Event::ListingDone { ticket, result } => {
-                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                let sizes = &self.folder_sizes;
+                if let Some(tab) = self
+                    .panes
+                    .iter_mut()
+                    .flat_map(|p| p.tabs.iter_mut())
+                    .find(|t| t.id == ticket.owner)
+                {
                     tab.on_done(ticket, result);
+                    // Посчитанные раньше размеры папок — снова в столбец.
+                    if !sizes.is_empty() {
+                        apply_sizes(tab, sizes);
+                    }
                 }
             }
             Event::Patch { ticket, upserts, removes, reload } => {
@@ -452,16 +526,82 @@ impl FilesApp {
                 }
             }
             Event::Paste { dest, files } => self.paste_files(dest, files),
-            Event::RenameDone { ticket: _, result } => match result {
-                Ok(count) => {
-                    self.set_status(format!("переименовано: {count}"), Level::Info);
-                    self.reload_all_dirs();
+            Event::RenameDone { ticket, result } => {
+                if ticket.generation == 0 {
+                    self.on_batch_done(result.is_ok());
                 }
-                Err(error) => {
-                    self.set_status(format!("переименование отменено: {error}"), Level::Error);
-                    self.reload_all_dirs();
+                match result {
+                    Ok(count) => self.set_status(format!("переименовано: {count}"), Level::Info),
+                    Err(error) => {
+                        self.set_status(format!("переименование отменено: {error}"), Level::Error)
+                    }
                 }
-            },
+                self.reload_all_dirs();
+            }
+            Event::Preflight { transfer, conflicts } => self.on_preflight(transfer, conflicts),
+            Event::FolderSize { ticket, path, size } => self.on_folder_size(ticket, path, size),
+            Event::Menu { paths, choice } => self.on_menu(paths, choice),
+        }
+    }
+
+    /// Посчитать размеры папок в фоне; прежний подсчёт отменяется.
+    pub fn request_folder_sizes(&mut self, dirs: Vec<PathBuf>) {
+        if dirs.is_empty() {
+            return;
+        }
+        if let Some(cancel) = self.sizes_cancel.take() {
+            cancel.cancel();
+        }
+        self.sizes_generation += 1;
+        self.sizes_pending = dirs.iter().cloned().collect();
+        let ticket = Ticket { owner: OWNER_SIZES, generation: self.sizes_generation };
+        self.sizes_cancel = Some(self.workers.folder_sizes(ticket, dirs));
+    }
+
+    fn on_folder_size(&mut self, ticket: Ticket, path: PathBuf, size: DirSize) {
+        if ticket.generation != self.sizes_generation {
+            return;
+        }
+        self.sizes_pending.remove(&path);
+        self.folder_sizes.insert(path.clone(), size);
+        for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+            if tab.listing.set_dir_size(&path, size.bytes) {
+                tab.listing.refresh();
+            }
+        }
+    }
+
+    /// Меню Windows закрылось: «Переименовать» делаем своим переименованием в строке,
+    /// остальное могло поменять папку — перечитать.
+    fn on_menu(&mut self, paths: Vec<PathBuf>, choice: Result<MenuChoice, String>) {
+        match choice {
+            Ok(MenuChoice::Dismissed) => {}
+            Ok(MenuChoice::Invoked { verb }) => {
+                if verb.as_deref() == Some("rename")
+                    && let Some(path) = paths.first()
+                    && self.tab().listing.row_of(path).is_some()
+                {
+                    self.tab_mut().selection.select_only(path.clone());
+                    self.actions.push(Action::Run(CommandId::Rename));
+                }
+                let mut dirs: Vec<PathBuf> =
+                    paths.iter().filter_map(|p| p.parent().map(PathBuf::from)).collect();
+                dirs.extend(paths.iter().cloned());
+                self.reload_dirs(&dirs);
+            }
+            Err(error) => self.set_status(error, Level::Error),
+        }
+    }
+
+    /// Первый шаг последовательности ещё ждёт второй?
+    pub fn chord_pending(&mut self) -> Option<egui::KeyboardShortcut> {
+        match self.pending_chord {
+            Some((first, at)) if at.elapsed() < CHORD_TIMEOUT => Some(first),
+            Some(_) => {
+                self.pending_chord = None;
+                None
+            }
+            None => None,
         }
     }
 
@@ -474,49 +614,6 @@ impl FilesApp {
         }
     }
 
-    fn on_op(&mut self, event: OpEvent) {
-        match event {
-            OpEvent::Started { id, op } => self.ops_running.push((id, op.describe())),
-            OpEvent::Finished { id, op, result } => {
-                self.ops_running.retain(|(running, _)| *running != id);
-                let followup = self.followups.remove(&id);
-                match &result {
-                    Ok(OpOutcome::Done { created }) => match followup {
-                        Some(Followup::RenameCreated { tab }) => {
-                            if let (Some(tab), Some(path)) = (self.tab_by_id(tab), created.first())
-                            {
-                                let name = path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                tab.pending_select = Some(path.clone());
-                                tab.rename = Some(InlineRename {
-                                    path: path.clone(),
-                                    text: name,
-                                    fresh: true,
-                                });
-                            }
-                        }
-                        Some(Followup::SelectCreated { tab }) => {
-                            if let (Some(tab), Some(path)) = (self.tab_by_id(tab), created.first())
-                            {
-                                tab.pending_select = Some(path.clone());
-                            }
-                        }
-                        Some(Followup::ClearClipboard) => {
-                            self.cut.clear();
-                            self.workers.shell(mh_files_fs::ShellJob::ClearClipboard);
-                        }
-                        None => {}
-                    },
-                    Ok(OpOutcome::Aborted) => self.set_status("операция отменена", Level::Info),
-                    Err(error) => self.set_status(error.clone(), Level::Error),
-                }
-                self.reload_dirs(&op.affected_dirs());
-            }
-        }
-    }
-
     // ── Кадр ─────────────────────────────────────────────────────────────────────────
 
     fn frame(&mut self, ui: &mut egui::Ui) {
@@ -525,6 +622,7 @@ impl FilesApp {
         self.handle_keys(&ctx);
         self.run_actions(&ctx);
         self.drop_zones.clear();
+        self.pane_regions.clear();
         self.availability =
             CommandId::ALL.iter().map(|&command| (command, self.available(command))).collect();
 
@@ -596,7 +694,10 @@ impl FilesApp {
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             busy |= tab.tick();
         }
-        if busy || !self.ops_running.is_empty() {
+        if self.pending_chord.is_some() {
+            ctx.request_repaint_after(CHORD_TIMEOUT);
+        }
+        if busy || self.operations.is_busy() {
             ctx.request_repaint_after(Duration::from_millis(120));
         }
         if self.status.as_ref().is_some_and(|s| s.at.elapsed() > STATUS_TIME) {
@@ -615,6 +716,12 @@ impl FilesApp {
                 let id = *id;
                 let Some(index) = self.panes.iter().position(|pane| pane.id == id) else { return };
                 let focused = self.focused == id && self.panes.len() > 1;
+                let strip_height = crate::pane_view::TAB_HEIGHT;
+                self.pane_regions.push(PaneRegion {
+                    pane: id,
+                    strip: Rect::from_min_size(rect.min, vec2(rect.width(), strip_height)),
+                    content: Rect::from_min_max(rect.min + vec2(0.0, strip_height), rect.max),
+                });
                 let mut child = ui.new_child(
                     UiBuilder::new()
                         .max_rect(rect)
@@ -703,8 +810,12 @@ impl FilesApp {
     }
 
     fn handle_drops(&mut self, ctx: &egui::Context) {
+        self.handle_tab_drop(ctx);
         let pointer = ctx.input(|i| i.pointer.hover_pos());
         let dragging = egui::DragAndDrop::has_payload_of_type::<DragFiles>(ctx);
+        if dragging && self.drag_left_window(ctx) {
+            return;
+        }
         let external = ctx.input(|i| !i.raw.hovered_files.is_empty());
         self.drop_hover = if dragging || external {
             pointer.and_then(|pos| self.zone_at(pos)).map(|zone| zone.dir.clone())
@@ -751,6 +862,111 @@ impl FilesApp {
                         .corner_radius(CornerRadius::same(4))
                         .inner_margin(egui::Margin::symmetric(8, 4))
                         .show(ui, |ui| ui.label(label));
+                });
+        }
+    }
+
+    /// Файлы вытащили за край окна: дальше перетаскивание ведёт Windows (OLE), и их можно
+    /// бросить в Проводник, мессенджер, редактор. `true` — так и случилось.
+    fn drag_left_window(&mut self, ctx: &egui::Context) -> bool {
+        if !cfg!(windows) {
+            return false;
+        }
+        let window = ctx.content_rect().shrink(1.0);
+        let (outside, down) = ctx.input(|i| {
+            let left = match i.pointer.latest_pos() {
+                Some(pos) => !window.contains(pos),
+                None => true,
+            };
+            (left || i.pointer.hover_pos().is_none(), i.pointer.primary_down())
+        });
+        if !(outside && down) {
+            return false;
+        }
+        let Some(payload) = egui::DragAndDrop::take_payload::<DragFiles>(ctx) else { return false };
+        match mh_files_platform::dnd::drag_out(&payload.paths) {
+            Ok(mh_files_platform::dnd::DropEffect::Move) => {
+                let dirs: Vec<PathBuf> =
+                    payload.paths.iter().filter_map(|p| p.parent().map(PathBuf::from)).collect();
+                self.reload_dirs(&dirs);
+            }
+            Ok(_) => {}
+            Err(error) => self.set_status(error, Level::Error),
+        }
+        true
+    }
+
+    /// Куда встанет перетаскиваемая вкладка, если отпустить в `pos`.
+    fn tab_target(&self, pos: egui::Pos2) -> Option<(TabTarget, Rect)> {
+        let region =
+            self.pane_regions.iter().find(|r| r.strip.contains(pos) || r.content.contains(pos))?;
+        if region.strip.contains(pos) {
+            return Some((TabTarget::Into(region.pane), region.content));
+        }
+        let rect = region.content;
+        let edge_x = (rect.width() * 0.25).clamp(40.0, 220.0);
+        let edge_y = (rect.height() * 0.25).clamp(40.0, 220.0);
+        let side = |direction, first, part: Rect| {
+            Some((TabTarget::Split { pane: region.pane, direction, first }, part))
+        };
+        if pos.x < rect.left() + edge_x {
+            side(
+                SplitDirection::Horizontal,
+                true,
+                Rect::from_min_max(rect.min, egui::pos2(rect.center().x, rect.bottom())),
+            )
+        } else if pos.x > rect.right() - edge_x {
+            side(
+                SplitDirection::Horizontal,
+                false,
+                Rect::from_min_max(egui::pos2(rect.center().x, rect.top()), rect.max),
+            )
+        } else if pos.y < rect.top() + edge_y {
+            side(
+                SplitDirection::Vertical,
+                true,
+                Rect::from_min_max(rect.min, egui::pos2(rect.right(), rect.center().y)),
+            )
+        } else if pos.y > rect.bottom() - edge_y {
+            side(
+                SplitDirection::Vertical,
+                false,
+                Rect::from_min_max(egui::pos2(rect.left(), rect.center().y), rect.max),
+            )
+        } else {
+            Some((TabTarget::Into(region.pane), rect))
+        }
+    }
+
+    /// Перетаскивание вкладки: подсветка места и перенос при отпускании.
+    fn handle_tab_drop(&mut self, ctx: &egui::Context) {
+        let Some(payload) = egui::DragAndDrop::payload::<DragTab>(ctx) else { return };
+        let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else { return };
+        let target = self.tab_target(pos);
+        if ctx.input(|i| i.pointer.any_released()) {
+            egui::DragAndDrop::clear_payload(ctx);
+            if let Some((target, _)) = target {
+                self.actions.push(Action::MoveTab { from: payload.pane, tab: payload.tab, target });
+            }
+            return;
+        }
+        if let Some((_, rect)) = target {
+            egui::Area::new(Id::new("tab-drop"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(rect.min)
+                .interactable(false)
+                .show(ctx, |ui| {
+                    ui.painter().rect_filled(
+                        rect,
+                        CornerRadius::same(6),
+                        theme::accent().gamma_multiply(0.18),
+                    );
+                    ui.painter().rect_stroke(
+                        rect.shrink(1.0),
+                        CornerRadius::same(6),
+                        Stroke::new(1.5, theme::accent()),
+                        egui::StrokeKind::Inside,
+                    );
                 });
         }
     }
@@ -884,6 +1100,20 @@ impl eframe::App for FilesApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_session_if_changed(true);
+    }
+}
+
+/// Размеры папок из кэша — в записи вкладки.
+fn apply_sizes(tab: &mut Tab, sizes: &HashMap<PathBuf, DirSize>) {
+    let Some(dir) = tab.dir() else { return };
+    let mut changed = false;
+    for (path, size) in sizes {
+        if path.parent() == Some(dir.as_path()) {
+            changed |= tab.listing.set_dir_size(path, size.bytes);
+        }
+    }
+    if changed {
+        tab.listing.refresh();
     }
 }
 
