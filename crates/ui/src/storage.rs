@@ -17,6 +17,19 @@ pub fn config_dir() -> PathBuf {
     base.unwrap_or_else(std::env::temp_dir).join(name)
 }
 
+/// Снимки индекса дисков: `%LOCALAPPDATA%\MH Files\index` — данные машины, а не
+/// пользователя, в перемещаемый профиль им незачем; вне Windows — `~/.cache/mh-files/index`.
+pub fn index_dir() -> PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+    let name = if cfg!(windows) { "MH Files" } else { "mh-files" };
+    base.unwrap_or_else(std::env::temp_dir).join(name).join("index")
+}
+
 pub fn settings_path() -> PathBuf {
     config_dir().join("settings.json")
 }

@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
  "eframe",
@@ -1288,9 +1288,10 @@ dependencies = [
 
 [[package]]
 name = "mh-files-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
+ "memchr",
  "nucleo-matcher",
  "regex",
  "serde",
@@ -1300,7 +1301,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-fs"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
  "encoding_rs",
@@ -1312,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-platform"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossbeam-channel",
  "windows",

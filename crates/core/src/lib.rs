@@ -9,6 +9,7 @@ pub mod format;
 pub mod fuzzy;
 pub mod goto;
 pub mod history;
+pub mod index;
 pub mod layout;
 pub mod listing;
 pub mod location;

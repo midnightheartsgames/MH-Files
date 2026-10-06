@@ -11,12 +11,13 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, CornerRadius, Id, Rect, Sense, Stroke, UiBuilder, vec2};
 use mh_files_core::layout::{LayoutNode, MAX_RATIO, MIN_RATIO, PaneId, SplitDirection};
+use mh_files_core::listing::LoadState;
 use mh_files_core::listing::ViewOptions;
 use mh_files_core::location::Location;
 use mh_files_core::session::{self, PaneSession, Session, TabSession, ViewMode, WindowGeometry};
 use mh_files_core::settings::Settings;
 use mh_files_core::sort::SortColumn;
-use mh_files_fs::{CancelToken, DirSize, Event, Ticket, Workers};
+use mh_files_fs::{CancelToken, DirSize, Event, Indexer, Ticket, Workers};
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
 use mh_files_platform::ops::{Executor, OpEvent};
@@ -42,6 +43,10 @@ pub const OWNER_SIZES: u64 = u64::MAX - 6;
 const CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
 
 const SESSION_SAVE_EVERY: Duration = Duration::from_secs(5);
+/// Индекс изменился — открытая выдача обновляется не чаще этого.
+const INDEX_REFRESH_EVERY: Duration = Duration::from_millis(1500);
+/// Сколько ждать сохранения снимков индекса при выходе.
+const INDEX_SAVE_WAIT: Duration = Duration::from_secs(4);
 const STATUS_TIME: Duration = Duration::from_secs(8);
 const SPLITTER: f32 = 5.0;
 
@@ -180,6 +185,7 @@ pub enum Action {
     },
     /// Посчитать размеры этих папок.
     FolderSizes(Vec<PathBuf>),
+    RemoveSavedSearch(usize),
 }
 
 pub struct FilesApp {
@@ -190,6 +196,7 @@ pub struct FilesApp {
     pub focused: PaneId,
     next_id: u64,
     pub workers: Workers,
+    pub indexer: Indexer,
     events: Receiver<Event>,
     pub ops: Executor,
     pub operations: crate::operations::Operations,
@@ -245,6 +252,8 @@ impl FilesApp {
         let ctx = cc.egui_ctx.clone();
         let ops = Executor::new(std::sync::Arc::new(move || ctx.request_repaint()));
         let (keymap, key_errors) = Keymap::new(&settings.keys);
+        let indexer = Indexer::new(workers.clone(), storage::index_dir());
+        indexer.configure(&settings.index);
 
         let mut images = ImageCache::new();
         images.system_icons = settings.appearance.system_icons;
@@ -257,6 +266,7 @@ impl FilesApp {
             focused: PaneId(1),
             next_id: 1,
             workers,
+            indexer,
             events,
             ops,
             operations: Default::default(),
@@ -416,6 +426,7 @@ impl FilesApp {
 
     /// Перечитать вкладки, показывающие эти папки.
     pub fn reload_dirs(&mut self, dirs: &[PathBuf]) {
+        self.indexer.refresh(dirs);
         let workers = self.workers.clone();
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             if tab.dir().is_some_and(|dir| dirs.contains(&dir)) {
@@ -457,6 +468,12 @@ impl FilesApp {
                     // Посчитанные раньше размеры папок — снова в столбец.
                     if !sizes.is_empty() {
                         apply_sizes(tab, sizes);
+                    }
+                    // Прочитанная папка заодно освежает индекс.
+                    if let Some(dir) = tab.dir()
+                        && tab.listing.state == LoadState::Done
+                    {
+                        self.indexer.observe(&dir, tab.listing.all());
                     }
                 }
             }
@@ -541,6 +558,45 @@ impl FilesApp {
             Event::Preflight { transfer, conflicts } => self.on_preflight(transfer, conflicts),
             Event::FolderSize { ticket, path, size } => self.on_folder_size(ticket, path, size),
             Event::Menu { paths, choice } => self.on_menu(paths, choice),
+            Event::IndexResults { ticket, result } => {
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    tab.on_index_results(ticket, result);
+                }
+            }
+            Event::IndexChanged { content } => {
+                if content {
+                    for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+                        if let Some(view) = &mut tab.index {
+                            view.stale = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Запустить нужные поиски по индексу. Видимая выдача обновляется после изменений
+    /// индекса, но не чаще [`INDEX_REFRESH_EVERY`].
+    fn drive_index_tabs(&mut self, ctx: &egui::Context) {
+        let show_hidden = self.settings.files.show_hidden;
+        let mut waiting = false;
+        for pane in &mut self.panes {
+            let active = pane.active;
+            for (index, tab) in pane.tabs.iter_mut().enumerate() {
+                let Some(view) = &mut tab.index else { continue };
+                if view.stale && index == active && !view.searching && !view.text.trim().is_empty()
+                {
+                    if view.last.elapsed() >= INDEX_REFRESH_EVERY {
+                        view.pending = true;
+                    } else {
+                        waiting = true;
+                    }
+                }
+                tab.start_index_search(&self.indexer, show_hidden);
+            }
+        }
+        if waiting {
+            ctx.request_repaint_after(INDEX_REFRESH_EVERY);
         }
     }
 
@@ -626,6 +682,13 @@ impl FilesApp {
         self.availability =
             CommandId::ALL.iter().map(|&command| (command, self.available(command))).collect();
 
+        if self.settings.appearance.custom_title_bar {
+            egui::Panel::top("titlebar")
+                .exact_size(crate::titlebar::HEIGHT)
+                .frame(egui::Frame::new().fill(theme::PANEL))
+                .show(ui, |ui| crate::titlebar::show(ui, self));
+        }
+
         egui::Panel::bottom("status")
             .exact_size(28.0)
             .frame(
@@ -689,6 +752,10 @@ impl FilesApp {
 
         self.handle_drops(&ctx);
         self.run_actions(&ctx);
+        self.drive_index_tabs(&ctx);
+        if self.settings.appearance.custom_title_bar {
+            crate::titlebar::borders(&ctx);
+        }
 
         let mut busy = false;
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
@@ -1057,6 +1124,12 @@ impl FilesApp {
         ctx.set_zoom_factor(settings.appearance.font_scale);
         self.images.system_icons = settings.appearance.system_icons;
         self.images.thumbnails_enabled = settings.preview.thumbnails;
+        self.indexer.configure(&settings.index);
+        if settings.appearance.custom_title_bar != self.settings.appearance.custom_title_bar {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(
+                !settings.appearance.custom_title_bar,
+            ));
+        }
         self.settings = settings;
         self.refresh_view_options();
         self.save_settings();
@@ -1065,7 +1138,7 @@ impl FilesApp {
     pub fn refresh_view_options(&mut self) {
         let base = self.view_options();
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
-            let sort = tab.listing.options().sort;
+            let sort = tab.options.sort;
             tab.set_options(ViewOptions { sort, ..base });
         }
     }
@@ -1100,6 +1173,7 @@ impl eframe::App for FilesApp {
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_session_if_changed(true);
+        self.indexer.shutdown(INDEX_SAVE_WAIT);
     }
 }
 

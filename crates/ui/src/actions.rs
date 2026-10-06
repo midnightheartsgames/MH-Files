@@ -8,7 +8,7 @@ use mh_files_core::location::Location;
 use mh_files_core::names;
 use mh_files_core::selection::Modifiers;
 use mh_files_core::session::{TabSession, ViewMode};
-use mh_files_core::settings::{Favorite, Group, NewTabLocation};
+use mh_files_core::settings::{Favorite, Group, NewTabLocation, SavedSearch};
 use mh_files_fs::{ShellJob, Transfer};
 use mh_files_platform::clipboard::ClipboardFiles;
 use mh_files_platform::folders::KnownFolder;
@@ -35,6 +35,7 @@ const IN_TEXT: &[CommandId] = &[
     CommandId::Refresh,
     CommandId::Filter,
     CommandId::Search,
+    CommandId::SearchEverywhere,
 ];
 
 impl FilesApp {
@@ -218,12 +219,17 @@ impl FilesApp {
             Action::SetSort { pane, column } => {
                 if let Some(pane) = self.pane_mut(pane) {
                     let tab = pane.tab_mut();
-                    let mut options = tab.listing.options();
-                    options.sort = options.sort.toggled(column);
-                    tab.set_options(options);
+                    let sort = tab.options.sort.toggled(column);
+                    tab.set_sort(sort);
                 }
             }
             Action::SetView(view) => self.tab_mut().view = view,
+            Action::RemoveSavedSearch(index) => {
+                if index < self.settings.saved_searches.len() {
+                    self.settings.saved_searches.remove(index);
+                    self.save_settings();
+                }
+            }
             Action::CommitRename { tab, path, new_name } => self.commit_rename(tab, path, new_name),
             Action::Drop { paths, dest, copy } => self.drop_files(paths, dest, copy),
             Action::AddFavorites { group, paths } => self.add_favorites(group, paths),
@@ -258,6 +264,8 @@ impl FilesApp {
             GoUp => tab.location.parent().is_some(),
             Paste | NewFolder | OpenTerminal => has_dir,
             Search => has_dir,
+            SaveSearch => matches!(&tab.location, Location::Index { query } if !query.is_empty()),
+            Reindex => self.indexer.status().enabled,
             CopyToOtherPane | MoveToOtherPane | OpenInOtherPane => {
                 has_targets && self.other_pane().is_some()
             }
@@ -369,6 +377,33 @@ impl FilesApp {
                 if let Some(dir) = dir {
                     self.palette = Some(palette::State::search(dir));
                 }
+            }
+            SearchEverywhere => {
+                if !matches!(self.tab().location, Location::Index { .. }) {
+                    let query = String::new();
+                    self.open_location(Location::Index { query }, Target::Current);
+                }
+                if let Some(view) = &mut self.tab_mut().index {
+                    view.focus = true;
+                }
+            }
+            SaveSearch => {
+                if let Location::Index { query } = self.tab().location.clone()
+                    && !query.is_empty()
+                {
+                    let saved = &mut self.settings.saved_searches;
+                    if saved.iter().any(|s| s.query == query) {
+                        self.set_status("такой поиск уже сохранён", Level::Info);
+                    } else {
+                        saved.push(SavedSearch { name: query.clone(), query });
+                        self.save_settings();
+                        self.set_status("поиск сохранён в боковой панели", Level::Info);
+                    }
+                }
+            }
+            Reindex => {
+                self.indexer.rescan();
+                self.set_status("индекс перестраивается в фоне", Level::Info);
             }
             Copy | Cut => {
                 let cut = command == Cut;

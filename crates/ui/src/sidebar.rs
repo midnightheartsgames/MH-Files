@@ -92,8 +92,11 @@ struct Renaming {
 const ROW: f32 = 26.0;
 
 pub fn show(ui: &mut Ui, app: &mut FilesApp) {
-    header(ui);
-    ui.add_space(6.0);
+    // Со своим заголовком окна название уже стоит в нём.
+    if !app.settings.appearance.custom_title_bar {
+        header(ui);
+        ui.add_space(6.0);
+    }
     let current = app.tab().dir();
     let computer = matches!(app.tab().location, Location::Computer);
     ScrollArea::vertical().id_salt("sidebar").auto_shrink([false, false]).show(ui, |ui| {
@@ -103,6 +106,13 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             app.actions
                 .push(Action::Open { location: Location::Computer, target: Target::Current });
         }
+        let index = matches!(&app.tab().location, Location::Index { query } if query.is_empty());
+        let response =
+            row(ui, icons::search, "Поиск по дискам", Some("Ctrl+E".into()), index, false);
+        if response.clicked() {
+            app.actions.push(Action::Run(crate::commands::CommandId::SearchEverywhere));
+        }
+        saved_searches(ui, app);
 
         ui.add_space(10.0);
         widgets::section_label(ui, "Диски");
@@ -132,6 +142,38 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             app.actions.push(Action::Sidebar(Edit::AddGroup));
         }
     });
+}
+
+/// Сохранённые поиски по дискам.
+fn saved_searches(ui: &mut Ui, app: &mut FilesApp) {
+    if app.settings.saved_searches.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    widgets::section_label(ui, "Поиски");
+    ui.add_space(2.0);
+    for (i, saved) in app.settings.saved_searches.clone().into_iter().enumerate() {
+        let selected =
+            matches!(&app.tab().location, Location::Index { query } if *query == saved.query);
+        let response = row(ui, icons::search, &saved.name, None, selected, false);
+        let location = Location::Index { query: saved.query.clone() };
+        if response.clicked() {
+            app.actions.push(Action::Open { location: location.clone(), target: Target::Current });
+        } else if response.middle_clicked() {
+            app.actions.push(Action::Open { location: location.clone(), target: Target::NewTab });
+        }
+        response.on_hover_text(&saved.query).context_menu(|ui| {
+            ui.set_min_width(200.0);
+            if ui.button("Открыть в новой вкладке").clicked() {
+                app.actions.push(Action::Open { location, target: Target::NewTab });
+                ui.close();
+            }
+            if ui.button("Убрать из списка").clicked() {
+                app.actions.push(Action::RemoveSavedSearch(i));
+                ui.close();
+            }
+        });
+    }
 }
 
 /// Заголовок в духе MH Sidebar: три столбика акцента и название.

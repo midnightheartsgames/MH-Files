@@ -11,7 +11,8 @@ use mh_files_core::listing::{Listing, LoadState, ViewOptions};
 use mh_files_core::location::Location;
 use mh_files_core::selection::Selection;
 use mh_files_core::session::{TabSession, ViewMode};
-use mh_files_fs::{CancelToken, DirWatch, SearchQuery, Ticket, Workers};
+use mh_files_core::sort::{SortColumn, SortOrder};
+use mh_files_fs::{CancelToken, DirWatch, IndexResults, Indexer, SearchQuery, Ticket, Workers};
 
 /// Как часто досортировывать список, пока он ещё грузится.
 const REFRESH_EVERY: Duration = Duration::from_millis(120);
@@ -36,6 +37,44 @@ pub struct Band {
     pub base: std::collections::HashSet<PathBuf>,
 }
 
+/// Поиск по дискам во вкладке: поле запроса и итог.
+#[derive(Debug, Clone)]
+pub struct IndexView {
+    /// Текст поля запроса — как набран, с пробелами по краям.
+    pub text: String,
+    /// Поставить фокус в поле в следующем кадре.
+    pub focus: bool,
+    /// Запустить поиск в конце кадра.
+    pub pending: bool,
+    /// Индекс изменился после последнего поиска — выдачу стоит обновить.
+    pub stale: bool,
+    pub searching: bool,
+    /// Сколько подошло всего (показано не больше предела).
+    pub total: usize,
+    pub elapsed: Duration,
+    pub error: Option<String>,
+    /// Когда запущен последний поиск.
+    pub last: Instant,
+}
+
+impl IndexView {
+    fn new(text: &str) -> IndexView {
+        IndexView {
+            text: text.to_string(),
+            // Фокус ставит команда «Поиск по дискам»; вкладка из сеанса или сохранённый
+            // поиск клавиатуру не забирают.
+            focus: false,
+            pending: true,
+            stale: false,
+            searching: false,
+            total: 0,
+            elapsed: Duration::ZERO,
+            error: None,
+            last: Instant::now(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchProgress {
     pub scanned: usize,
@@ -57,6 +96,10 @@ pub struct Tab {
     pub address: Option<String>,
     pub focus_address: bool,
     pub search: Option<SearchProgress>,
+    pub index: Option<IndexView>,
+    /// Вид списка, как его задали настройки и пользователь. Поиск по дискам показывает
+    /// скрытое независимо от него (см. [`options_for`]).
+    pub options: ViewOptions,
     pub rename: Option<InlineRename>,
     /// Прокрутить к строке в следующем кадре.
     pub scroll_to: Option<usize>,
@@ -90,11 +133,13 @@ pub struct Tab {
 
 impl Tab {
     pub fn new(id: u64, location: Location, view: ViewMode, options: ViewOptions) -> Tab {
+        let listing = Listing::new(options_for(&location, options));
         Tab {
             id,
             location,
             history: History::default(),
-            listing: Listing::new(options),
+            listing,
+            options,
             selection: Selection::default(),
             view,
             filter: String::new(),
@@ -103,6 +148,7 @@ impl Tab {
             address: None,
             focus_address: false,
             search: None,
+            index: None,
             rename: None,
             scroll_to: None,
             grid_columns: 1,
@@ -138,11 +184,7 @@ impl Tab {
     }
 
     pub fn session(&self) -> TabSession {
-        TabSession {
-            location: self.location.clone(),
-            view: self.view,
-            sort: self.listing.options().sort,
-        }
+        TabSession { location: self.location.clone(), view: self.view, sort: self.options.sort }
     }
 
     /// Объекты для команды: выделенные или под курсором.
@@ -172,7 +214,17 @@ impl Tab {
         if record {
             self.history.visit(self.location.clone());
         }
+        // Выдача поиска по дискам упорядочена по совпадению; в папках — обычная сортировка.
+        let to_index = matches!(location, Location::Index { .. });
+        if to_index != matches!(self.location, Location::Index { .. }) {
+            if to_index {
+                self.options.sort = SortOrder { column: SortColumn::Relevance, descending: false };
+            } else if self.options.sort.column == SortColumn::Relevance {
+                self.options.sort = SortOrder::default();
+            }
+        }
         self.location = location;
+        self.apply_options();
         self.selection.reset();
         self.filter.clear();
         self.filter_open = false;
@@ -216,14 +268,91 @@ impl Tab {
                 self.staging = None;
                 self.listing.reset();
                 self.search = Some(SearchProgress::default());
-                let query =
-                    SearchQuery { text: query, include_hidden: self.listing.options().show_hidden };
+                let query = SearchQuery { text: query, include_hidden: self.options.show_hidden };
                 self.cancel = Some(workers.search(ticket, root, query));
+            }
+            Location::Index { query } => {
+                // Сам поиск запускает окно в конце кадра: у вкладки нет доступа к индексу.
+                self.watch = None;
+                self.staging = None;
+                if !soft {
+                    self.listing.reset();
+                }
+                let view = self.index.get_or_insert_with(|| IndexView::new(&query));
+                if view.text.trim() != query {
+                    view.text = query;
+                }
+                view.pending = true;
             }
         }
         if !matches!(self.location, Location::Search { .. }) {
             self.search = None;
         }
+        if !matches!(self.location, Location::Index { .. }) {
+            self.index = None;
+        }
+    }
+
+    /// Новый текст в поле поиска по дискам. История не пополняется на каждую букву.
+    pub fn set_index_query(&mut self, text: String, workers: &Workers) {
+        let query = text.trim().to_string();
+        if let Some(view) = &mut self.index {
+            view.text = text;
+        }
+        if self.location != (Location::Index { query: query.clone() }) {
+            if !matches!(self.location, Location::Index { .. }) {
+                self.options.sort = SortOrder { column: SortColumn::Relevance, descending: false };
+            }
+            self.location = Location::Index { query };
+            self.apply_options();
+            self.reload(workers, true);
+        }
+    }
+
+    /// Запустить поиск по индексу, если он нужен.
+    pub fn start_index_search(&mut self, indexer: &Indexer, show_hidden: bool) {
+        let Location::Index { query } = &self.location else { return };
+        let Some(view) = &mut self.index else { return };
+        if !view.pending {
+            return;
+        }
+        view.pending = false;
+        view.stale = false;
+        view.searching = true;
+        view.last = Instant::now();
+        let query = query.clone();
+        if let Some(cancel) = self.cancel.take() {
+            cancel.cancel();
+        }
+        self.generation += 1;
+        let ticket = self.ticket();
+        self.cancel = Some(indexer.search(ticket, query, show_hidden));
+    }
+
+    pub fn on_index_results(&mut self, ticket: Ticket, result: Result<IndexResults, String>) {
+        if !self.current(ticket) {
+            return;
+        }
+        self.cancel = None;
+        let Some(view) = &mut self.index else { return };
+        view.searching = false;
+        let entries = match result {
+            Ok(found) => {
+                view.total = found.total;
+                view.elapsed = found.elapsed;
+                view.error = None;
+                found.entries
+            }
+            Err(error) => {
+                view.total = 0;
+                view.error = Some(error);
+                Vec::new()
+            }
+        };
+        self.listing.replace(entries);
+        self.listing.state = LoadState::Done;
+        self.dirty = false;
+        self.after_change();
     }
 
     /// Остановить фоновую работу вкладки (закрытие).
@@ -351,7 +480,17 @@ impl Tab {
     }
 
     pub fn set_options(&mut self, options: ViewOptions) {
-        self.listing.set_options(options);
+        self.options = options;
+        self.apply_options();
+    }
+
+    pub fn set_sort(&mut self, sort: SortOrder) {
+        self.options.sort = sort;
+        self.apply_options();
+    }
+
+    fn apply_options(&mut self) {
+        self.listing.set_options(options_for(&self.location, self.options));
         self.selection.retain_visible(&self.listing);
     }
 
@@ -406,6 +545,16 @@ impl Tab {
             self.cursor_to(row, Default::default());
         }
     }
+}
+
+/// В поиске по дискам скрытое отбирает сам индекс (с учётом `hidden:да` в запросе), список
+/// показывает всё, что пришло.
+fn options_for(location: &Location, mut options: ViewOptions) -> ViewOptions {
+    if matches!(location, Location::Index { .. }) {
+        options.show_hidden = true;
+        options.show_system = true;
+    }
+    options
 }
 
 pub struct Pane {

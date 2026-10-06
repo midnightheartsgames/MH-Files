@@ -9,5 +9,6 @@ pub mod menu;
 pub mod ops;
 pub mod shell;
 pub mod thumbs;
+pub mod volume;
 pub mod watch;
 pub mod window;

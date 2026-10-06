@@ -29,6 +29,40 @@ pub struct Settings {
     pub keys: BTreeMap<String, Vec<String>>,
     /// Команда терминала; `{dir}` — папка. Пусто — Windows Terminal или PowerShell.
     pub terminal: String,
+    pub index: IndexSettings,
+    /// Сохранённые поиски по дискам, показываются в боковой панели.
+    pub saved_searches: Vec<SavedSearch>,
+}
+
+/// Индекс дисков для поиска «везде».
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IndexSettings {
+    pub enabled: bool,
+    /// Что индексировать. Пусто — все локальные диски.
+    pub roots: Vec<PathBuf>,
+    /// Папки, которые пропускаются вместе с содержимым.
+    pub exclude: Vec<PathBuf>,
+    /// Досканировать при запуске папки, изменённые пока программа была закрыта. Без журнала
+    /// USN (нужны права администратора) — полный обход в фоне.
+    pub rescan_on_start: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSearch {
+    pub name: String,
+    pub query: String,
+}
+
+impl Default for IndexSettings {
+    fn default() -> IndexSettings {
+        IndexSettings {
+            enabled: true,
+            roots: Vec::new(),
+            exclude: Vec::new(),
+            rescan_on_start: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,6 +77,8 @@ pub struct Appearance {
     pub animations: bool,
     /// Значки файлов из Windows; выключено — свои значки в стиле MH.
     pub system_icons: bool,
+    /// Свой заголовок окна со вкладками вместо системного.
+    pub custom_title_bar: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,6 +155,8 @@ impl Default for Settings {
             }],
             keys: BTreeMap::new(),
             terminal: String::new(),
+            index: IndexSettings::default(),
+            saved_searches: Vec::new(),
         }
     }
 }
@@ -132,6 +170,7 @@ impl Default for Appearance {
             accent: ACCENT,
             animations: true,
             system_icons: true,
+            custom_title_bar: true,
         }
     }
 }

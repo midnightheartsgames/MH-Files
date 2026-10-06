@@ -23,13 +23,21 @@ enum Page {
     Appearance,
     Files,
     Preview,
+    Index,
     Keys,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 6] =
-        [Page::General, Page::Appearance, Page::Files, Page::Preview, Page::Keys, Page::About];
+    const ALL: [Page; 7] = [
+        Page::General,
+        Page::Appearance,
+        Page::Files,
+        Page::Preview,
+        Page::Index,
+        Page::Keys,
+        Page::About,
+    ];
 
     fn title(self) -> &'static str {
         match self {
@@ -37,6 +45,7 @@ impl Page {
             Page::Appearance => "Внешний вид",
             Page::Files => "Файлы и папки",
             Page::Preview => "Предпросмотр",
+            Page::Index => "Поиск по дискам",
             Page::Keys => "Горячие клавиши",
             Page::About => "О программе",
         }
@@ -52,6 +61,9 @@ pub struct State {
     /// Сочетания как текст: «Ctrl+C, Ctrl+Insert».
     keys: BTreeMap<CommandId, String>,
     status: Option<(String, bool)>,
+    /// Поля «добавить папку» на странице индекса.
+    new_root: String,
+    new_exclude: String,
 }
 
 impl State {
@@ -111,6 +123,9 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         .with_min_inner_size([760.0, 480.0]);
     let mut applied: Option<Settings> = None;
     let mut close = false;
+    let index_status = app.indexer.status();
+    let elevated = app.indexer.elevated();
+    let mut rescan = false;
     ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ui, class| {
         let state = &mut app.settings_window;
         if class == ViewportClass::EmbeddedWindow {
@@ -194,6 +209,10 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                         Page::Appearance => appearance(ui, &mut state.draft),
                         Page::Files => files(ui, &mut state.draft),
                         Page::Preview => preview(ui, &mut state.draft),
+                        Page::Index => {
+                            let info = IndexInfo { status: &index_status, elevated };
+                            rescan |= index(ui, state, &info);
+                        }
                         Page::Keys => keys(ui, &mut state.keys),
                         Page::About => about(ui),
                     }
@@ -202,6 +221,12 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     });
     if let Some(settings) = applied {
         app.apply_settings(ctx, settings);
+    }
+    if rescan {
+        app.indexer.rescan();
+    }
+    if app.settings_window.open && index_status.busy() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
     if close {
         app.settings_window.open = false;
@@ -306,6 +331,16 @@ fn appearance(ui: &mut Ui, s: &mut Settings) {
         );
         switch_row(ui, "Анимации", None, &mut s.appearance.animations);
     });
+    card(ui, "Окно", |ui| {
+        switch_row(
+            ui,
+            "Свой заголовок окна",
+            Some(
+                "Заголовок в стиле MH со строкой поиска по дискам. Выключено — системная рамка Windows.",
+            ),
+            &mut s.appearance.custom_title_bar,
+        );
+    });
 }
 
 fn files(ui: &mut Ui, s: &mut Settings) {
@@ -352,6 +387,112 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
         row(ui, "Картинки до, МБ", |ui| {
             ui.add(egui::DragValue::new(&mut s.preview.image_limit_mb).range(1..=1024));
         });
+    });
+}
+
+struct IndexInfo<'a> {
+    status: &'a mh_files_fs::IndexStatus,
+    elevated: bool,
+}
+
+/// Страница индекса. `true` — нажали «Пересканировать».
+fn index(ui: &mut Ui, state: &mut State, info: &IndexInfo) -> bool {
+    let s = &mut state.draft;
+    let mut rescan = false;
+    card(ui, "Индекс", |ui| {
+        switch_row(
+            ui,
+            "Поиск по дискам",
+            Some(
+                "Имена всех файлов в памяти: поиск за миллисекунды (Ctrl+E). Около 50 МБ на миллион файлов.",
+            ),
+            &mut s.index.enabled,
+        );
+        switch_row(
+            ui,
+            "Досматривать при запуске",
+            Some(
+                "Найти изменённое, пока программа была закрыта. С правами администратора — по журналу NTFS за секунды, без них — обходом в фоне.",
+            ),
+            &mut s.index.rescan_on_start,
+        );
+        row(ui, "Состояние", |ui| {
+            let text = if info.status.volumes.is_empty() {
+                "не запущен".to_string()
+            } else {
+                format!(
+                    "{} · {}",
+                    mh_files_core::format::items(info.status.entries()),
+                    crate::pane_view::index_state(info.status)
+                )
+            };
+            ui.label(RichText::new(text).color(theme::TEXT_SECONDARY));
+            if ui.button("Пересканировать").clicked() {
+                rescan = true;
+            }
+        });
+        for volume in &info.status.volumes {
+            let mut notes = Vec::new();
+            notes.push(if volume.live {
+                "изменения видны сразу"
+            } else {
+                "обновляется при просмотре папок"
+            });
+            if volume.journal {
+                notes.push("журнал NTFS");
+            }
+            widgets::hint(
+                ui,
+                &format!(
+                    "{} — {}, {}",
+                    volume.root.display(),
+                    mh_files_core::format::items(volume.entries),
+                    notes.join(", ")
+                ),
+            );
+        }
+        if cfg!(windows) && !info.elevated {
+            widgets::hint(
+                ui,
+                "Без прав администратора журнал NTFS недоступен: после запуска диск досматривается обходом в фоне. Поиск при этом работает сразу.",
+            );
+        }
+    });
+    card(ui, "Что индексировать", |ui| {
+        widgets::hint(ui, "Пусто — все локальные диски.");
+        path_list(ui, &mut s.index.roots, &mut state.new_root, "D:\\ или папка");
+    });
+    card(ui, "Исключения", |ui| {
+        widgets::hint(ui, "Эти папки пропускаются вместе со всем содержимым.");
+        path_list(ui, &mut s.index.exclude, &mut state.new_exclude, "C:\\Windows\\WinSxS");
+    });
+    rescan
+}
+
+/// Список путей с кнопками «убрать» и полем «добавить».
+fn path_list(ui: &mut Ui, paths: &mut Vec<std::path::PathBuf>, new: &mut String, hint: &str) {
+    let mut remove = None;
+    for (i, path) in paths.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(path.display().to_string());
+            if ui.small_button("Убрать").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        paths.remove(i);
+    }
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(new).hint_text(hint).desired_width(320.0));
+        let path = std::path::PathBuf::from(new.trim());
+        if ui.add_enabled(path.is_absolute(), egui::Button::new("Добавить")).clicked() {
+            let path = mh_files_core::location::normalize(&path);
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+            new.clear();
+        }
     });
 }
 

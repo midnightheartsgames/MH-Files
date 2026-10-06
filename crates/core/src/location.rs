@@ -14,6 +14,10 @@ pub enum Location {
         root: PathBuf,
         query: String,
     },
+    /// Поиск по индексу всех дисков.
+    Index {
+        query: String,
+    },
 }
 
 /// Звено строки пути.
@@ -24,6 +28,7 @@ pub struct Crumb {
 }
 
 pub const COMPUTER_TITLE: &str = "Этот компьютер";
+pub const INDEX_TITLE: &str = "Поиск по дискам";
 
 impl Location {
     /// Папка, в которую можно вставлять и создавать. У поиска и «Этого компьютера» её нет.
@@ -34,12 +39,19 @@ impl Location {
         }
     }
 
+    /// Результаты поиска (по папке или по дискам): у записей разные папки.
+    pub fn is_search(&self) -> bool {
+        matches!(self, Location::Search { .. } | Location::Index { .. })
+    }
+
     /// Заголовок вкладки.
     pub fn title(&self) -> String {
         match self {
             Location::Computer => COMPUTER_TITLE.to_string(),
             Location::Dir(path) => path_label(path),
             Location::Search { query, .. } => format!("Поиск: {query}"),
+            Location::Index { query } if query.is_empty() => INDEX_TITLE.to_string(),
+            Location::Index { query } => format!("Везде: {query}"),
         }
     }
 
@@ -51,6 +63,7 @@ impl Location {
                 Some(path.parent().map_or(Location::Computer, |p| Location::Dir(p.to_path_buf())))
             }
             Location::Search { root, .. } => Some(Location::Dir(root.clone())),
+            Location::Index { .. } => Some(Location::Computer),
         }
     }
 
@@ -61,6 +74,15 @@ impl Location {
             Location::Computer => return crumbs,
             Location::Dir(path) => path,
             Location::Search { root, .. } => root,
+            Location::Index { query } => {
+                let label = if query.is_empty() {
+                    INDEX_TITLE.to_string()
+                } else {
+                    format!("{INDEX_TITLE} «{query}»")
+                };
+                crumbs.push(Crumb { label, location: self.clone() });
+                return crumbs;
+            }
         };
         let mut ancestors: Vec<&Path> = path.ancestors().collect();
         ancestors.reverse();
@@ -140,6 +162,11 @@ mod tests {
         let search = Location::Search { root: PathBuf::from("/home"), query: "x".into() };
         assert_eq!(search.crumbs().last().unwrap().label, "Поиск «x»");
         assert_eq!(search.dir(), None);
+        let index = Location::Index { query: "x".into() };
+        let labels: Vec<String> = index.crumbs().into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, [COMPUTER_TITLE, "Поиск по дискам «x»"]);
+        assert_eq!(index.parent(), Some(Location::Computer));
+        assert_eq!(index.title(), "Везде: x");
     }
 
     #[test]

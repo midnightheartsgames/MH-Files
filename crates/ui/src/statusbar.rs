@@ -45,6 +45,14 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             let text = format!("{} …", crate::commands::format_shortcut(&first));
             ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::accent()));
         }
+        let index = app.indexer.status();
+        if index.busy() {
+            ui.add(Spinner::new().size(12.0).color(theme::accent()));
+            let text = format!("Индекс: {}", crate::pane_view::index_state(&index));
+            ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::TEXT_SECONDARY))
+                .on_hover_text("Поиск по дискам уже работает, но пока находит не всё");
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+        }
         if let Some(status) = &app.status {
             let color = match status.level {
                 Level::Info => theme::TEXT_SECONDARY,
