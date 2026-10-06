@@ -1,0 +1,15 @@
+[package]
+name = "mh-files-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "MH Files: модель — вкладки, панели, история, сортировка, переименование. Без ввода-вывода."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+nucleo-matcher.workspace = true
+regex.workspace = true
+uuid.workspace = true

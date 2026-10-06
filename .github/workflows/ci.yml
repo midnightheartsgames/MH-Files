@@ -1,0 +1,100 @@
+# Проверка и сборка (PLAN.md §11).
+#
+# Правила цепочки поставок — как в MH Monitoring:
+# * сторонние действия закреплены по SHA коммита, а не по тегу;
+# * у токена только чтение, checkout не оставляет его в .git;
+# * всё собирается с --locked — ровно те версии, что в Cargo.lock.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DENY_VERSION: "0.20.2"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Формат
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Тесты
+        run: cargo test --workspace --locked --no-fail-fast
+
+  linux:
+    # Модель и воркеры переносимы: их тесты гоняются и здесь, а интерфейс должен собираться.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Тесты
+        run: cargo test --workspace --locked --no-fail-fast
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: cargo-deny
+        run: cargo install cargo-deny --version $CARGO_DENY_VERSION --locked
+
+      - name: Уязвимости, отозванные версии, источники, лицензии
+        run: cargo deny --locked check
+
+  release:
+    needs: [windows, linux, supply-chain]
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Сборка
+        run: .\tools\build-release.ps1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: MH-Files-${{ github.sha }}
+          path: target/dist/
+          if-no-files-found: error
