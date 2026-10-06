@@ -123,6 +123,8 @@ pub struct Preview {
     pub text_limit_kb: u32,
     /// Картинки больше этого не декодируются для предпросмотра, МБ.
     pub image_limit_mb: u32,
+    /// Документы Office и прочее — обработчиками предпросмотра Windows в Инспекторе.
+    pub handlers: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,7 +205,7 @@ impl Default for Panes {
 
 impl Default for Preview {
     fn default() -> Preview {
-        Preview { thumbnails: true, text_limit_kb: 256, image_limit_mb: 64 }
+        Preview { thumbnails: true, text_limit_kb: 256, image_limit_mb: 64, handlers: true }
     }
 }
 

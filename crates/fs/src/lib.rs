@@ -19,6 +19,8 @@ use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
 use mh_files_platform::shell::MenuChoice;
 
+pub mod archive;
+pub mod duplicates;
 pub mod images;
 pub mod indexer;
 pub mod listing;
@@ -31,6 +33,7 @@ pub mod sizes;
 pub mod transfer;
 pub mod watch;
 
+pub use duplicates::{DuplicateOptions, DuplicateProgress};
 pub use images::{ImageKey, ImageKind, ImageResult};
 pub use indexer::{IndexResults, IndexStatus, Indexer, VolumeState, VolumeStatus};
 pub use preview::{Preview, PreviewRequest};
@@ -148,6 +151,52 @@ pub enum Event {
     IndexChanged {
         content: bool,
     },
+    /// Ход извлечения из архива.
+    ExtractProgress {
+        id: u64,
+        done: u64,
+        total: u64,
+    },
+    /// Извлечение закончено: созданные пути верхнего уровня.
+    Extracted {
+        extraction: Extraction,
+        result: Result<Vec<PathBuf>, String>,
+    },
+    DuplicatesProgress {
+        ticket: Ticket,
+        progress: DuplicateProgress,
+    },
+    DuplicatesDone {
+        ticket: Ticket,
+        result: Result<Vec<mh_files_core::duplicates::Group>, String>,
+    },
+    /// Каких из проверенных путей больше нет на диске.
+    Missing {
+        owner: u64,
+        paths: Vec<PathBuf>,
+    },
+}
+
+/// Что сделать с извлечённым.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterExtract {
+    /// Просто сообщить.
+    Report,
+    /// Открыть (файл из архива по двойному щелчку).
+    Open,
+    /// Положить в буфер обмена как файлы (Ctrl+C в архиве).
+    Clipboard,
+}
+
+/// Задание на извлечение.
+#[derive(Debug, Clone)]
+pub struct Extraction {
+    pub id: u64,
+    pub archive: PathBuf,
+    /// Пути внутри архива; папки — целиком.
+    pub inners: Vec<String>,
+    pub dest: PathBuf,
+    pub then: AfterExtract,
 }
 
 /// Точка постановки задач. Дешёвая в клонировании.
@@ -269,6 +318,79 @@ impl Workers {
             for path in dirs {
                 let Some(size) = sizes::dir_size(&path, &token) else { return };
                 workers.send(Event::FolderSize { ticket, path, size });
+            }
+        });
+        cancel
+    }
+
+    /// Прочитать папку внутри архива — теми же событиями, что и обычную.
+    pub fn list_archive(&self, ticket: Ticket, archive: PathBuf, inner: String) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("list-archive", move |workers| {
+            let result = archive::list(&archive, &inner);
+            if token.is_cancelled() {
+                return;
+            }
+            let result = result.map(|batch| workers.send(Event::Listing { ticket, batch }));
+            workers.send(Event::ListingDone { ticket, result });
+        });
+        cancel
+    }
+
+    /// Извлечь из архива в фоне; ход — `ExtractProgress`, итог — `Extracted`.
+    pub fn extract(&self, extraction: Extraction) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("extract", move |workers| {
+            let id = extraction.id;
+            let total = archive::total_size(&extraction.archive, &extraction.inners).unwrap_or(0);
+            let mut done = 0;
+            let mut last = std::time::Instant::now();
+            let result = archive::extract(
+                &extraction.archive,
+                &extraction.inners,
+                &extraction.dest,
+                &token,
+                |bytes| {
+                    done += bytes;
+                    if last.elapsed() >= std::time::Duration::from_millis(100) {
+                        last = std::time::Instant::now();
+                        workers.send(Event::ExtractProgress { id, done, total });
+                    }
+                },
+            );
+            workers.send(Event::Extracted { extraction, result });
+        });
+        cancel
+    }
+
+    /// Проверить, какие пути исчезли (после удаления лишних копий).
+    pub fn missing(&self, owner: u64, paths: Vec<PathBuf>) {
+        self.spawn("missing", move |workers| {
+            let paths: Vec<PathBuf> =
+                paths.into_iter().filter(|p| std::fs::symlink_metadata(p).is_err()).collect();
+            if !paths.is_empty() {
+                workers.send(Event::Missing { owner, paths });
+            }
+        });
+    }
+
+    /// Найти дубликаты в папках.
+    pub fn duplicates(
+        &self,
+        ticket: Ticket,
+        roots: Vec<PathBuf>,
+        options: DuplicateOptions,
+    ) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("duplicates", move |workers| {
+            let result = duplicates::find(&roots, options, &token, |progress| {
+                workers.send(Event::DuplicatesProgress { ticket, progress });
+            });
+            if !token.is_cancelled() {
+                workers.send(Event::DuplicatesDone { ticket, result });
             }
         });
         cancel

@@ -20,21 +20,23 @@ pub fn texture_of(ctx: &egui::Context, preview: &Preview, name: &str) -> Option<
 }
 
 /// Рисует предпросмотр в доступной области. `max_height` ограничивает картинку и текст.
+/// Возвращает страницу, на которую попросили перейти (у PDF).
 pub fn show(
     ui: &mut Ui,
     preview: Option<&Preview>,
     texture: Option<&TextureHandle>,
     max_height: f32,
     id: &str,
-) {
+) -> Option<u32> {
     let width = ui.available_width();
+    let mut turn = None;
     match preview {
         None => {
             ui.allocate_ui(vec2(width, 60.0), |ui| {
                 ui.centered_and_justified(|ui| ui.add(egui::Spinner::new().color(theme::accent())));
             });
         }
-        Some(Preview::Image { dimensions, .. }) => {
+        Some(Preview::Image { dimensions, pages, info, .. }) => {
             if let Some(texture) = texture {
                 let size = texture.size_vec2();
                 let scale = (width / size.x).min(max_height / size.y).min(4.0);
@@ -54,6 +56,33 @@ pub fn show(
                 ui.add_space(4.0);
                 ui.label(RichText::new(format!("{w} × {h}")).color(theme::TEXT_SECONDARY));
             }
+            if let Some((page, count)) = *pages {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(page > 0, egui::Button::new("<")).clicked() {
+                        turn = Some(page - 1);
+                    }
+                    ui.label(
+                        RichText::new(format!("Страница {} из {count}", page + 1))
+                            .color(theme::TEXT_SECONDARY),
+                    );
+                    if ui.add_enabled(page + 1 < count, egui::Button::new(">")).clicked() {
+                        turn = Some(page + 1);
+                    }
+                });
+            }
+            properties(ui, info);
+        }
+        Some(Preview::Info(info)) => properties(ui, info),
+        Some(Preview::Archive { dirs, files, bytes }) => {
+            ui.label(
+                RichText::new(format!("Внутри: папок {dirs}, файлов {files}"))
+                    .color(theme::TEXT_SECONDARY),
+            );
+            ui.label(
+                RichText::new(format!("Распакованный размер: {}", format::size(*bytes)))
+                    .color(theme::TEXT_SECONDARY),
+            );
         }
         Some(Preview::Text { text, truncated, encoding }) => {
             egui::Frame::new()
@@ -101,6 +130,27 @@ pub fn show(
             ui.add(egui::Label::new(RichText::new(error).color(theme::WARN)).wrap());
         }
     }
+    turn
+}
+
+/// Свойства файла из Windows: подпись и значение.
+fn properties(ui: &mut Ui, info: &[(String, String)]) {
+    if info.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    egui::Grid::new(ui.next_auto_id()).num_columns(2).spacing(vec2(10.0, 3.0)).show(ui, |ui| {
+        for (label, value) in info {
+            ui.label(RichText::new(label).font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
+            ui.add(
+                egui::Label::new(
+                    RichText::new(value).font(theme::regular(13.5)).color(theme::TEXT_PRIMARY),
+                )
+                .wrap(),
+            );
+            ui.end_row();
+        }
+    });
 }
 
 /// Шахматка под картинками с прозрачностью.

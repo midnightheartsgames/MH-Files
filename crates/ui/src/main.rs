@@ -5,7 +5,9 @@
 
 mod actions;
 mod app;
+mod archives;
 mod batch;
+mod columns;
 mod commands;
 mod dialogs;
 mod icons;

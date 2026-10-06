@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/fs", "crates/platform", "crates/ui"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 # Крейты не публикуются: дистрибутив — один exe.
@@ -26,6 +26,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 encoding_rs = "0.8"
 memchr = "2"
 lru = "0.18"
+# Архивы как папки: только чтение, всё на чистом Rust (без C-библиотек).
+zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["util", "bzip2", "deflate", "ppmd"] }
+# Хэш для поиска дубликатов; `pure` — без C и ассемблера в сборке.
+blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 raw-window-handle = "0.6"
 windows = "0.62"

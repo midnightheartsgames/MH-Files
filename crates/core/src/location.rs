@@ -18,6 +18,15 @@ pub enum Location {
     Index {
         query: String,
     },
+    /// Папка внутри архива: `inner` — путь в архиве через `/`, пусто — корень архива.
+    Archive {
+        archive: PathBuf,
+        inner: String,
+    },
+    /// Найденные дубликаты в папках `roots`.
+    Duplicates {
+        roots: Vec<PathBuf>,
+    },
 }
 
 /// Звено строки пути.
@@ -29,9 +38,11 @@ pub struct Crumb {
 
 pub const COMPUTER_TITLE: &str = "Этот компьютер";
 pub const INDEX_TITLE: &str = "Поиск по дискам";
+pub const DUPLICATES_TITLE: &str = "Дубликаты";
 
 impl Location {
-    /// Папка, в которую можно вставлять и создавать. У поиска и «Этого компьютера» её нет.
+    /// Папка, в которую можно вставлять и создавать. У поиска, архива и «Этого компьютера»
+    /// её нет.
     pub fn dir(&self) -> Option<&Path> {
         match self {
             Location::Dir(path) => Some(path),
@@ -39,9 +50,47 @@ impl Location {
         }
     }
 
-    /// Результаты поиска (по папке или по дискам): у записей разные папки.
+    /// Результаты поиска (по папке, по дискам, дубликаты): у записей разные папки.
     pub fn is_search(&self) -> bool {
-        matches!(self, Location::Search { .. } | Location::Index { .. })
+        matches!(
+            self,
+            Location::Search { .. } | Location::Index { .. } | Location::Duplicates { .. }
+        )
+    }
+
+    /// Папка внутри архива как путь: `C:\a.zip\docs`. Такого пути на диске нет — по нему
+    /// записи архива узнают своё место.
+    pub fn archive_path(archive: &Path, inner: &str) -> PathBuf {
+        let mut path = archive.to_path_buf();
+        for part in inner.split('/').filter(|p| !p.is_empty()) {
+            path.push(part);
+        }
+        path
+    }
+
+    /// Куда ведёт папка с путём `path` из этого места: внутри архива — глубже в архив,
+    /// иначе — обычная папка.
+    pub fn enter(&self, path: &Path) -> Location {
+        match self {
+            Location::Archive { archive, inner } => {
+                let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let inner = inner.trim_matches('/');
+                let inner =
+                    if inner.is_empty() { name.into_owned() } else { format!("{inner}/{name}") };
+                Location::Archive { archive: archive.clone(), inner }
+            }
+            _ => Location::Dir(path.to_path_buf()),
+        }
+    }
+
+    /// Путь этого места так, как его видят записи родителя: у папки — сама папка, в архиве —
+    /// путь через архив. По нему в колонке родителя подсвечивается дорога сюда.
+    pub fn own_path(&self) -> Option<PathBuf> {
+        match self {
+            Location::Dir(path) => Some(path.clone()),
+            Location::Archive { archive, inner } => Some(Location::archive_path(archive, inner)),
+            _ => None,
+        }
     }
 
     /// Заголовок вкладки.
@@ -52,10 +101,19 @@ impl Location {
             Location::Search { query, .. } => format!("Поиск: {query}"),
             Location::Index { query } if query.is_empty() => INDEX_TITLE.to_string(),
             Location::Index { query } => format!("Везде: {query}"),
+            Location::Archive { archive, inner } => match inner.rsplit('/').find(|p| !p.is_empty())
+            {
+                Some(name) => name.to_string(),
+                None => path_label(archive),
+            },
+            Location::Duplicates { roots } => match roots.as_slice() {
+                [root] => format!("{DUPLICATES_TITLE}: {}", path_label(root)),
+                _ => DUPLICATES_TITLE.to_string(),
+            },
         }
     }
 
-    /// На уровень выше. У корня диска — «Этот компьютер».
+    /// На уровень выше. У корня диска — «Этот компьютер», у корня архива — папка архива.
     pub fn parent(&self) -> Option<Location> {
         match self {
             Location::Computer => None,
@@ -64,6 +122,22 @@ impl Location {
             }
             Location::Search { root, .. } => Some(Location::Dir(root.clone())),
             Location::Index { .. } => Some(Location::Computer),
+            Location::Archive { archive, inner } => {
+                let inner = inner.trim_matches('/');
+                if inner.is_empty() {
+                    return Some(
+                        archive
+                            .parent()
+                            .map_or(Location::Computer, |p| Location::Dir(p.to_path_buf())),
+                    );
+                }
+                let parent = inner.rsplit_once('/').map_or("", |(parent, _)| parent);
+                Some(Location::Archive { archive: archive.clone(), inner: parent.to_string() })
+            }
+            Location::Duplicates { roots } => match roots.as_slice() {
+                [root] => Some(Location::Dir(root.clone())),
+                _ => Some(Location::Computer),
+            },
         }
     }
 
@@ -74,6 +148,14 @@ impl Location {
             Location::Computer => return crumbs,
             Location::Dir(path) => path,
             Location::Search { root, .. } => root,
+            Location::Archive { archive, .. } => archive.parent().unwrap_or(archive),
+            Location::Duplicates { roots } => match roots.as_slice() {
+                [root] => root,
+                _ => {
+                    crumbs.push(Crumb { label: DUPLICATES_TITLE.into(), location: self.clone() });
+                    return crumbs;
+                }
+            },
             Location::Index { query } => {
                 let label = if query.is_empty() {
                     INDEX_TITLE.to_string()
@@ -92,8 +174,30 @@ impl Location {
                 location: Location::Dir(ancestor.to_path_buf()),
             });
         }
-        if let Location::Search { query, .. } = self {
-            crumbs.push(Crumb { label: format!("Поиск «{query}»"), location: self.clone() });
+        match self {
+            Location::Search { query, .. } => {
+                crumbs.push(Crumb {
+                    label: format!("Поиск «{query}»"), location: self.clone()
+                });
+            }
+            Location::Duplicates { .. } => {
+                crumbs.push(Crumb { label: DUPLICATES_TITLE.into(), location: self.clone() });
+            }
+            Location::Archive { archive, inner } => {
+                let root = Location::Archive { archive: archive.clone(), inner: String::new() };
+                crumbs.push(Crumb { label: path_label(archive), location: root });
+                let mut current = String::new();
+                for part in inner.split('/').filter(|p| !p.is_empty()) {
+                    if !current.is_empty() {
+                        current.push('/');
+                    }
+                    current.push_str(part);
+                    let location =
+                        Location::Archive { archive: archive.clone(), inner: current.clone() };
+                    crumbs.push(Crumb { label: part.to_string(), location });
+                }
+            }
+            _ => {}
         }
         crumbs
     }
@@ -167,6 +271,36 @@ mod tests {
         assert_eq!(labels, [COMPUTER_TITLE, "Поиск по дискам «x»"]);
         assert_eq!(index.parent(), Some(Location::Computer));
         assert_eq!(index.title(), "Везде: x");
+    }
+
+    #[test]
+    fn archives() {
+        let archive = PathBuf::from("/home/a.zip");
+        let inside = Location::Archive { archive: archive.clone(), inner: "docs/old".into() };
+        assert_eq!(inside.title(), "old");
+        assert_eq!(
+            inside.parent(),
+            Some(Location::Archive { archive: archive.clone(), inner: "docs".into() })
+        );
+        let root = Location::Archive { archive: archive.clone(), inner: String::new() };
+        assert_eq!(root.title(), "a.zip");
+        assert_eq!(root.parent(), Some(Location::Dir(PathBuf::from("/home"))));
+        let labels: Vec<String> = inside.crumbs().into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, [COMPUTER_TITLE, "/", "home", "a.zip", "docs", "old"]);
+        assert_eq!(inside.dir(), None);
+        assert_eq!(
+            inside.enter(Path::new("/home/a.zip/docs/old/new")),
+            Location::Archive { archive: archive.clone(), inner: "docs/old/new".into() }
+        );
+        assert_eq!(root.own_path(), Some(archive.clone()));
+        assert_eq!(
+            Location::Dir("/x".into()).enter(Path::new("/x/y")),
+            Location::Dir("/x/y".into())
+        );
+        assert_eq!(
+            Location::archive_path(&archive, "docs/old/"),
+            PathBuf::from("/home/a.zip/docs/old")
+        );
     }
 
     #[test]

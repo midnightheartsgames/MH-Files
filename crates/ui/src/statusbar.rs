@@ -45,6 +45,7 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             let text = format!("{} …", crate::commands::format_shortcut(&first));
             ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::accent()));
         }
+        extractions(ui, app);
         let index = app.indexer.status();
         if index.busy() {
             ui.add(Spinner::new().size(12.0).color(theme::accent()));
@@ -161,6 +162,22 @@ fn operations(ui: &mut Ui, app: &mut FilesApp) {
             ui.add_space(6.0);
         }
     });
+}
+
+/// Извлечение из архивов: что, сколько, отмена.
+fn extractions(ui: &mut Ui, app: &mut FilesApp) {
+    for view in &app.extractions {
+        ui.add(Spinner::new().size(12.0).color(theme::accent()));
+        ui.label(RichText::new(&view.label).font(theme::regular(13.0)).color(theme::accent()));
+        let fraction = (view.total > 0).then(|| view.done as f32 / view.total as f32);
+        progress_bar(ui, fraction, 90.0);
+        if ui.small_button("Отменить").clicked() {
+            view.cancel.cancel();
+        }
+    }
+    if !app.extractions.is_empty() {
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Полоса хода; без известного объёма — бегущая.

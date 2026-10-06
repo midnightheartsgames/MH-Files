@@ -38,6 +38,7 @@ pub const OWNER_PALETTE: u64 = u64::MAX - 3;
 pub const OWNER_CRUMBS: u64 = u64::MAX - 4;
 pub const OWNER_BATCH: u64 = u64::MAX - 5;
 pub const OWNER_SIZES: u64 = u64::MAX - 6;
+pub const OWNER_COLUMNS: u64 = u64::MAX - 7;
 
 /// Как долго ждать второй шаг последовательности (`Alt+G` → `D`).
 const CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -74,6 +75,8 @@ pub enum Target {
 #[derive(Debug, Clone)]
 pub struct DragFiles {
     pub paths: Vec<PathBuf>,
+    /// Тащат из архива: бросок извлекает, а не копирует.
+    pub archive: Option<PathBuf>,
 }
 
 /// Куда можно бросить файлы: папка-строка, вкладка, пункт боковой панели.
@@ -186,6 +189,11 @@ pub enum Action {
     /// Посчитать размеры этих папок.
     FolderSizes(Vec<PathBuf>),
     RemoveSavedSearch(usize),
+    /// Перейти и встать на объект (щелчок в боковой колонке).
+    OpenSelect {
+        location: Location,
+        select: Option<PathBuf>,
+    },
 }
 
 pub struct FilesApp {
@@ -197,6 +205,11 @@ pub struct FilesApp {
     next_id: u64,
     pub workers: Workers,
     pub indexer: Indexer,
+    /// Идущие извлечения из архивов.
+    pub extractions: Vec<crate::archives::ExtractView>,
+    pub next_extract: u64,
+    /// Содержимое папок для боковых колонок вида «Колонки».
+    pub column_cache: crate::columns::Cache,
     events: Receiver<Event>,
     pub ops: Executor,
     pub operations: crate::operations::Operations,
@@ -267,6 +280,9 @@ impl FilesApp {
             next_id: 1,
             workers,
             indexer,
+            column_cache: Default::default(),
+            extractions: Vec::new(),
+            next_extract: 0,
             events,
             ops,
             operations: Default::default(),
@@ -427,6 +443,21 @@ impl FilesApp {
     /// Перечитать вкладки, показывающие эти папки.
     pub fn reload_dirs(&mut self, dirs: &[PathBuf]) {
         self.indexer.refresh(dirs);
+        self.column_cache.invalidate(dirs);
+        // Результаты дубликатов: проверить, не удалили ли что-то из них.
+        for tab in self.panes.iter().flat_map(|pane| pane.tabs.iter()) {
+            if let Some(view) = &tab.duplicates {
+                let paths: Vec<PathBuf> = view
+                    .group_of
+                    .keys()
+                    .filter(|p| p.parent().is_some_and(|parent| dirs.iter().any(|d| d == parent)))
+                    .cloned()
+                    .collect();
+                if !paths.is_empty() {
+                    self.workers.missing(tab.id, paths);
+                }
+            }
+        }
         let workers = self.workers.clone();
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             if tab.dir().is_some_and(|dir| dirs.contains(&dir)) {
@@ -451,6 +482,12 @@ impl FilesApp {
     fn on_event(&mut self, ctx: &egui::Context, event: Event) {
         let workers = self.workers.clone();
         match event {
+            Event::Listing { ticket, batch } if ticket.owner == OWNER_COLUMNS => {
+                self.column_cache.on_batch(ticket.generation, batch);
+            }
+            Event::ListingDone { ticket, result } if ticket.owner == OWNER_COLUMNS => {
+                self.column_cache.on_done(ticket.generation, result);
+            }
             Event::Listing { ticket, batch } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
                     tab.on_batch(ticket, batch);
@@ -561,6 +598,23 @@ impl FilesApp {
             Event::IndexResults { ticket, result } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
                     tab.on_index_results(ticket, result);
+                }
+            }
+            Event::ExtractProgress { id, done, total } => self.on_extract_progress(id, done, total),
+            Event::Missing { owner, paths } => {
+                if let Some(tab) = self.tab_by_id(owner) {
+                    tab.forget_paths(&paths);
+                }
+            }
+            Event::Extracted { extraction, result } => self.on_extracted(extraction, result),
+            Event::DuplicatesProgress { ticket, progress } => {
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    tab.on_duplicates_progress(ticket, progress);
+                }
+            }
+            Event::DuplicatesDone { ticket, result } => {
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    tab.on_duplicates_done(ticket, result);
                 }
             }
             Event::IndexChanged { content } => {
@@ -771,6 +825,7 @@ impl FilesApp {
             self.status = None;
         }
         inspector::follow(self);
+        inspector::sync_host(&ctx, self);
         self.images.end_frame(&self.workers);
         self.track_window(&ctx);
         self.save_session_if_changed(false);
@@ -910,7 +965,12 @@ impl FilesApp {
             if let (Some(payload), Some(pos)) = (payload, pointer)
                 && let Some(zone) = self.zone_at(pos).cloned()
             {
-                self.drop_on(zone, payload.paths.clone(), ctx);
+                match &payload.archive {
+                    Some(archive) if zone.favorite_group.is_none() => {
+                        self.extract_drop(archive.clone(), payload.paths.clone(), zone.dir)
+                    }
+                    _ => self.drop_on(zone, payload.paths.clone(), ctx),
+                }
             }
         }
         if dragging && let Some(pos) = pointer {
@@ -948,6 +1008,10 @@ impl FilesApp {
             (left || i.pointer.hover_pos().is_none(), i.pointer.primary_down())
         });
         if !(outside && down) {
+            return false;
+        }
+        // Из архива наружу не вытащить: файлов на диске ещё нет.
+        if egui::DragAndDrop::payload::<DragFiles>(ctx).is_some_and(|p| p.archive.is_some()) {
             return false;
         }
         let Some(payload) = egui::DragAndDrop::take_payload::<DragFiles>(ctx) else { return false };
