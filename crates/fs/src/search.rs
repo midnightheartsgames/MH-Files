@@ -103,6 +103,16 @@ mod tests {
         std::fs::write(dir.join("a/b/models/qwen-7b.gguf"), "").unwrap();
         std::fs::write(dir.join("a/llama.gguf"), "").unwrap();
         std::fs::write(dir.join("a/.hidden.gguf"), "").unwrap();
+        // В Windows точка в имени файл не скрывает — нужен атрибут, как у Проводника.
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("attrib")
+                .arg("+h")
+                .arg(dir.join("a").join(".hidden.gguf"))
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
         let query = SearchQuery { text: "*.gguf".into(), include_hidden: false };
         let mut names = Vec::new();
         let scanned = walk(&dir, &query, &CancelToken::default(), |batch, _| {
