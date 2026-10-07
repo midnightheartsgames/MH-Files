@@ -21,6 +21,7 @@ use mh_files_platform::integration;
 use mh_files_platform::shell::MenuChoice;
 
 pub mod archive;
+mod archive_tool;
 pub mod duplicates;
 pub mod images;
 pub mod indexer;
@@ -35,7 +36,7 @@ pub mod sorting;
 pub mod transfer;
 pub mod watch;
 
-pub use duplicates::{DuplicateOptions, DuplicateProgress};
+pub use duplicates::{DuplicateOptions, DuplicateProgress, LinkReport};
 pub use images::{ImageKey, ImageKind, ImageResult};
 pub use indexer::{IndexResults, IndexStatus, Indexer, VolumeState, VolumeStatus};
 pub use preview::{Preview, PreviewRequest};
@@ -208,6 +209,11 @@ pub enum Event {
     /// categories.json записан из настроек: ошибка или путь копии испорченного файла.
     CategoriesSaved {
         result: Result<Option<PathBuf>, String>,
+    },
+    /// Лишние копии заменены жёсткими ссылками.
+    DuplicatesLinked {
+        ticket: Ticket,
+        report: LinkReport,
     },
     /// Итог проверки обновлений.
     Update(Result<mh_files_core::update::Check, String>),
@@ -583,6 +589,18 @@ impl Workers {
             }
         });
         cancel
+    }
+
+    /// Заменить лишние копии жёсткими ссылками (см. `duplicates::replace_with_links`).
+    pub fn link_duplicates(
+        &self,
+        ticket: Ticket,
+        pairs: Vec<(PathBuf, mh_files_core::duplicates::Member, u64)>,
+    ) {
+        self.spawn("duplicates-link", move |workers| {
+            let report = duplicates::replace_with_links(&pairs, &CancelToken::default());
+            workers.send(Event::DuplicatesLinked { ticket, report });
+        });
     }
 
     pub fn batch_rename(&self, ticket: Ticket, plan: mh_files_core::rename::Plan) {

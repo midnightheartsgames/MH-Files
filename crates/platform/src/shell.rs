@@ -74,6 +74,20 @@ pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Кодовая страница ANSI Windows (1251 у русской); вне Windows — UTF-8 (65001). Нужна, чтобы
+/// прочитать вывод консольных программ, печатающих в ней.
+pub fn ansi_code_page() -> u32 {
+    #[cfg(windows)]
+    {
+        // SAFETY: функция без аргументов, только читает настройку системы.
+        unsafe { windows::Win32::Globalization::GetACP() }
+    }
+    #[cfg(not(windows))]
+    {
+        65001
+    }
+}
+
 /// Ярлыки на `targets` в папке `dest` («имя - ярлык.lnk», занятые имена не трогаются).
 /// Вне Windows — символические ссылки. Возвращает пути созданных ярлыков.
 pub fn create_shortcuts(targets: &[PathBuf], dest: &Path) -> Result<Vec<PathBuf>, String> {

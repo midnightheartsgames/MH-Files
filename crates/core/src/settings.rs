@@ -34,6 +34,24 @@ pub struct Settings {
     pub saved_searches: Vec<SavedSearch>,
     pub sorting: SortSettings,
     pub system: SystemSettings,
+    pub duplicates: DuplicateSettings,
+}
+
+/// Поиск дубликатов.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DuplicateSettings {
+    /// Файлы меньше, байт, не сравниваются.
+    pub min_size: u64,
+    /// Что пропускать: имя папки или файла (`node_modules`), маска (`*.tmp`) или полный
+    /// путь папки (`D:\Резерв`). См. `duplicates::excluded`.
+    pub exclude: Vec<String>,
+}
+
+impl Default for DuplicateSettings {
+    fn default() -> DuplicateSettings {
+        DuplicateSettings { min_size: 1, exclude: vec![".git".into(), "node_modules".into()] }
+    }
 }
 
 /// Как программа живёт в системе.
@@ -184,6 +202,8 @@ pub struct Preview {
     pub image_limit_mb: u32,
     /// Документы Office и прочее — обработчиками предпросмотра Windows в Инспекторе.
     pub handlers: bool,
+    /// Видео и звук играют прямо в быстром просмотре (Media Foundation).
+    pub media: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,6 +240,7 @@ impl Default for Settings {
             saved_searches: Vec::new(),
             sorting: SortSettings::default(),
             system: SystemSettings::default(),
+            duplicates: DuplicateSettings::default(),
         }
     }
 }
@@ -266,7 +287,13 @@ impl Default for Panes {
 
 impl Default for Preview {
     fn default() -> Preview {
-        Preview { thumbnails: true, text_limit_kb: 256, image_limit_mb: 64, handlers: true }
+        Preview {
+            thumbnails: true,
+            text_limit_kb: 256,
+            image_limit_mb: 64,
+            handlers: true,
+            media: true,
+        }
     }
 }
 

@@ -647,12 +647,21 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
 }
 
 /// Ход поиска дубликатов, итог и отметка лишних копий.
+/// Пороги размера для поиска дубликатов.
+const MIN_SIZES: [(u64, &str); 7] = [
+    (1, "любые"),
+    (4 << 10, "от 4 КБ"),
+    (100 << 10, "от 100 КБ"),
+    (1 << 20, "от 1 МБ"),
+    (10 << 20, "от 10 МБ"),
+    (100 << 20, "от 100 МБ"),
+    (1 << 30, "от 1 ГБ"),
+];
+
 fn duplicates_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     use mh_files_core::duplicates::{Keep, totals};
     use mh_files_fs::DuplicateProgress;
     let Some(view) = &mut tab.duplicates else { return };
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
     let (text, color) = if let Some(error) = &view.error {
         (error.clone(), theme::WARN)
     } else if view.done {
@@ -683,33 +692,109 @@ fn duplicates_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(150));
         (text, theme::accent())
     };
-    ui.painter().text(
-        rect.left_center() + vec2(12.0, 0.0),
-        Align2::LEFT_CENTER,
-        text,
-        theme::regular(13.5),
-        color,
-    );
-    if view.done && !view.groups.is_empty() {
-        let controls = Rect::from_min_max(
-            pos2(rect.right() - 420.0, rect.top() + 6.0),
-            rect.max - vec2(10.0, 6.0),
-        );
-        let mut child = ui.new_child(
-            egui::UiBuilder::new().max_rect(controls).layout(Layout::right_to_left(Align::Center)),
-        );
-        if child.button("Отметить лишние").on_hover_text("Delete отправит их в корзину").clicked()
-        {
-            app.actions.push(Action::Run(CommandId::SelectExtraCopies));
-        }
-        egui::ComboBox::from_id_salt(("dup-keep", tab.id))
-            .selected_text(view.keep.title())
-            .width(230.0)
-            .show_ui(&mut child, |ui| {
-                for keep in Keep::ALL {
-                    ui.selectable_value(&mut view.keep, keep, keep.title());
-                }
+    let mut rerun = false;
+    let mut link = false;
+    egui::Frame::new()
+        .fill(theme::WINDOW_BACKGROUND)
+        .inner_margin(egui::Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(text).font(theme::regular(13.5)).color(color));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // Исключения: по одному на строку, применяются поиском заново.
+                    let rules = &app.settings.duplicates.exclude;
+                    let label = match rules.len() {
+                        0 => "Исключения".to_string(),
+                        n => format!("Исключения: {n}"),
+                    };
+                    let text = view.exclude_text.get_or_insert_with(|| rules.join("\n"));
+                    let mut apply = false;
+                    ui.menu_button(label, |ui| {
+                        ui.set_width(300.0);
+                        ui.label(
+                            RichText::new("По одному на строку: имя (node_modules), маска (*.tmp) или полный путь папки.")
+                                .color(theme::TEXT_SECONDARY),
+                        );
+                        ui.add(egui::TextEdit::multiline(text).desired_rows(5).desired_width(280.0));
+                        if ui.button("Искать заново").clicked() {
+                            apply = true;
+                            ui.close();
+                        }
+                    });
+                    if apply {
+                        app.settings.duplicates.exclude = text
+                            .lines()
+                            .map(str::trim)
+                            .filter(|line| !line.is_empty())
+                            .map(String::from)
+                            .collect();
+                        rerun = true;
+                    }
+                    let current = app.settings.duplicates.min_size.max(1);
+                    let selected = MIN_SIZES
+                        .iter()
+                        .find(|(size, _)| *size == current)
+                        .map_or_else(|| format!("от {}", format::size(current)), |(_, l)| l.to_string());
+                    egui::ComboBox::from_id_salt(("dup-min", tab.id))
+                        .selected_text(selected)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for (size, label) in MIN_SIZES {
+                                if ui.selectable_label(size == current, label).clicked()
+                                    && size != current
+                                {
+                                    app.settings.duplicates.min_size = size;
+                                    rerun = true;
+                                }
+                            }
+                        });
+                    ui.label(RichText::new("Файлы").color(theme::TEXT_SECONDARY));
+                });
             });
+            if view.done && !view.groups.is_empty() {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    egui::ComboBox::from_id_salt(("dup-keep", tab.id))
+                        .selected_text(view.keep.title())
+                        .width(230.0)
+                        .show_ui(ui, |ui| {
+                            for keep in Keep::ALL {
+                                ui.selectable_value(&mut view.keep, keep, keep.title());
+                            }
+                        });
+                    if ui.button("Отметить лишние").on_hover_text("Delete отправит их в корзину").clicked() {
+                        app.actions.push(Action::Run(CommandId::SelectExtraCopies));
+                    }
+                    if ui
+                        .button("Жёсткие ссылки вместо копий…")
+                        .on_hover_text("Лишние копии остаются на местах, но перестают занимать место")
+                        .clicked()
+                    {
+                        link = true;
+                    }
+                });
+            }
+        });
+    if link && let Some(view) = &tab.duplicates {
+        let pairs: Vec<_> = view
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .link_plan(view.keep)
+                    .into_iter()
+                    .map(|(keeper, extra)| (keeper, extra, group.size))
+            })
+            .collect();
+        if !pairs.is_empty() {
+            app.dialog = Some(crate::dialogs::Dialog::HardLinks { tab: tab.id, pairs });
+        }
+    }
+    if rerun {
+        app.save_settings();
+        tab.duplicate_options = app.duplicate_options();
+        tab.reload(&app.workers, false);
     }
 }
 
@@ -756,7 +841,13 @@ fn list_view(
 ) {
     let area = ui.available_rect_before_wrap();
     ui.painter().rect_filled(area, CornerRadius::ZERO, theme::BACKGROUND);
-    if let Some(dir) = tab.dir() {
+    // В открытый zip можно бросать файлы: их дописывает Проводник.
+    let zip_dir = match &tab.location {
+        Location::Archive { archive, inner } => Some(Location::archive_path(archive, inner))
+            .filter(|dir| crate::actions::writable_zip(dir).is_some()),
+        _ => None,
+    };
+    if let Some(dir) = tab.dir().or(zip_dir) {
         app.drop_zones.push(DropZone { rect: area, dir, priority: 1, favorite_group: None });
         if app.drop_hover.as_deref() == tab.dir().as_deref() {
             ui.painter().rect_stroke(
@@ -1356,7 +1447,8 @@ pub(crate) fn item(
             DragFiles { paths: tab.targets(), archive, right },
         );
     }
-    if entry.is_dir() {
+    // Папка, а ещё zip — бросок в него дописывает архив.
+    if entry.is_dir() || crate::actions::writable_zip(&path).is_some() {
         app.drop_zones.push(DropZone {
             rect,
             dir: path.clone(),

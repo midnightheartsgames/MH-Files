@@ -493,6 +493,16 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
             &mut s.preview.handlers,
         );
     });
+    card(ui, "Видео и звук", |ui| {
+        switch_row(
+            ui,
+            "Играть в быстром просмотре",
+            Some(
+                "Пробел на видео или музыке — сразу воспроизведение: Enter — пауза, Shift+стрелки — перемотка. Кодеки — те же, что у Windows (HEVC и AV1 ставятся из Microsoft Store).",
+            ),
+            &mut s.preview.media,
+        );
+    });
     card(ui, "Инспектор и быстрый просмотр", |ui| {
         row(ui, "Читать текста, КБ", |ui| {
             ui.add(egui::DragValue::new(&mut s.preview.text_limit_kb).range(4..=4096));

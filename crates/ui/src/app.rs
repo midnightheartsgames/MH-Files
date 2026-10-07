@@ -495,6 +495,7 @@ impl FilesApp {
         let id = self.new_id();
         let options = ViewOptions { sort: session.sort, ..self.view_options() };
         let mut tab = Tab::new(id, session.location.clone(), session.view, options);
+        tab.duplicate_options = self.duplicate_options();
         tab.reload(&self.workers, false);
         tab
     }
@@ -597,7 +598,12 @@ impl FilesApp {
         }
         let workers = self.workers.clone();
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
-            if tab.dir().is_some_and(|dir| dirs.contains(&dir)) {
+            // Архив перечитывается, если менялось что-то в нём (запись в zip).
+            let archive_touched = match &tab.location {
+                Location::Archive { archive, .. } => dirs.iter().any(|d| d.starts_with(archive)),
+                _ => false,
+            };
+            if archive_touched || tab.dir().is_some_and(|dir| dirs.contains(&dir)) {
                 tab.reload(&workers, true);
             }
         }
@@ -781,6 +787,25 @@ impl FilesApp {
             Event::DuplicatesProgress { ticket, progress } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
                     tab.on_duplicates_progress(ticket, progress);
+                }
+            }
+            Event::DuplicatesLinked { ticket, report } => {
+                let level = if report.failed.is_empty() { Level::Info } else { Level::Error };
+                let mut text = format!(
+                    "жёсткими ссылками заменено {} — освобождено {}",
+                    mh_files_core::format::items(report.linked),
+                    mh_files_core::format::size(report.freed)
+                );
+                if let Some(first) = report.failed.first() {
+                    text.push_str(&format!(
+                        "; не вышло: {} (первое: {first})",
+                        report.failed.len()
+                    ));
+                }
+                self.set_status(text, level);
+                let workers = self.workers.clone();
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    tab.reload(&workers, false);
                 }
             }
             Event::DuplicatesDone { ticket, result } => {
@@ -1445,9 +1470,20 @@ impl FilesApp {
 
     pub fn refresh_view_options(&mut self) {
         let base = self.view_options();
+        let duplicates = self.duplicate_options();
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             let sort = tab.options.sort;
             tab.set_options(ViewOptions { sort, ..base });
+            tab.duplicate_options = duplicates.clone();
+        }
+    }
+
+    /// Порог размера и исключения для поиска дубликатов — из настроек.
+    pub fn duplicate_options(&self) -> mh_files_fs::DuplicateOptions {
+        mh_files_fs::DuplicateOptions {
+            min_size: self.settings.duplicates.min_size.max(1),
+            exclude: self.settings.duplicates.exclude.clone(),
+            ..Default::default()
         }
     }
 

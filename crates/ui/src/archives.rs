@@ -160,6 +160,12 @@ impl FilesApp {
                     let location = self.tab().location.enter(path);
                     self.open_location(location, target);
                 }
+                // Архив в архиве открывается как папка: путь — через внешний архив.
+                Some(entry) if mh_files_fs::archive::is_archive_name(&entry.name) => {
+                    let location =
+                        Location::Archive { archive: path.clone(), inner: String::new() };
+                    self.open_location(location, target);
+                }
                 Some(_) => files.extend(inner_of(&archive, path)),
                 None => {}
             }

@@ -23,6 +23,11 @@ pub enum Dialog {
         choices: Vec<OnConflict>,
         followup: Option<Followup>,
     },
+    /// Заменить лишние копии жёсткими ссылками: `(оставляемая, лишняя, размер)`.
+    HardLinks {
+        tab: u64,
+        pairs: Vec<(PathBuf, mh_files_core::duplicates::Member, u64)>,
+    },
 }
 
 impl Dialog {
@@ -48,6 +53,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     match &app.dialog {
         Some(Dialog::Delete { .. }) => delete(ctx, app),
         Some(Dialog::Conflicts { .. }) => conflicts(ctx, app),
+        Some(Dialog::HardLinks { .. }) => hard_links(ctx, app),
         None => {}
     }
 }
@@ -108,6 +114,63 @@ fn delete(ctx: &egui::Context, app: &mut FilesApp) {
         if confirmed {
             app.submit(FileOp::Delete { paths, permanent }, None);
         }
+    }
+}
+
+/// Подтверждение замены копий жёсткими ссылками: точный список того, что заменится.
+fn hard_links(ctx: &egui::Context, app: &mut FilesApp) {
+    let Some(Dialog::HardLinks { tab, pairs }) = &app.dialog else { return };
+    let (tab, freed) = (*tab, pairs.iter().map(|(_, _, size)| size).sum::<u64>());
+    let mut result: Option<bool> = None;
+    let modal = egui::Modal::new(Id::new("confirm-hard-links")).show(ctx, |ui| {
+        ui.set_width(560.0);
+        ui.label(RichText::new("Заменить копии жёсткими ссылками?").font(theme::bold(20.0)));
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(format!(
+                "{} останутся на своих местах, но станут одним файлом с оставляемой копией — освободится {}. Правка любого из них меняет все сразу; удаление одного не трогает остальные. Только в пределах одного диска NTFS.",
+                format::items(pairs.len()),
+                format::size(freed)
+            ))
+            .color(theme::TEXT_SECONDARY),
+        );
+        ui.add_space(6.0);
+        egui::Frame::new().fill(theme::FIELD).corner_radius(4).inner_margin(8).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (keeper, extra, _) in pairs.iter().take(LISTED) {
+                ui.label(
+                    RichText::new(format!("{} → {}", extra.path.display(), keeper.display()))
+                        .font(theme::regular(13.0))
+                        .color(theme::TEXT_SECONDARY),
+                );
+            }
+            if pairs.len() > LISTED {
+                ui.label(
+                    RichText::new(format!("и ещё {}", pairs.len() - LISTED))
+                        .color(theme::TEXT_DISABLED),
+                );
+            }
+        });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            if widgets::button(ui, "Заменить ссылками", true).clicked() {
+                result = Some(true);
+            }
+            if widgets::button(ui, "Отмена", false).clicked() {
+                result = Some(false);
+            }
+        });
+    });
+    if modal.should_close() || ctx.input(|i| i.key_pressed(Key::Escape)) {
+        result.get_or_insert(false);
+    }
+    if let Some(confirmed) = result
+        && let Some(Dialog::HardLinks { pairs, .. }) = app.dialog.take()
+        && confirmed
+    {
+        let ticket = mh_files_fs::Ticket { owner: tab, generation: 0 };
+        app.workers.link_duplicates(ticket, pairs);
+        app.set_status("заменяю копии жёсткими ссылками…", crate::app::Level::Info);
     }
 }
 
