@@ -121,6 +121,8 @@ struct Volume {
     stop: AtomicBool,
     /// Исключённые папки в нижнем регистре.
     exclude: Vec<PathBuf>,
+    /// Серийный номер тома съёмного диска: снимок у каждой флешки свой, хоть буква и та же.
+    serial: Option<u32>,
 }
 
 struct Shared {
@@ -132,7 +134,7 @@ struct Shared {
     /// Перезапуски по смене настроек идут строго по очереди.
     restart: Mutex<()>,
     last_notice: Mutex<Instant>,
-    /// Идёт опрос подключённых дисков (съёмные и сетевые в индексе).
+    /// Опрос подключённых дисков запущен (один на всё время работы).
     polling: AtomicBool,
 }
 
@@ -171,7 +173,6 @@ impl Indexer {
         }
         if settings.enabled
             && settings.roots.is_empty()
-            && (settings.removable || settings.network)
             && !self.shared.polling.swap(true, Ordering::Relaxed)
         {
             let shared = self.shared.clone();
@@ -250,6 +251,12 @@ impl Indexer {
         }
     }
 
+    /// Список дисков изменился (сообщает UI): тома подключённых — запустить, отключённых —
+    /// остановить; остальные не трогаются.
+    pub fn drives_changed(&self) {
+        request_sync(&self.shared);
+    }
+
     /// Обойти все тома заново.
     pub fn rescan(&self) {
         for volume in self.shared.state.lock().volumes.iter() {
@@ -286,13 +293,18 @@ impl Shared {
         self.workers.send(Event::IndexChanged { content });
     }
 
-    fn snapshot_path(&self, root: &Path) -> PathBuf {
+    /// Файл снимка тома. У съёмного диска в имени и серийный номер: другая флешка на той же
+    /// букве не получает чужой снимок.
+    fn snapshot_path(&self, root: &Path, serial: Option<u32>) -> PathBuf {
         let text = root.to_string_lossy().to_lowercase();
         let label: String = text.chars().filter(|c| c.is_alphanumeric()).take(24).collect();
         let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
             (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
         });
-        self.store.join(format!("{label}-{hash:016x}.idx"))
+        match serial {
+            Some(serial) => self.store.join(format!("{label}-{serial:08x}-{hash:016x}.idx")),
+            None => self.store.join(format!("{label}-{hash:016x}.idx")),
+        }
     }
 }
 
@@ -313,12 +325,13 @@ fn roots(settings: &IndexSettings) -> Vec<PathBuf> {
 
 fn default_roots(settings: &IndexSettings) -> Vec<PathBuf> {
     if cfg!(windows) {
-        use mh_files_platform::drives::{DriveKind, drive_roots};
+        use mh_files_platform::drives::{DriveKind, drive_roots, volume_serial};
         drive_roots()
             .into_iter()
-            .filter(|(_, kind)| match kind {
+            .filter(|(root, kind)| match kind {
                 DriveKind::Fixed => true,
-                DriveKind::Removable => settings.removable,
+                // Кардридер без карты держит букву — индексировать нечего.
+                DriveKind::Removable => settings.removable && volume_serial(root).is_some(),
                 DriveKind::Network => settings.network,
                 _ => false,
             })
@@ -329,43 +342,66 @@ fn default_roots(settings: &IndexSettings) -> Vec<PathBuf> {
     }
 }
 
-/// Как часто проверять, не подключили ли или отключили диск.
+/// Как часто проверять, не подключили ли или отключили диск, если UI не сообщил сам.
 const DRIVES_EVERY: Duration = Duration::from_secs(10);
 
-/// Съёмные и сетевые диски приходят и уходят: тома подключённых запускаются, отключённых —
-/// останавливаются (их снимок остаётся до следующего раза). Остальные тома не трогаются.
-/// Опрос кончается, когда настройки перестают его требовать.
+/// Запасной опрос дисков: UI сообщает о смене списка сразу ([`Indexer::drives_changed`]), но
+/// кардридер, например, букву не меняет. Живёт всё время работы; когда индексируются
+/// заданные папки, а не диски, ничего не делает.
 fn poll_drives(shared: &Arc<Shared>) {
     loop {
         std::thread::sleep(DRIVES_EVERY);
-        let settings = shared.state.lock().settings.clone();
-        let Some(settings) =
-            settings.filter(|s| s.enabled && s.roots.is_empty() && (s.removable || s.network))
-        else {
-            shared.polling.store(false, Ordering::Relaxed);
-            return;
-        };
-        let _order = shared.restart.lock();
-        let wanted = roots(&settings);
-        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut shared.state.lock().volumes)
-            .into_iter()
-            .partition(|volume| !wanted.contains(&volume.root));
-        let added: Vec<PathBuf> =
-            wanted.into_iter().filter(|root| !kept.iter().any(|v| &v.root == root)).collect();
-        let changed = !gone.is_empty() || !added.is_empty();
-        shared.state.lock().volumes = kept;
-        stop_volumes(gone, Duration::from_secs(10));
-        // Пока ждали остановки, настройки могли смениться — тогда тома запустит configure.
-        if shared.state.lock().settings.as_ref() != Some(&settings) {
-            continue;
-        }
-        let started: Vec<Arc<Volume>> =
-            added.into_iter().map(|root| start_volume(shared, root, &settings)).collect();
-        shared.state.lock().volumes.extend(started);
-        if changed {
-            shared.notify(true, true);
-        }
+        sync_drives(shared);
     }
+}
+
+fn request_sync(shared: &Arc<Shared>) {
+    let shared = shared.clone();
+    shared.workers.clone().spawn("index-drives", move |_| sync_drives(&shared));
+}
+
+/// Диски приходят и уходят: тома подключённых запускаются, отключённых (и флешек, сменившихся
+/// на той же букве) — останавливаются, их снимок остаётся до следующего раза. Остальные тома
+/// не трогаются.
+fn sync_drives(shared: &Arc<Shared>) {
+    let settings = shared.state.lock().settings.clone();
+    let Some(settings) = settings.filter(|s| s.enabled && s.roots.is_empty()) else { return };
+    let _order = shared.restart.lock();
+    // Пока ждали очереди, настройки могли смениться — тогда тома запустил configure.
+    if shared.state.lock().settings.as_ref() != Some(&settings) {
+        return;
+    }
+    let wanted = roots(&settings);
+    let (gone, kept): (Vec<_>, Vec<_>) =
+        std::mem::take(&mut shared.state.lock().volumes).into_iter().partition(|volume| {
+            !wanted.contains(&volume.root)
+                || volume.serial.is_some_and(|serial| {
+                    mh_files_platform::drives::volume_serial(&volume.root) != Some(serial)
+                })
+        });
+    let added: Vec<PathBuf> =
+        wanted.into_iter().filter(|root| !kept.iter().any(|v| &v.root == root)).collect();
+    let changed = !gone.is_empty() || !added.is_empty();
+    shared.state.lock().volumes = kept;
+    stop_volumes(gone, Duration::from_secs(10));
+    if shared.state.lock().settings.as_ref() != Some(&settings) {
+        return;
+    }
+    let started: Vec<Arc<Volume>> =
+        added.into_iter().map(|root| start_volume(shared, root, &settings)).collect();
+    shared.state.lock().volumes.extend(started);
+    if changed {
+        shared.notify(true, true);
+    }
+}
+
+/// Серийный номер тома, если это съёмный диск (флешка, карта, диск на USB).
+fn removable_serial(root: &Path) -> Option<u32> {
+    use mh_files_platform::drives::{DriveKind, drive_roots, volume_serial};
+    let removable = drive_roots()
+        .into_iter()
+        .any(|(r, kind)| r.as_path() == root && kind == DriveKind::Removable);
+    if removable { volume_serial(root) } else { None }
 }
 
 fn stop_all(shared: &Shared, wait: Duration) {
@@ -390,7 +426,8 @@ fn stop_volumes(volumes: Vec<Arc<Volume>>, wait: Duration) {
 
 fn start_volume(shared: &Arc<Shared>, root: PathBuf, settings: &IndexSettings) -> Arc<Volume> {
     let (tx, rx) = unbounded();
-    let exclude = settings.exclude.iter().map(|path| lower(path)).collect();
+    let exclude = settings.exclude.iter().map(|path| exclude_key(path)).collect();
+    let serial = removable_serial(&root);
     let volume = Arc::new(Volume {
         index: RwLock::new(VolumeIndex::new(root.clone())),
         status: Mutex::new(VolumeStatus {
@@ -404,6 +441,7 @@ fn start_volume(shared: &Arc<Shared>, root: PathBuf, settings: &IndexSettings) -
         jobs: tx,
         stop: AtomicBool::new(false),
         exclude,
+        serial,
     });
     let (shared, me, rescan) = (shared.clone(), volume.clone(), settings.rescan_on_start);
     shared.workers.clone().spawn("index-volume", move |_| run(&shared, &me, &rx, rescan));
@@ -414,6 +452,18 @@ fn lower(path: &Path) -> PathBuf {
     if cfg!(windows) { PathBuf::from(path.to_string_lossy().to_lowercase()) } else { path.into() }
 }
 
+/// Исключённая папка для сравнения: без кавычек («Копировать как путь» Проводника), без
+/// `\\?\`, без `.`/`..` и хвостовой черты, в нижнем регистре.
+fn exclude_key(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let text = text.trim().trim_matches('"');
+    let plain = match text.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => format!(r"\\{rest}"),
+        None => text.strip_prefix(r"\\?\").unwrap_or(text).to_string(),
+    };
+    lower(&mh_files_core::location::normalize(Path::new(&plain)))
+}
+
 impl Volume {
     fn excluded(&self, path: &Path) -> bool {
         if self.exclude.is_empty() {
@@ -421,6 +471,37 @@ impl Volume {
         }
         let path = lower(path);
         self.exclude.iter().any(|e| path.starts_with(e))
+    }
+
+    /// Содержимое папки `dir` без исключённых записей. Сверка папки тогда сама убирает из
+    /// индекса исключённое раньше — вместе со всем, что под ним.
+    fn without_excluded(&self, dir: &Path, (actual, links): Children) -> Children {
+        if self.exclude.is_empty() {
+            return (actual, links);
+        }
+        actual
+            .into_iter()
+            .zip(links)
+            .filter(|((name, _), _)| !self.excluded(&dir.join(name)))
+            .unzip()
+    }
+
+    /// Снимок мог быть построен до того, как папку исключили: убрать её из индекса. `true` —
+    /// что-то убрано.
+    fn prune_excluded(&self, index: &mut VolumeIndex) -> bool {
+        let root = lower(&self.root);
+        let mut pruned = false;
+        for key in &self.exclude {
+            let Ok(relative) = key.strip_prefix(&root) else { continue };
+            if relative.as_os_str().is_empty() {
+                continue; // Исключён весь корень тома — так индекс не выключают.
+            }
+            if let Some(node) = index.lookup(&self.root.join(relative)) {
+                index.remove(node);
+                pruned = true;
+            }
+        }
+        pruned
     }
 
     fn set_state(&self, shared: &Shared, state: VolumeState) {
@@ -451,15 +532,13 @@ impl Volume {
             dirs += 1;
             progress(dirs);
             // Нечитаемая папка (нет доступа) остаётся какой была.
-            let Some((actual, links)) = read_children(&path) else { continue };
+            let Some(children) = read_children(&path) else { continue };
+            let (actual, links) = self.without_excluded(&path, children);
             let nodes = self.index.write().reconcile_node(node, &actual);
             for (((child, _), (name, info)), link) in nodes.into_iter().zip(&actual).zip(links) {
                 // Ссылки и junction не обходятся: петли и чужие тома.
                 if info.is_dir && !link {
-                    let child_path = path.join(name);
-                    if !self.excluded(&child_path) {
-                        queue.push_back((child, child_path));
-                    }
+                    queue.push_back((child, path.join(name)));
                 }
             }
         }
@@ -472,7 +551,10 @@ impl Volume {
             return;
         }
         match read_children(dir) {
-            Some((actual, links)) => self.apply(dir, &actual, &links),
+            Some(children) => {
+                let (actual, links) = self.without_excluded(dir, children);
+                self.apply(dir, &actual, &links)
+            }
             None => {
                 if std::fs::symlink_metadata(dir).is_err() {
                     let mut index = self.index.write();
@@ -498,7 +580,7 @@ impl Volume {
             new_dirs
         };
         for (node, path) in new_dirs {
-            if !self.excluded(&path) && !self.walk(node, path, |_| {}) {
+            if !self.walk(node, path, |_| {}) {
                 return;
             }
         }
@@ -581,7 +663,7 @@ impl Volume {
     }
 
     fn save(&self, shared: &Shared) {
-        let path = shared.snapshot_path(&self.root);
+        let path = shared.snapshot_path(&self.root, self.serial);
         let index = self.index.upgradable_read();
         let bytes = snapshot::write(&index);
         let written = std::fs::create_dir_all(&shared.store).is_ok() && {
@@ -650,12 +732,14 @@ fn touched_dirs(events: Vec<WatchEvent>, dirs: &mut BTreeSet<PathBuf>) -> Option
 fn run(shared: &Arc<Shared>, volume: &Arc<Volume>, jobs: &Receiver<Job>, rescan_on_start: bool) {
     volume::background_thread();
     // 1. Снимок.
-    let loaded = std::fs::read(shared.snapshot_path(&volume.root))
+    let loaded = std::fs::read(shared.snapshot_path(&volume.root, volume.serial))
         .ok()
         .and_then(|bytes| snapshot::read(&bytes).ok())
         .filter(|index| index.root() == volume.root);
     let had_snapshot = loaded.as_ref().is_some_and(|index| index.built_at > 0);
-    if let Some(index) = loaded {
+    let mut pruned = false;
+    if let Some(mut index) = loaded {
+        pruned = volume.prune_excluded(&mut index);
         *volume.index.write() = index;
     }
     volume.set_state(shared, VolumeState::Loading);
@@ -673,7 +757,8 @@ fn run(shared: &Arc<Shared>, volume: &Arc<Volume>, jobs: &Receiver<Job>, rescan_
 
     // 3. Досмотр.
     let mark = volume.index.read().journal;
-    let mut dirty = false;
+    // Убранное из снимка исключённое — переписать снимок.
+    let mut dirty = pruned;
     let caught_up = match mark {
         Some(mark) if had_snapshot && shared.elevated => {
             volume.status.lock().journal = true;
@@ -687,7 +772,7 @@ fn run(shared: &Arc<Shared>, volume: &Arc<Volume>, jobs: &Receiver<Job>, rescan_
             volume.save(shared);
         }
     } else {
-        dirty = mark.is_some();
+        dirty |= mark.is_some();
     }
     if !volume.stopped() {
         volume.set_state(shared, VolumeState::Ready);
@@ -708,6 +793,16 @@ fn run(shared: &Arc<Shared>, volume: &Arc<Volume>, jobs: &Receiver<Job>, rescan_
         let mut changed = false;
         match job {
             Some(Job::Watch(events)) => {
+                // Наблюдатель остановился, а корня больше нет — диск отключили: результаты
+                // с него не показывать, тома пересобрать сейчас, а не при следующем опросе.
+                if events.iter().any(|e| matches!(e, WatchEvent::Stopped))
+                    && std::fs::metadata(&volume.root).is_err()
+                {
+                    volume.status.lock().live = false;
+                    volume.set_state(shared, VolumeState::Failed("диск отключён".into()));
+                    shared.notify(true, true);
+                    request_sync(shared);
+                }
                 if touched_dirs(events, &mut pending).is_none() {
                     pending.clear();
                     let _ = volume.jobs.send(Job::Rescan);
@@ -721,6 +816,7 @@ fn run(shared: &Arc<Shared>, volume: &Arc<Volume>, jobs: &Receiver<Job>, rescan_
                 changed = true;
             }
             Some(Job::Seen { dir, actual, links }) => {
+                let (actual, links) = volume.without_excluded(&dir, (actual, links));
                 volume.apply(&dir, &actual, &links);
                 changed = true;
             }
@@ -783,7 +879,9 @@ fn search(
     let cancelled = || cancel.is_cancelled();
     let mut found: Vec<(i32, Entry)> = Vec::new();
     let mut total = 0;
-    for volume in volumes {
+    // Отключённый диск: его записи — уже не файлы.
+    let live = volumes.iter().filter(|v| !matches!(v.status.lock().state, VolumeState::Failed(_)));
+    for volume in live {
         let index = volume.index.read();
         let hits = index.search(&query, RESULT_LIMIT, &cancelled);
         if cancel.is_cancelled() {
@@ -830,6 +928,7 @@ mod tests {
             jobs: tx,
             stop: AtomicBool::new(false),
             exclude,
+            serial: None,
         }
     }
 
@@ -871,6 +970,45 @@ mod tests {
         vol.refresh_dir(&root.join("a/b"));
         assert_eq!(names(&vol, "report"), ["report.md"]);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn exclusion_added_later_drops_indexed_folder() {
+        let root = temp("exclude-later");
+        std::fs::create_dir_all(root.join("Skip/deep")).unwrap();
+        std::fs::create_dir_all(root.join("keep")).unwrap();
+        std::fs::write(root.join("Skip/deep/report.doc"), "x").unwrap();
+        std::fs::write(root.join("keep/report.pdf"), "x").unwrap();
+        let vol = Arc::new(volume(&root, Vec::new()));
+        assert!(vol.walk(ROOT, root.clone(), |_| {}));
+        assert_eq!(names(&vol, "report"), ["report.doc", "report.pdf"]);
+
+        // Исключили после постройки — снимок чистится при загрузке; с хвостовой чертой, а в
+        // Windows — в любом регистре.
+        let name = if cfg!(windows) { "skip" } else { "Skip" };
+        let key = exclude_key(&PathBuf::from(format!("{}/", root.join(name).display())));
+        let excluded = Arc::new(volume(&root, vec![key]));
+        let mut index = std::mem::replace(&mut *vol.index.write(), VolumeIndex::new(root.clone()));
+        assert!(excluded.prune_excluded(&mut index));
+        *excluded.index.write() = index;
+        assert_eq!(names(&excluded, "report"), ["report.pdf"]);
+        let index = std::mem::replace(&mut *excluded.index.write(), VolumeIndex::new(root.clone()));
+        *excluded.index.write() = index;
+        // И обходом: исключённая папка уходит из индекса вместе с содержимым.
+        assert!(excluded.walk(ROOT, root.clone(), |_| {}));
+        assert_eq!(names(&excluded, "report"), ["report.pdf"]);
+        assert!(names(&excluded, "skip").is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn exclude_key_strips_quotes_and_verbatim_prefix() {
+        if cfg!(windows) {
+            assert_eq!(exclude_key(Path::new(r#""C:\Windows\""#)), PathBuf::from(r"c:\windows"));
+            assert_eq!(exclude_key(Path::new(r"\\?\C:\Windows")), PathBuf::from(r"c:\windows"));
+        } else {
+            assert_eq!(exclude_key(Path::new("/data/skip/")), PathBuf::from("/data/skip"));
+        }
     }
 
     #[test]

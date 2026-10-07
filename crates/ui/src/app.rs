@@ -380,7 +380,7 @@ impl FilesApp {
         let restored = session.filter(|_| app.settings.panes.restore_session);
         let fresh = restored.is_none();
         app.restore(restored.unwrap_or_else(|| Session::single(app.home_location())));
-        app.workers.drives();
+        app.workers.watch_drives();
         app.workers.known_folders();
         app.workers.integration(None);
         // Пути из командной строки: без восстановленного сеанса первый — в домашнюю вкладку.
@@ -729,6 +729,14 @@ impl FilesApp {
             },
             Event::DriveRoots(roots) => {
                 let old = std::mem::take(&mut self.drives);
+                // Диск подключили или отключили (не первый список при запуске) — и индекс
+                // поиска пересобирает тома сразу, а не при своём опросе.
+                let changed = !old.is_empty()
+                    && (old.len() != roots.len()
+                        || old.iter().zip(&roots).any(|(a, (root, _))| &a.root != root));
+                if changed {
+                    self.indexer.drives_changed();
+                }
                 self.drives = roots
                     .into_iter()
                     .map(|(root, kind)| {
