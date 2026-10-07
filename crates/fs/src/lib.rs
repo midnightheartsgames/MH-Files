@@ -145,10 +145,12 @@ pub enum Event {
         size: DirSize,
     },
     /// Пункты меню Windows для своего контекстного меню (поколение запроса — `generation`).
-    /// Номер выбранной команды — в `commands`; отпустить отправитель — меню закрыто.
+    /// Приходят дважды: без `complete` — подменю ещё заполняются. Номер выбранной команды —
+    /// в `commands`; отпустить все отправители — меню закрыто.
     ShellMenu {
         generation: u64,
         items: Result<Vec<ShellMenuItem>, String>,
+        complete: bool,
         commands: Sender<u32>,
     },
     /// Меню Windows закрыто; `paths` — для чего его открывали.

@@ -868,6 +868,9 @@ fn list_view(
     {
         start_band(ui, tab, pos);
     }
+    if let Some(dir) = tab.dir() {
+        crate::shell_menu::prefetch_on_press(app, &background, || MenuTarget::Background(dir));
+    }
     background.context_menu(|ui| background_menu(ui, app, tab));
     if ui.rect_contains_pointer(area) {
         app.wheel_resize(ui.ctx(), tab.view);
@@ -1478,6 +1481,13 @@ pub(crate) fn item(
             dir: path.clone(),
             priority: 2,
             favorite_group: None,
+        });
+    }
+    // В архиве объектов нет на диске — и меню Windows для них нет.
+    if !matches!(tab.location, Location::Archive { .. }) {
+        crate::shell_menu::prefetch_on_press(app, &response, || {
+            // Невыделенный объект при щелчке станет единственным выделенным.
+            MenuTarget::Items(if selected { tab.targets() } else { vec![path.clone()] })
         });
     }
     let many = tab.selection.len() > 1;

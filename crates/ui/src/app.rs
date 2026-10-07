@@ -273,7 +273,12 @@ pub struct FilesApp {
     pub zoom_rest: (f32, f64),
     /// Пункты меню Windows для открытого сейчас контекстного меню.
     pub shell_menu: Option<crate::shell_menu::ShellMenu>,
+    /// Меню Windows, заказанное при нажатии правой кнопки, — до отпускания.
+    pub shell_prefetch: Option<crate::shell_menu::ShellMenu>,
     pub shell_menu_generation: u64,
+    pub shell_menu_heights: crate::shell_menu::Heights,
+    /// Расширения меню Windows уже загружены пробным меню после запуска.
+    pub shell_warmed: bool,
     /// Посчитанные размеры папок (целиком) и те, что ещё считаются.
     pub folder_sizes: HashMap<PathBuf, DirSize>,
     pub sizes_pending: HashSet<PathBuf>,
@@ -357,7 +362,10 @@ impl FilesApp {
             pending_chord: None,
             zoom_rest: (0.0, 0.0),
             shell_menu: None,
+            shell_prefetch: None,
             shell_menu_generation: 0,
+            shell_menu_heights: Default::default(),
+            shell_warmed: false,
             folder_sizes: HashMap::new(),
             sizes_pending: HashSet::new(),
             sizes_cancel: None,
@@ -759,8 +767,8 @@ impl FilesApp {
             Event::Preflight { transfer, conflicts } => self.on_preflight(transfer, conflicts),
             Event::FolderSize { ticket, path, size } => self.on_folder_size(ticket, path, size),
             Event::Menu { paths, choice } => self.on_menu(paths, choice),
-            Event::ShellMenu { generation, items, commands } => {
-                crate::shell_menu::on_ready(self, ctx, generation, items, commands);
+            Event::ShellMenu { generation, items, complete, commands } => {
+                crate::shell_menu::on_ready(self, ctx, generation, items, complete, commands);
             }
             Event::IndexResults { ticket, result } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
@@ -1018,6 +1026,7 @@ impl FilesApp {
         }
         settings_window::show(&ctx, self);
         crate::shell_menu::end_frame(self);
+        crate::shell_menu::warm_up(&ctx, self);
 
         self.handle_drops(&ctx);
         self.run_actions(&ctx);
