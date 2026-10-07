@@ -11,6 +11,7 @@ mh-files-core.workspace = true
 crossbeam-channel.workspace = true
 parking_lot.workspace = true
 image.workspace = true
+resvg.workspace = true
 encoding_rs.workspace = true
 mh-files-platform.workspace = true
 zip.workspace = true

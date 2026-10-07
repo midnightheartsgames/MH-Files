@@ -23,6 +23,8 @@ nucleo-matcher = "0.3"
 regex = { version = "1", default-features = false, features = ["std", "unicode"] }
 uuid = { version = "1", features = ["v4"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "ico", "webp", "tiff"] }
+# SVG в предпросмотре и эскизах: разбор и отрисовка на чистом Rust.
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts", "memmap-fonts", "raster-images"] }
 encoding_rs = "0.8"
 memchr = "2"
 lru = "0.18"
@@ -51,4 +53,10 @@ opt-level = 3
 [profile.dev.package.zune-jpeg]
 opt-level = 3
 [profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.resvg]
+opt-level = 3
+[profile.dev.package.usvg]
+opt-level = 3
+[profile.dev.package.tiny-skia]
 opt-level = 3

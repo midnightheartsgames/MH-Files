@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use mh_files_platform::thumbs::{self, Bitmap, ImageMode};
 use mh_files_platform::{media, pdf};
 
-use crate::images::{decodable, decode_bytes, decode_scaled, dimensions};
+use crate::images::{
+    decodable, decode_bytes, decode_scaled, dimensions, render_svg, render_svg_file, vector,
+};
 use crate::{CancelToken, archive};
 
 #[derive(Debug, Clone)]
@@ -80,6 +82,20 @@ pub fn load(request: &PreviewRequest, cancel: &CancelToken) -> Preview {
             Ok((dirs, files, bytes)) => Preview::Archive { dirs, files, bytes },
             Err(error) => Preview::Error(error),
         };
+    }
+    if vector(&ext) {
+        match render_svg_file(&request.path, request.max_side, request.image_limit) {
+            Ok((bitmap, size)) => {
+                return Preview::Image {
+                    bitmap,
+                    dimensions: Some(size),
+                    pages: None,
+                    info: Vec::new(),
+                };
+            }
+            // Не разобрался — покажем текст: SVG остаётся текстовым форматом.
+            Err(_) => return text(&request.path, request.text_limit),
+        }
     }
     if decodable(&ext) {
         return match decode_scaled(&request.path, request.max_side, request.image_limit) {
@@ -190,6 +206,12 @@ fn in_archive(request: &PreviewRequest, archive: &Path, inner: &str) -> Preview 
             Ok((dirs, files, bytes)) => Preview::Archive { dirs, files, bytes },
             Err(error) => Preview::Error(error),
         };
+    }
+    if vector(&ext)
+        && let Ok((bitmap, size)) = archive::read(archive, inner, request.image_limit.min(16 << 20))
+            .and_then(|bytes| render_svg(&bytes, request.max_side))
+    {
+        return Preview::Image { bitmap, dimensions: Some(size), pages: None, info: Vec::new() };
     }
     if decodable(&ext) {
         return match archive::read(archive, inner, request.image_limit)
