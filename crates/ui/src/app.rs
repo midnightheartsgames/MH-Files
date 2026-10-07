@@ -228,10 +228,12 @@ pub struct FilesApp {
     incoming: Option<crossbeam_channel::Receiver<Vec<crate::startup::Target>>>,
     /// Сервер единственной копии.
     _instance: Option<Box<dyn std::any::Any>>,
-    /// Прошлый запуск кончился сбоем: отчёт для «Настройки → Система».
+    /// Прошлый запуск кончился сбоем: отчёт для «Настройки › Система».
     pub previous: crate::crash::Previous,
     /// Проверка обновлений: идёт ли и чем кончилась.
     pub update: UpdateState,
+    /// Когда последний раз проверялось расписание сортировки.
+    pub schedule_checked: Option<Instant>,
     /// Встраивание в Проводник: что есть (узнаётся в фоне).
     pub integration: Option<mh_files_platform::integration::Status>,
     /// Сортировщик: категории и журналы.
@@ -322,6 +324,7 @@ impl FilesApp {
             previous: startup.previous.clone(),
             integration: None,
             update: UpdateState::default(),
+            schedule_checked: None,
             extractions: Vec::new(),
             next_extract: 0,
             events,
@@ -369,7 +372,7 @@ impl FilesApp {
         // Сбой — только паника с отчётом; без отчёта процесс сняли или выключили компьютер.
         if startup.previous.report.is_some() {
             app.set_status(
-                "прошлый запуск закончился сбоем — отчёт в «Настройки → Система»",
+                "прошлый запуск закончился сбоем — отчёт в «Настройки › Система»",
                 Level::Error,
             );
         } else if let Some(old) = &startup.upgraded_from {
@@ -460,7 +463,7 @@ impl FilesApp {
                 Level::Info,
             ),
             Ok(Check::Available(release)) => self.set_status(
-                format!("доступна MH Files {} — «Настройки → О программе»", release.version),
+                format!("доступна MH Files {} — «Настройки › О программе»", release.version),
                 Level::Info,
             ),
             Err(error) => {
@@ -1008,6 +1011,7 @@ impl FilesApp {
         self.run_actions(&ctx);
         self.drive_index_tabs(&ctx);
         self.drive_sorters();
+        self.run_schedules(&ctx);
         if self.settings.appearance.custom_title_bar {
             crate::titlebar::borders(&ctx);
         }
@@ -1462,6 +1466,15 @@ impl FilesApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(
                 !settings.appearance.custom_title_bar,
             ));
+        }
+        let mut settings = settings;
+        // Пока окно настроек было открыто, расписание могло отработать: его время новее.
+        for schedule in &mut settings.sort_schedules {
+            if let Some(current) =
+                self.settings.sort_schedules.iter().find(|s| s.folder == schedule.folder)
+            {
+                schedule.last_run = schedule.last_run.max(current.last_run);
+            }
         }
         self.settings = settings;
         self.refresh_view_options();

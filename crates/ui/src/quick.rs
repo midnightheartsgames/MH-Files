@@ -186,8 +186,13 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "{index} / {}   стрелки — листать, пробел — закрыть",
-                                    tab.listing.len()
+                                    "{index} / {}   стрелки — листать, {}пробел — закрыть",
+                                    tab.listing.len(),
+                                    if quick.player.is_some() {
+                                        "Enter — пауза, Shift+стрелки — перемотка, "
+                                    } else {
+                                        ""
+                                    }
                                 ))
                                 .color(theme::TEXT_DISABLED),
                             );

@@ -523,6 +523,53 @@ impl Workers {
         cancel
     }
 
+    /// Сортировка по расписанию: план и сразу выполнение всех его строк, с журналом (её
+    /// можно отменить). Итог — `SortDone` с этим `ticket`.
+    pub fn sort_scheduled(
+        &self,
+        ticket: Ticket,
+        options: mh_files_core::sorting::ScanOptions,
+        mode: mh_files_core::sorting::Mode,
+        remove_empty: bool,
+        classifier: Arc<mh_files_core::sorting::Classifier>,
+        history: PathBuf,
+    ) {
+        self.spawn("sort-scheduled", move |workers| {
+            use mh_files_core::sorting::{Action, Report};
+            let never = AtomicBool::new(false);
+            let refused = |note: String| {
+                let mut report = Report::new(Action::Sort(mode), 0);
+                report.note = Some(note);
+                report
+            };
+            let (report, journal) =
+                if let Some(reason) = sorting::danger_reason(&options.root, options.recursive) {
+                    (refused(reason.to_string()), PathBuf::new())
+                } else if !options.root.is_dir() {
+                    (refused(format!("нет папки {}", options.root.display())), PathBuf::new())
+                } else {
+                    match sorting::scan(&options, &classifier, &never, &mut |_| {}) {
+                        Some(plan) if !plan.moves.is_empty() => {
+                            let job = sorting::SortJob {
+                                source: plan.root,
+                                output: plan.output,
+                                mode,
+                                remove_empty: remove_empty && options.recursive,
+                                moves: plan.moves,
+                                journal_path: sorting::new_journal_path(&history),
+                            };
+                            let journal = job.journal_path.clone();
+                            let report = sorting::run_sort(job, &never, &mut |_, _, _| {});
+                            sorting::prune(&history, sorting::JOURNAL_KEEP);
+                            (report, journal)
+                        }
+                        _ => (Report::new(Action::Sort(mode), 0), PathBuf::new()),
+                    }
+                };
+            workers.send(Event::SortDone { ticket, report, journal });
+        });
+    }
+
     /// Найти последнюю операцию сортировщика, которую можно отменить.
     pub fn sort_last(&self, ticket: Ticket, history: PathBuf) {
         self.spawn("sort-last", move |workers| {

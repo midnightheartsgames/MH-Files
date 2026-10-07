@@ -10,7 +10,7 @@ pub mod names;
 pub mod plan;
 
 pub use classify::{Class, Classifier};
-pub use config::{CONFIG_FILE, Config, Mode};
+pub use config::{CONFIG_FILE, Config, Mode, Rule};
 pub use plan::{
     Action, CategoryStat, Entry, Journal, LogLine, Plan, PlannedMove, Report, ScanOptions,
 };

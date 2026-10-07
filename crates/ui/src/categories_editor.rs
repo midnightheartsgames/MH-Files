@@ -105,6 +105,16 @@ pub fn show(ui: &mut Ui, editor: &mut Editor, type_folders: bool) {
             .on_hover_text("Недокачанные и временные файлы: crdownload, part, tmp…");
         });
     });
+    card(ui, "Правила по дате и размеру", |ui| {
+        widgets::hint(
+            ui,
+            "Проверяются раньше категорий: подошедший файл ляжет в «Папка\\Категория». Пустое поле — без этого условия; категории через запятую, пусто — все.",
+        );
+        rules(ui, &mut editor.draft);
+        if ui.button("Добавить правило").clicked() {
+            editor.draft.add_rule();
+        }
+    });
     card(ui, "Проверить имя файла", |ui| {
         ui.add(
             egui::TextEdit::singleline(&mut editor.test_name)
@@ -234,6 +244,54 @@ fn list(ui: &mut Ui, editor: &mut Editor) {
             Some(open) if open > index => Some(open - 1),
             other => other,
         };
+    }
+}
+
+/// Правила: папка, «старше, дней», «больше, МБ», категории, удалить.
+fn rules(ui: &mut Ui, draft: &mut Draft) {
+    let mut remove = None;
+    for (index, rule) in draft.rules.iter_mut().enumerate() {
+        egui::Frame::new()
+            .fill(theme::FIELD)
+            .corner_radius(CornerRadius::same(4))
+            .inner_margin(egui::Margin::symmetric(10, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("В папку").color(theme::TEXT_SECONDARY));
+                    ui.add(egui::TextEdit::singleline(&mut rule.folder).desired_width(130.0));
+                    ui.label(RichText::new("старше, дней").color(theme::TEXT_SECONDARY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut rule.older_than_days)
+                            .hint_text("—")
+                            .desired_width(50.0),
+                    );
+                    ui.label(RichText::new("больше, МБ").color(theme::TEXT_SECONDARY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut rule.larger_than_mb)
+                            .hint_text("—")
+                            .desired_width(60.0),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if widgets::icon_button(ui, true, "Удалить правило", icons::close).clicked()
+                        {
+                            remove = Some(index);
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Категории").color(theme::TEXT_SECONDARY));
+                    ui.add(
+                        egui::TextEdit::singleline(&mut rule.categories)
+                            .hint_text("все")
+                            .desired_width(ui.available_width()),
+                    );
+                });
+            });
+        ui.add_space(4.0);
+    }
+    if let Some(index) = remove {
+        draft.rules.remove(index);
     }
 }
 

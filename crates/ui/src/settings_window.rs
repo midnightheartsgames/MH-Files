@@ -566,7 +566,7 @@ fn system(ui: &mut Ui, s: &mut Settings, info: &SystemInfo) -> Option<SystemActi
                 (
                     Feature::Archives,
                     "Архивы zip, 7z, rar",
-                    "MH Files появится в «Открыть с помощью» для архивов: архив откроется как папка. Сделать его программой по умолчанию Windows разрешает только вам — «Открыть с помощью → Выбрать другое приложение → Всегда».",
+                    "MH Files появится в «Открыть с помощью» для архивов: архив откроется как папка. Сделать его программой по умолчанию Windows разрешает только вам — «Открыть с помощью › Выбрать другое приложение › Всегда».",
                     status.archives,
                 ),
             ];
@@ -723,6 +723,39 @@ fn sorting(
             &mut o.remove_empty,
         );
         widgets::hint(ui, "Галочки, изменённые во вкладке сортировщика, запоминаются сами.");
+    });
+    card(ui, "По расписанию", |ui| {
+        if s.sort_schedules.is_empty() {
+            widgets::hint(
+                ui,
+                "Папки можно раскладывать сами по себе: «Разложить» › «Параметры» › «По расписанию». Работает, пока MH Files открыт; пропущенное — при следующем запуске.",
+            );
+        }
+        let mut remove = None;
+        for (index, schedule) in s.sort_schedules.iter().enumerate() {
+            // Путь бывает длинным: обрезается по ширине карточки, целиком — в подсказке.
+            let path = schedule.folder.display().to_string();
+            ui.add(egui::Label::new(RichText::new(&path).color(theme::TEXT_PRIMARY)).truncate())
+                .on_hover_text(path);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(schedule.period_label()).color(theme::TEXT_SECONDARY));
+                if schedule.last_run > 0 {
+                    let when = chrono::DateTime::from_timestamp(schedule.last_run, 0)
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local).format("%d.%m.%Y %H:%M").to_string()
+                        })
+                        .unwrap_or_default();
+                    ui.label(RichText::new(format!("отсчёт с {when}")).color(theme::TEXT_DISABLED));
+                }
+                if ui.small_button("Убрать").clicked() {
+                    remove = Some(index);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some(index) = remove {
+            s.sort_schedules.remove(index);
+        }
     });
     crate::categories_editor::show(ui, editor, s.sorting.type_folders);
     card(ui, "Файл categories.json", |ui| {

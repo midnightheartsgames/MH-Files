@@ -27,6 +27,46 @@ pub struct Config {
     pub ignore_extensions: Vec<String>,
     /// Категория → расширения. Если расширение указано дважды, побеждает первая категория.
     pub categories: IndexMap<String, Vec<String>>,
+    /// Правила по дате и размеру — проверяются раньше категорий. MH Sort этого поля не знает
+    /// и просто пропускает его.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
+}
+
+/// Правило: файл, подошедший по всем заданным условиям, идёт не в `<категория>`, а в
+/// `<папка>\<категория>` — «старше года — в Архив», «больше 4 ГБ — в Большие».
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Rule {
+    /// Папка верхнего уровня рядом с категориями.
+    pub folder: String,
+    /// Не менялся дольше стольких дней.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub older_than_days: Option<u32>,
+    /// Больше стольких мегабайт.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub larger_than_mb: Option<u64>,
+    /// Только для этих категорий; пусто — для всех.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub categories: Vec<String>,
+}
+
+impl Rule {
+    /// Подходит ли файл: категория, размер в байтах, возраст в днях (`None` — неизвестен).
+    /// Правило без условий не подходит ни к чему.
+    pub fn matches(&self, category: &str, size: u64, age_days: Option<u64>) -> bool {
+        if self.older_than_days.is_none() && self.larger_than_mb.is_none() {
+            return false;
+        }
+        let category = category.to_lowercase();
+        let category_ok = self.categories.is_empty()
+            || self.categories.iter().any(|c| c.trim().to_lowercase() == category);
+        let old_ok = self
+            .older_than_days
+            .is_none_or(|days| age_days.is_some_and(|age| age >= u64::from(days)));
+        let large_ok = self.larger_than_mb.is_none_or(|mb| size > mb.saturating_mul(1 << 20));
+        category_ok && old_ok && large_ok
+    }
 }
 
 const DEFAULT_CATEGORIES: &[(&str, &[&str])] = &[
@@ -133,6 +173,7 @@ impl Default for Config {
                 .iter()
                 .map(|(name, exts)| (name.to_string(), words(exts)))
                 .collect(),
+            rules: Vec::new(),
         }
     }
 }
@@ -151,6 +192,15 @@ impl Config {
         out += &format!("  \"unknown_category\": {},\n", quote(&self.unknown_category));
         out += &format!("  \"no_extension_folder\": {},\n", quote(&self.no_extension_folder));
         out += &format!("  \"ignore_extensions\": [{}],\n", list(&self.ignore_extensions));
+        if !self.rules.is_empty() {
+            out += "  \"rules\": [\n";
+            let last = self.rules.len() - 1;
+            for (i, rule) in self.rules.iter().enumerate() {
+                let comma = if i == last { "" } else { "," };
+                out += &format!("    {}{comma}\n", serde_json::to_string(rule).unwrap_or_default());
+            }
+            out += "  ],\n";
+        }
         out += "  \"categories\": {\n";
         let last = self.categories.len().saturating_sub(1);
         for (i, (name, exts)) in self.categories.iter().enumerate() {
@@ -176,5 +226,33 @@ mod tests {
         assert!(Config::parse("{ broken").is_err());
         let with_bom = format!("\u{feff}{}", config.to_json());
         assert!(Config::parse(&with_bom).is_ok());
+        assert!(!config.to_json().contains("rules"), "без правил — как у MH Sort");
+    }
+
+    #[test]
+    fn rules_roundtrip_and_match() {
+        let config = Config {
+            rules: vec![
+                Rule { folder: "Архив".into(), older_than_days: Some(365), ..Rule::default() },
+                Rule {
+                    folder: "Большие".into(),
+                    larger_than_mb: Some(1024),
+                    categories: vec!["Видео".into()],
+                    ..Rule::default()
+                },
+            ],
+            ..Config::default()
+        };
+        let parsed = Config::parse(&config.to_json()).unwrap();
+        assert_eq!(parsed.rules, config.rules);
+        let old = &parsed.rules[0];
+        assert!(old.matches("Документы", 1, Some(400)));
+        assert!(!old.matches("Документы", 1, Some(10)));
+        assert!(!old.matches("Документы", 1, None), "возраст неизвестен — не подходит");
+        let big = &parsed.rules[1];
+        assert!(big.matches("видео", 2 << 30, None));
+        assert!(!big.matches("Аудио", 2 << 30, None));
+        assert!(!big.matches("Видео", 1 << 30, None), "ровно 1 ГБ — не больше");
+        assert!(!Rule { folder: "X".into(), ..Rule::default() }.matches("Видео", 1, Some(1)));
     }
 }

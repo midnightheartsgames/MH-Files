@@ -102,6 +102,38 @@ impl Plan {
         stats
     }
 
+    /// Поправить план руками: файл `index` — в категорию `category` (файл бросили на неё в
+    /// сводке). Папка правила и папка типа остаются, меняется только звено категории; имя
+    /// не совпадёт с другими строками плана (занятые на диске имена всё равно подбираются
+    /// заново при сортировке). `false` — менять нечего.
+    pub fn reassign(&mut self, index: usize, category: &str) -> bool {
+        let Some(planned) = self.moves.get(index) else { return false };
+        if planned.category == category || category.trim().is_empty() {
+            return false;
+        }
+        let Ok(relative) = planned.dst.strip_prefix(&self.output) else { return false };
+        let mut parts: Vec<String> =
+            relative.iter().map(|part| part.to_string_lossy().into_owned()).collect();
+        let Some(name) = parts.pop() else { return false };
+        match parts.iter().position(|part| *part == planned.category) {
+            Some(position) => parts[position] = category.to_string(),
+            None => parts = vec![category.to_string()],
+        }
+        let mut dir = self.output.clone();
+        dir.extend(&parts);
+        let ext = planned.ext.clone();
+        let taken = |path: &Path| {
+            self.moves.iter().enumerate().any(|(i, other)| i != index && other.dst == path)
+        };
+        let dst = super::names::unique_path(&dir, &name, &ext, taken);
+        let planned = &mut self.moves[index];
+        planned.category = category.to_string();
+        planned.dst = dst;
+        planned.by_content = false;
+        planned.enabled = true;
+        true
+    }
+
     /// Отмечено файлов, их объём и сколько разных папок назначения.
     pub fn selection(&self) -> (usize, u64, usize) {
         let mut dirs = std::collections::HashSet::new();
@@ -262,6 +294,37 @@ mod tests {
         assert_eq!((stats[1].files, stats[1].bytes, stats[1].selected), (2, 30, 2));
         assert_eq!(plan.selection(), (2, 30, 2));
         assert_eq!(plan.moves[0].destination_label(Path::new("/d")), "Видео › MP4");
+    }
+
+    #[test]
+    fn reassign_moves_into_other_category() {
+        let mut plan = Plan {
+            root: "/d".into(),
+            output: "/d".into(),
+            moves: vec![
+                planned("Видео", "/d/Архив/Видео/MP4/a.mp4", 10, false),
+                planned("Аудио", "/d/Аудио/MP4/a.mp4", 5, true),
+                planned("Прочее", "/d/Прочее/x", 1, true),
+            ],
+            ..Plan::default()
+        };
+        plan.moves[0].ext = "mp4".into();
+        assert!(plan.reassign(0, "Аудио"));
+        assert_eq!(plan.moves[0].category, "Аудио");
+        assert_eq!(
+            plan.moves[0].dst,
+            PathBuf::from("/d/Архив/Аудио/MP4/a.mp4"),
+            "папка правила осталась"
+        );
+        assert!(plan.moves[0].enabled, "поправленный файл отмечен");
+        assert!(!plan.reassign(0, "Аудио"), "уже там");
+        // Совпадение имени с другой строкой плана — «(1)».
+        plan.moves[0].dst = "/d/Видео/MP4/a.mp4".into();
+        plan.moves[0].category = "Видео".into();
+        assert!(plan.reassign(0, "Аудио"));
+        assert_eq!(plan.moves[0].dst, PathBuf::from("/d/Аудио/MP4/a (1).mp4"));
+        assert!(plan.reassign(2, "Документы"));
+        assert_eq!(plan.moves[2].dst, PathBuf::from("/d/Документы/x"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Определение категории и папки типа для файла. Чтения файла здесь нет: сигнатуру (первые
 //! байты) по просьбе классификатора узнаёт вызывающий.
 
-use super::config::Config;
+use super::config::{Config, Rule};
 use super::names::{looks_like_ext, primary_ext, sanitize_name};
 use std::collections::{HashMap, HashSet};
 
@@ -17,6 +17,8 @@ pub struct Classifier {
     folder_names: HashSet<String>,
     /// Наибольшее число точек в расширениях из конфига.
     max_dots: usize,
+    /// Правила по дате и размеру; папки — уже допустимые имена.
+    rules: Vec<Rule>,
     /// Замечания к конфигу для показа в окне.
     pub warnings: Vec<String>,
     pub extension_count: usize,
@@ -72,7 +74,19 @@ impl Classifier {
         }
 
         let unknown = sanitize_name(&config.unknown_category);
-        let folder_names = categories.iter().chain([&unknown]).map(|n| n.to_lowercase()).collect();
+        let rules: Vec<Rule> = config
+            .rules
+            .iter()
+            .filter(|rule| !rule.folder.trim().is_empty())
+            .map(|rule| Rule { folder: sanitize_name(rule.folder.trim()), ..rule.clone() })
+            .collect();
+        // Папки правил — тоже «уже разложенное»: второй проход их не трогает.
+        let folder_names = categories
+            .iter()
+            .chain([&unknown])
+            .chain(rules.iter().map(|rule| &rule.folder))
+            .map(|n| n.to_lowercase())
+            .collect();
         Self {
             extension_count: by_ext.len(),
             by_ext,
@@ -82,8 +96,18 @@ impl Classifier {
             ignore: config.ignore_extensions.iter().map(|e| normalize_ext(e)).collect(),
             folder_names,
             max_dots,
+            rules,
             warnings,
         }
+    }
+
+    /// Папка первого подошедшего правила по дате и размеру: файл пойдёт в
+    /// `<папка>\<категория>`. `age_days` — сколько дней файл не менялся.
+    pub fn rule_folder(&self, category: &str, size: u64, age_days: Option<u64>) -> Option<&str> {
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(category, size, age_days))
+            .map(|rule| rule.folder.as_str())
     }
 
     /// Имена папок категорий в порядке из categories.json.

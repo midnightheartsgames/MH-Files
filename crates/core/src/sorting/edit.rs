@@ -7,7 +7,7 @@
 use indexmap::IndexMap;
 
 use super::classify::Classifier;
-use super::config::Config;
+use super::config::{Config, Rule};
 use super::names::sanitize_name;
 
 /// Категория в черновике.
@@ -18,6 +18,18 @@ pub struct DraftCategory {
     pub extensions: String,
 }
 
+/// Правило по дате и размеру в черновике: числа — текстом, как их набрали.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DraftRule {
+    pub folder: String,
+    /// Дней; пусто — без условия.
+    pub older_than_days: String,
+    /// Мегабайт; пусто — без условия.
+    pub larger_than_mb: String,
+    /// Категории через запятую; пусто — все.
+    pub categories: String,
+}
+
 /// Черновик categories.json.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Draft {
@@ -26,6 +38,20 @@ pub struct Draft {
     pub no_extension_folder: String,
     /// Не трогать файлы с такими расширениями (недокачанные).
     pub ignore_extensions: String,
+    pub rules: Vec<DraftRule>,
+}
+
+/// Число из поля: пусто — `Ok(None)`, не число — `Err`.
+fn number<T: std::str::FromStr>(text: &str) -> Result<Option<T>, ()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse().map(Some).map_err(|_| ())
+}
+
+fn split_names(text: &str) -> Vec<String> {
+    text.split([',', ';']).map(str::trim).filter(|n| !n.is_empty()).map(String::from).collect()
 }
 
 /// Итог проверки: ошибки не дают сохранить, предупреждения — нет.
@@ -78,6 +104,19 @@ impl Draft {
             unknown_category: config.unknown_category.clone(),
             no_extension_folder: config.no_extension_folder.clone(),
             ignore_extensions: format_extensions(&config.ignore_extensions),
+            rules: config
+                .rules
+                .iter()
+                .map(|rule| DraftRule {
+                    folder: rule.folder.clone(),
+                    older_than_days: rule
+                        .older_than_days
+                        .map(|d| d.to_string())
+                        .unwrap_or_default(),
+                    larger_than_mb: rule.larger_than_mb.map(|m| m.to_string()).unwrap_or_default(),
+                    categories: rule.categories.join(", "),
+                })
+                .collect(),
         }
     }
 
@@ -98,6 +137,16 @@ impl Draft {
             no_extension_folder: self.no_extension_folder.trim().to_string(),
             ignore_extensions: parse_extensions(&self.ignore_extensions),
             categories,
+            rules: self
+                .rules
+                .iter()
+                .map(|rule| Rule {
+                    folder: rule.folder.trim().to_string(),
+                    older_than_days: number(&rule.older_than_days).ok().flatten(),
+                    larger_than_mb: number(&rule.larger_than_mb).ok().flatten(),
+                    categories: split_names(&rule.categories),
+                })
+                .collect(),
         }
     }
 
@@ -148,6 +197,43 @@ impl Draft {
         for ext in parse_extensions(&self.ignore_extensions).iter().filter(|e| bad_extension(e)) {
             check.errors.push(format!("«{ext}» в пропускаемых — недопустимое расширение."));
         }
+        for (index, rule) in self.rules.iter().enumerate() {
+            let folder = rule.folder.trim();
+            let label = if folder.is_empty() {
+                format!("№{}", index + 1)
+            } else {
+                format!("«{folder}»")
+            };
+            if folder.is_empty() {
+                check.errors.push(format!("У правила {label} нет папки."));
+            } else if let Some((name, _)) =
+                folders.iter().find(|(_, f)| *f == sanitize_name(folder).to_lowercase())
+            {
+                check
+                    .errors
+                    .push(format!("Папка правила {label} совпадает с категорией «{name}»."));
+            }
+            let days = number::<u32>(&rule.older_than_days);
+            let mb = number::<u64>(&rule.larger_than_mb);
+            if days.is_err() {
+                check.errors.push(format!("В правиле {label} дни — не число."));
+            }
+            if mb.is_err() {
+                check.errors.push(format!("В правиле {label} мегабайты — не число."));
+            }
+            if matches!((days, mb), (Ok(None), Ok(None))) {
+                check
+                    .errors
+                    .push(format!("У правила {label} нет условий: укажите дни или размер."));
+            }
+            for name in split_names(&rule.categories) {
+                if !folders.iter().any(|(n, _)| n.to_lowercase() == name.to_lowercase()) {
+                    check
+                        .warnings
+                        .push(format!("В правиле {label} нет такой категории: «{name}»."));
+                }
+            }
+        }
         // Остальное — те же замечания, что увидит сортировщик: повторы расширений и
         // символы, недопустимые в именах папок.
         if check.is_ok() {
@@ -188,6 +274,15 @@ impl Draft {
         if index < self.categories.len() {
             self.categories.remove(index);
         }
+    }
+
+    /// Новое правило «старше года — в Архив».
+    pub fn add_rule(&mut self) {
+        self.rules.push(DraftRule {
+            folder: "Архив".into(),
+            older_than_days: "365".into(),
+            ..DraftRule::default()
+        });
     }
 }
 
@@ -266,5 +361,27 @@ mod tests {
         let config = draft.to_config();
         let class = Classifier::new(&config).classify("x.png", || None);
         assert_eq!(class.category, "Видео");
+    }
+
+    #[test]
+    fn rules_in_draft() {
+        let mut draft = Draft::from_config(&Config::default());
+        draft.add_rule();
+        assert!(draft.check().is_ok());
+        let config = draft.to_config();
+        assert_eq!(config.rules[0].older_than_days, Some(365));
+        assert_eq!(Draft::from_config(&config).rules, draft.rules);
+        draft.rules[0].older_than_days = "год".into();
+        assert!(!draft.check().is_ok(), "не число");
+        draft.rules[0].older_than_days.clear();
+        assert!(!draft.check().is_ok(), "нет условий");
+        draft.rules[0].larger_than_mb = "100".into();
+        draft.rules[0].folder = "видео".into();
+        assert!(!draft.check().is_ok(), "папка правила совпадает с категорией");
+        draft.rules[0].folder = "Большие".into();
+        draft.rules[0].categories = "Видео, Нет такой".into();
+        let check = draft.check();
+        assert!(check.is_ok());
+        assert!(check.warnings.iter().any(|w| w.contains("Нет такой")));
     }
 }

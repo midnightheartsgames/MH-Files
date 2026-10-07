@@ -139,7 +139,7 @@ fn hard_links(ctx: &egui::Context, app: &mut FilesApp) {
             ui.set_width(ui.available_width());
             for (keeper, extra, _) in pairs.iter().take(LISTED) {
                 ui.label(
-                    RichText::new(format!("{} → {}", extra.path.display(), keeper.display()))
+                    RichText::new(format!("{} — ссылка на {}", extra.path.display(), keeper.display()))
                         .font(theme::regular(13.0))
                         .color(theme::TEXT_SECONDARY),
                 );

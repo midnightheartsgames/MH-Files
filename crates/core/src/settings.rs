@@ -35,6 +35,40 @@ pub struct Settings {
     pub sorting: SortSettings,
     pub system: SystemSettings,
     pub duplicates: DuplicateSettings,
+    /// Папки, которые сортировщик раскладывает сам по расписанию (пока программа открыта).
+    pub sort_schedules: Vec<SortSchedule>,
+}
+
+/// Сортировка папки по расписанию.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortSchedule {
+    pub folder: std::path::PathBuf,
+    /// Раз в столько часов.
+    pub every_hours: u32,
+    /// Последний запуск, секунды Unix; 0 — ещё не было.
+    #[serde(default)]
+    pub last_run: i64,
+    /// Галочки сортировщика на момент, когда расписание включили.
+    #[serde(default)]
+    pub options: SortSettings,
+}
+
+impl SortSchedule {
+    /// Варианты периода: часы и подпись.
+    pub const PERIODS: [(u32, &'static str); 4] =
+        [(1, "каждый час"), (6, "каждые 6 часов"), (24, "раз в день"), (168, "раз в неделю")];
+
+    /// Пора ли запускать в момент `now` (секунды Unix).
+    pub fn due(&self, now: i64) -> bool {
+        self.every_hours > 0 && now - self.last_run >= i64::from(self.every_hours) * 3600
+    }
+
+    pub fn period_label(&self) -> String {
+        Self::PERIODS.iter().find(|(hours, _)| *hours == self.every_hours).map_or_else(
+            || format!("каждые {} ч", self.every_hours),
+            |(_, label)| label.to_string(),
+        )
+    }
 }
 
 /// Поиск дубликатов.
@@ -241,6 +275,7 @@ impl Default for Settings {
             sorting: SortSettings::default(),
             system: SystemSettings::default(),
             duplicates: DuplicateSettings::default(),
+            sort_schedules: Vec::new(),
         }
     }
 }
@@ -351,6 +386,28 @@ fn migrate(value: serde_json::Value, version: u32) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedules_are_due_by_period() {
+        let mut schedule = SortSchedule {
+            folder: "D:/Загрузки".into(),
+            every_hours: 24,
+            last_run: 0,
+            options: SortSettings::default(),
+        };
+        assert!(schedule.due(1_760_000_000), "ещё не запускалось");
+        schedule.last_run = 100_000;
+        assert!(!schedule.due(100_000 + 23 * 3600));
+        assert!(schedule.due(100_000 + 24 * 3600));
+        assert_eq!(schedule.period_label(), "раз в день");
+        schedule.every_hours = 0;
+        assert!(!schedule.due(i64::MAX / 2), "период 0 — выключено");
+        let json = r#"{"sort_schedules":[{"folder":"C:/x","every_hours":6}]}"#;
+        let (parsed, error) = Settings::parse(json);
+        assert!(error.is_none());
+        assert_eq!(parsed.sort_schedules[0].every_hours, 6);
+        assert_eq!(parsed.sort_schedules[0].options, SortSettings::default());
+    }
 
     #[test]
     fn round_trip_and_defaults() {
