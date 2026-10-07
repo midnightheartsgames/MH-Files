@@ -15,7 +15,9 @@ use mh_files_core::location::Location;
 use mh_files_fs::{CancelToken, Ticket, Workers};
 
 use crate::app::{Action, FilesApp, OWNER_COLUMNS};
-use crate::pane_view::{Look, elided, item, paint_icon, row_height, scroll_for};
+use crate::pane_view::{
+    Look, elided, item, paint_icon, row_font, row_height, row_icon, scroll_for,
+};
 use crate::tabs::Tab;
 use crate::{icons, theme};
 
@@ -261,9 +263,9 @@ fn side_column(
                 egui::Color32::TRANSPARENT
             };
             ui.painter().rect_filled(body, CornerRadius::same(4), fill);
-            let icon_size = (rect.height() - 9.0).clamp(14.0, 20.0);
+            let icon_size = row_icon(app, rect.height());
             let icon = Rect::from_center_size(
-                pos2(rect.left() + 16.0, rect.center().y),
+                pos2(rect.left() + 6.0 + icon_size / 2.0, rect.center().y),
                 vec2(icon_size, icon_size),
             );
             let dim = entry.hidden();
@@ -276,10 +278,10 @@ fn side_column(
                 theme::TEXT_SECONDARY.gamma_multiply(1.15)
             };
             let right = if entry.is_dir() { rect.right() - 22.0 } else { rect.right() - 8.0 };
-            let galley =
-                elided(ui, &entry.name, theme::regular(14.0), color, right - rect.left() - 30.0);
+            let text_left = rect.left() + 10.0 + icon_size;
+            let galley = elided(ui, &entry.name, row_font(app, 14.0), color, right - text_left);
             ui.painter().galley(
-                pos2(rect.left() + 30.0, rect.center().y - galley.size().y / 2.0),
+                pos2(text_left, rect.center().y - galley.size().y / 2.0),
                 galley,
                 color,
             );

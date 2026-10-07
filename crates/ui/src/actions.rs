@@ -8,7 +8,10 @@ use mh_files_core::location::Location;
 use mh_files_core::names;
 use mh_files_core::selection::Modifiers;
 use mh_files_core::session::{TabSession, ViewMode};
-use mh_files_core::settings::{Favorite, Group, NewTabLocation, SavedSearch};
+use mh_files_core::settings::{
+    Favorite, Group, MAX_GRID, MAX_LIST_SCALE, MIN_GRID, MIN_LIST_SCALE, NewTabLocation,
+    SavedSearch,
+};
 use mh_files_fs::{ShellJob, Transfer};
 use mh_files_platform::clipboard::ClipboardFiles;
 use mh_files_platform::folders::KnownFolder;
@@ -39,43 +42,63 @@ const IN_TEXT: &[CommandId] = &[
     CommandId::SearchEverywhere,
 ];
 
-/// Шаг масштаба: Ctrl+Plus/Minus и один щелчок колеса с Ctrl.
+/// Шаг масштаба интерфейса (Ctrl+Plus/Minus).
 const ZOOM_STEP: f32 = 0.1;
 
-/// Сколько натечь Ctrl+прокрутки (логарифм множителя egui) на один шаг масштаба. Щелчок
+/// Сколько натечь Ctrl+прокрутки (логарифм множителя egui) на один шаг размера. Щелчок
 /// колеса даёт около 0,2 (40 точек × 1/200), но egui размазывает его на несколько кадров;
 /// тачпад и жест щипка дают мелкие доли — шаги идут по мере жеста.
-const WHEEL_ZOOM_STEP: f32 = 0.12;
+const WHEEL_STEP: f32 = 0.12;
 
 /// Пауза, после которой недокрученный остаток забывается: иначе следующий щелчок колеса
 /// через минуту дал бы два шага.
-const WHEEL_ZOOM_IDLE: f64 = 0.3;
+const WHEEL_IDLE: f64 = 0.3;
+
+/// Шаг размера плиток и строк на щелчок колеса.
+const GRID_STEP: f32 = 16.0;
+const LIST_STEP: f32 = 0.1;
 
 impl FilesApp {
-    /// Ctrl+колесо мыши (и щипок на тачпаде) — масштаб, как Ctrl+Plus/Minus. egui сам не
-    /// прокручивает списки, пока зажат Ctrl, а отдаёт прокрутку множителем `zoom_delta`.
-    fn wheel_zoom(&mut self, ctx: &egui::Context) {
+    /// Ctrl+колесо мыши (и щипок на тачпаде) над списком файлов — размер содержимого, как в
+    /// Проводнике: в плитках — сторона плитки, в таблице и колонках — строки со значками и
+    /// шрифтом. Весь интерфейс масштабирует Ctrl+Plus/Minus. egui, пока зажат Ctrl, списки не
+    /// прокручивает, а отдаёт прокрутку множителем `zoom_delta`.
+    pub(crate) fn wheel_resize(&mut self, ctx: &egui::Context, view: ViewMode) {
+        // Повторный проход того же кадра (egui перерисовывает при смене размеров) видит ту же
+        // прокрутку — без проверки шаг засчитался бы дважды.
+        if ctx.current_pass_index() > 0 {
+            return;
+        }
         let (delta, now) = ctx.input(|i| (i.zoom_delta(), i.time));
         let (mut accumulated, last) = self.zoom_rest;
         if delta == 1.0 {
-            if now - last > WHEEL_ZOOM_IDLE {
+            if now - last > WHEEL_IDLE {
                 self.zoom_rest.0 = 0.0;
             }
             return;
         }
         accumulated += delta.ln();
-        let command = if accumulated >= WHEEL_ZOOM_STEP {
-            Some(CommandId::ZoomIn)
-        } else if accumulated <= -WHEEL_ZOOM_STEP {
-            Some(CommandId::ZoomOut)
+        let step = if accumulated >= WHEEL_STEP {
+            1.0
+        } else if accumulated <= -WHEEL_STEP {
+            -1.0
         } else {
-            None
+            self.zoom_rest = (accumulated, now);
+            return;
         };
-        if let Some(command) = command {
-            accumulated = 0.0;
-            self.actions.push(Action::Run(command));
-        }
-        self.zoom_rest = (accumulated, now);
+        self.zoom_rest = (0.0, now);
+        let a = &mut self.settings.appearance;
+        let text = if view == ViewMode::Grid {
+            a.grid_size = (a.grid_size + step * GRID_STEP).clamp(MIN_GRID, MAX_GRID);
+            format!("плитки: {:.0} точек", a.grid_size)
+        } else {
+            // Округление — чтобы шаги по 0,1 не копили погрешность.
+            let scale = ((a.list_scale + step * LIST_STEP) * 10.0).round() / 10.0;
+            a.list_scale = scale.clamp(MIN_LIST_SCALE, MAX_LIST_SCALE);
+            format!("строки: {:.0}%", a.list_scale * 100.0)
+        };
+        self.save_settings();
+        self.set_status(text, Level::Info);
     }
 
     pub(crate) fn handle_keys(&mut self, ctx: &egui::Context) {
@@ -88,7 +111,6 @@ impl FilesApp {
         if overlay {
             return;
         }
-        self.wheel_zoom(ctx);
         let text_focus = ctx.egui_wants_keyboard_input();
         let renaming = self.tab().rename.is_some();
         if !text_focus && !renaming {
