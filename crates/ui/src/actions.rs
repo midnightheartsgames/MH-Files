@@ -318,6 +318,7 @@ impl FilesApp {
             Search => has_dir,
             SaveSearch => matches!(&tab.location, Location::Index { query } if !query.is_empty()),
             Reindex => self.indexer.status().enabled,
+            CheckUpdates => !self.update.checking,
             CopyToOtherPane | MoveToOtherPane | OpenInOtherPane => {
                 has_targets && self.other_pane().is_some()
             }
@@ -462,6 +463,7 @@ impl FilesApp {
                     }
                 }
             }
+            CheckUpdates => self.check_updates(),
             Reindex => {
                 self.indexer.rescan();
                 self.set_status("индекс перестраивается в фоне", Level::Info);

@@ -19,6 +19,7 @@ features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_NetworkManagement_WNet",
+    "Win32_Networking_WinHttp",
     "Win32_Security",
     "Win32_Storage_EnhancedStorage",
     "Win32_Storage_FileSystem",

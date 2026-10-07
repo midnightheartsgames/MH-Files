@@ -196,6 +196,13 @@ pub enum Action {
     },
 }
 
+/// Проверка обновлений по кнопке.
+#[derive(Default)]
+pub struct UpdateState {
+    pub checking: bool,
+    pub result: Option<Result<mh_files_core::update::Check, String>>,
+}
+
 pub struct FilesApp {
     pub settings: Settings,
     pub keymap: Keymap,
@@ -213,8 +220,10 @@ pub struct FilesApp {
     _instance: Option<Box<dyn std::any::Any>>,
     /// Прошлый запуск кончился сбоем: отчёт для «Настройки → Система».
     pub previous: crate::crash::Previous,
-    /// Пункт «Открыть в MH Files» в Проводнике: есть ли (узнаётся в фоне).
-    pub explorer_menu: Option<bool>,
+    /// Проверка обновлений: идёт ли и чем кончилась.
+    pub update: UpdateState,
+    /// Встраивание в Проводник: что есть (узнаётся в фоне).
+    pub integration: Option<mh_files_platform::integration::Status>,
     /// Сортировщик: категории и журналы.
     pub sorter: crate::sorter::Shared,
     /// Идущие извлечения из архивов.
@@ -300,7 +309,8 @@ impl FilesApp {
             incoming: startup.incoming,
             _instance: startup.keepalive,
             previous: startup.previous.clone(),
-            explorer_menu: None,
+            integration: None,
+            update: UpdateState::default(),
             extractions: Vec::new(),
             next_extract: 0,
             events,
@@ -341,7 +351,7 @@ impl FilesApp {
         app.restore(restored.unwrap_or_else(|| Session::single(app.home_location())));
         app.workers.drives();
         app.workers.known_folders();
-        app.workers.explorer_menu(None);
+        app.workers.integration(None);
         // Пути из командной строки: без восстановленного сеанса первый — в домашнюю вкладку.
         app.open_targets_from_outside(startup.open, fresh);
         // Сбой — только паника с отчётом; без отчёта процесс сняли или выключили компьютер.
@@ -380,7 +390,8 @@ impl FilesApp {
     }
 
     /// Открыть пути, пришедшие снаружи (командная строка, следующий запуск): папки —
-    /// вкладками, файлы — своей папкой с выделением. `replace_first` — первый путь занимает
+    /// вкладками, архивы — как папки (так их открывает «Открыть с помощью → MH Files»),
+    /// остальные файлы — своей папкой с выделением. `replace_first` — первый путь занимает
     /// текущую вкладку вместо новой.
     pub fn open_targets_from_outside(
         &mut self,
@@ -388,6 +399,19 @@ impl FilesApp {
         mut replace_first: bool,
     ) {
         for (path, is_dir) in targets {
+            let archive = !is_dir
+                && path.file_name().is_some_and(|name| {
+                    mh_files_fs::archive::is_archive_name(&name.to_string_lossy())
+                });
+            if archive {
+                let target = if replace_first { Target::Current } else { Target::NewTab };
+                replace_first = false;
+                self.open_location(
+                    Location::Archive { archive: path, inner: String::new() },
+                    target,
+                );
+                continue;
+            }
             let (dir, select) = if is_dir {
                 (path, None)
             } else {
@@ -405,6 +429,33 @@ impl FilesApp {
                 tab.reveal_pending();
             }
         }
+    }
+
+    pub fn check_updates(&mut self) {
+        if !self.update.checking {
+            self.update.checking = true;
+            self.workers.check_updates();
+            self.set_status("проверяю обновления…", Level::Info);
+        }
+    }
+
+    fn on_update(&mut self, result: Result<mh_files_core::update::Check, String>) {
+        use mh_files_core::update::Check;
+        self.update.checking = false;
+        match &result {
+            Ok(Check::UpToDate) => self.set_status(
+                format!("установлена последняя версия — {}", env!("CARGO_PKG_VERSION")),
+                Level::Info,
+            ),
+            Ok(Check::Available(release)) => self.set_status(
+                format!("доступна MH Files {} — «Настройки → О программе»", release.version),
+                Level::Info,
+            ),
+            Err(error) => {
+                self.set_status(format!("обновления не проверены: {error}"), Level::Error)
+            }
+        }
+        self.update.result = Some(result);
     }
 
     pub fn home_location(&self) -> Location {
@@ -702,8 +753,9 @@ impl FilesApp {
                 ),
                 Err(error) => self.set_status(error, Level::Error),
             },
-            Event::ExplorerMenu { installed, error } => {
-                self.explorer_menu = Some(installed);
+            Event::Update(result) => self.on_update(result),
+            Event::Integration { status, error } => {
+                self.integration = Some(status);
                 if let Some(error) = error {
                     self.set_status(error, Level::Error);
                 }

@@ -17,6 +17,7 @@ pub mod folders;
 pub mod instance;
 pub mod integration;
 pub mod media;
+pub mod net;
 pub mod ops;
 pub mod pdf;
 pub mod preview_handler;

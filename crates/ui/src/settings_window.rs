@@ -164,7 +164,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         config: dirs.config.clone(),
         index: dirs.index.clone(),
         portable: dirs.portable,
-        explorer_menu: app.explorer_menu,
+        integration: app.integration,
         crashed: app.previous.crashed,
         report: app.previous.report.clone(),
         first_frame: app.diag.first_frame,
@@ -172,6 +172,8 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         text: app.diag.report(),
     };
     let mut system_action = None;
+    let update_info = (app.update.checking, app.update.result.clone());
+    let mut about_action = None;
     ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ui, class| {
         let state = &mut app.settings_window;
         if class == ViewportClass::EmbeddedWindow {
@@ -265,7 +267,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                         }
                         Page::System => system_action = system(ui, &mut state.draft, &system_info),
                         Page::Keys => keys(ui, &mut state.keys),
-                        Page::About => about(ui),
+                        Page::About => about_action = about(ui, &update_info),
                     }
                 });
             });
@@ -282,9 +284,9 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         app.indexer.rescan();
     }
     match system_action {
-        Some(SystemAction::ExplorerMenu(install)) => {
-            app.explorer_menu = None;
-            app.workers.explorer_menu(Some(install));
+        Some(SystemAction::Integration(feature, on)) => {
+            app.integration = None;
+            app.workers.integration(Some((feature, on)));
         }
         Some(SystemAction::Open(path)) => {
             let _ = std::fs::create_dir_all(&path);
@@ -297,6 +299,13 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         Some(SystemAction::Copy) => {
             ctx.copy_text(system_info.text.clone());
             app.settings_window.status = Some(("отчёт скопирован".into(), false));
+        }
+        None => {}
+    }
+    match about_action {
+        Some(AboutAction::Check) => app.check_updates(),
+        Some(AboutAction::Open(url)) => {
+            app.workers.shell(mh_files_fs::ShellJob::Open(std::path::PathBuf::from(url)))
         }
         None => {}
     }
@@ -498,7 +507,7 @@ struct SystemInfo {
     config: std::path::PathBuf,
     index: std::path::PathBuf,
     portable: bool,
-    explorer_menu: Option<bool>,
+    integration: Option<mh_files_platform::integration::Status>,
     crashed: bool,
     report: Option<std::path::PathBuf>,
     first_frame: Option<std::time::Duration>,
@@ -507,7 +516,7 @@ struct SystemInfo {
 }
 
 enum SystemAction {
-    ExplorerMenu(bool),
+    Integration(mh_files_platform::integration::Feature, bool),
     Open(std::path::PathBuf),
     OpenFile(std::path::PathBuf),
     Copy,
@@ -527,39 +536,44 @@ fn system(ui: &mut Ui, s: &mut Settings, info: &SystemInfo) -> Option<SystemActi
         );
     });
     card(ui, "Проводник", |ui| {
-        let (text, color) = match info.explorer_menu {
-            None => ("Проверяется…", theme::TEXT_DISABLED),
-            Some(true) => (
-                "Пункт «Открыть в MH Files» есть в меню папок, дисков и пустого места",
-                theme::TEXT_SECONDARY,
-            ),
-            Some(false) => {
-                ("Пункта «Открыть в MH Files» в меню Проводника нет", theme::TEXT_SECONDARY)
-            }
-        };
-        ui.label(RichText::new(text).color(color));
-        widgets::hint(
-            ui,
-            "Только для текущего пользователя, права администратора не нужны. В Windows 11 пункт — в «Показать дополнительные параметры».",
-        );
-        ui.horizontal(|ui| {
-            let busy = info.explorer_menu.is_none();
-            if ui
-                .add_enabled(
-                    !busy && info.explorer_menu != Some(true),
-                    egui::Button::new("Добавить"),
-                )
-                .clicked()
-            {
-                action = Some(SystemAction::ExplorerMenu(true));
-            }
-            if ui
-                .add_enabled(!busy && info.explorer_menu == Some(true), egui::Button::new("Убрать"))
-                .clicked()
-            {
-                action = Some(SystemAction::ExplorerMenu(false));
+        use mh_files_platform::integration::Feature;
+        let busy = info.integration.is_none();
+        let status = info.integration.unwrap_or_default();
+        ui.add_enabled_ui(!busy, |ui| {
+            let mut rows = [
+                (
+                    Feature::ExplorerMenu,
+                    "Пункт «Открыть в MH Files»",
+                    "В меню папок, дисков и пустого места окна. В Windows 11 — в «Показать дополнительные параметры».",
+                    status.explorer_menu,
+                ),
+                (
+                    Feature::DefaultFolders,
+                    "Открывать папки в MH Files",
+                    "Двойной щелчок по папке или диску на рабочем столе и в других программах открывает MH Files вместо Проводника. Win+E, «Этот компьютер» и «Панель управления» остаются за Проводником; «Показать в Проводнике» по-прежнему открывает Проводник.",
+                    status.default_folders,
+                ),
+                (
+                    Feature::Archives,
+                    "Архивы zip, 7z, rar",
+                    "MH Files появится в «Открыть с помощью» для архивов: архив откроется как папка. Сделать его программой по умолчанию Windows разрешает только вам — «Открыть с помощью → Выбрать другое приложение → Всегда».",
+                    status.archives,
+                ),
+            ];
+            for (feature, label, help, on) in &mut rows {
+                let before = *on;
+                switch_row(ui, label, Some(help), on);
+                if *on != before {
+                    action = Some(SystemAction::Integration(*feature, *on));
+                }
             }
         });
+        let text = if busy {
+            "Проверяется…"
+        } else {
+            "Только для текущего пользователя, права администратора не нужны. Удаление программы убирает всё это."
+        };
+        widgets::hint(ui, text);
     });
     card(ui, "Данные программы", |ui| {
         let mode = if info.portable {
@@ -873,7 +887,18 @@ fn keys(ui: &mut Ui, keys: &mut BTreeMap<CommandId, String>) {
     }
 }
 
-fn about(ui: &mut Ui) {
+enum AboutAction {
+    Check,
+    Open(String),
+}
+
+/// Версия, обновления, сторонние компоненты.
+fn about(
+    ui: &mut Ui,
+    (checking, result): &(bool, Option<Result<mh_files_core::update::Check, String>>),
+) -> Option<AboutAction> {
+    use mh_files_core::update::Check;
+    let mut action = None;
     card(ui, "MH Files", |ui| {
         ui.label(format!("Версия {}", env!("CARGO_PKG_VERSION")));
         ui.label(
@@ -890,6 +915,43 @@ fn about(ui: &mut Ui) {
                 .color(theme::TEXT_DISABLED),
         );
     });
+    card(ui, "Обновления", |ui| {
+        let (text, color) = match (checking, result) {
+            (true, _) => ("Проверяю…".to_string(), theme::TEXT_DISABLED),
+            (false, None) => (
+                "Программа не проверяет обновления сама: только по этой кнопке.".to_string(),
+                theme::TEXT_SECONDARY,
+            ),
+            (false, Some(Ok(Check::UpToDate))) => (
+                format!("Установлена последняя версия — {}.", env!("CARGO_PKG_VERSION")),
+                theme::TEXT_SECONDARY,
+            ),
+            (false, Some(Ok(Check::Available(release)))) => {
+                let date =
+                    release.published.as_deref().map(|d| format!(" от {d}")).unwrap_or_default();
+                (format!("Доступна {}{date}.", release.name), theme::accent())
+            }
+            (false, Some(Err(error))) => {
+                (format!("Не удалось проверить: {error}"), theme::CRITICAL)
+            }
+        };
+        ui.label(RichText::new(text).color(color));
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!checking, egui::Button::new("Проверить обновления")).clicked()
+            {
+                action = Some(AboutAction::Check);
+            }
+            if let Some(Ok(Check::Available(release))) = result
+                && ui.button("Открыть страницу выпуска").clicked()
+            {
+                action = Some(AboutAction::Open(release.url.clone()));
+            }
+        });
+        widgets::hint(
+            ui,
+            "Один запрос к GitHub Releases. Пред-выпуски (rc) предлагаются, только если установлен пред-выпуск. Установщик новой версии сохраняет настройки и вкладки.",
+        );
+    });
     card(ui, "Сторонние компоненты", |ui| {
         ui.label(
             RichText::new(
@@ -899,4 +961,5 @@ fn about(ui: &mut Ui) {
         );
     });
     let _ = Color32::TRANSPARENT;
+    action
 }

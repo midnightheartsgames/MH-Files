@@ -22,6 +22,7 @@ pub mod session;
 pub mod settings;
 pub mod sort;
 pub mod sorting;
+pub mod update;
 
 pub use entry::{Attributes, Entry, EntryKind};
 pub use listing::Listing;

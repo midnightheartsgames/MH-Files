@@ -46,6 +46,11 @@ WizardStyle=modern
 ; Работающую копию программа закрывает сама перед обновлением.
 CloseApplications=yes
 RestartApplications=yes
+; Подпись: build-release.ps1 передаёт /DSign и команду mhsign (signtool с сертификатом).
+#ifdef Sign
+SignTool=mhsign
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
@@ -54,6 +59,7 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Значок на рабочем столе"; Flags: unchecked
 Name: "explorermenu"; Description: "Пункт «Открыть в MH Files» в меню Проводника"
+Name: "archives"; Description: "MH Files в «Открыть с помощью» для архивов zip, 7z, rar"; Flags: unchecked
 
 [Files]
 Source: "{#SourceDir}\MH-Files.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -77,13 +83,37 @@ Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles"; ValueType: string; V
 Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\MH-Files.exe"",0"; Tasks: explorermenu
 Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%V"""; Tasks: explorermenu
 
-; Пункт меню мог добавить и сам пользователь из настроек (без задачи установщика) —
-; при удалении программы он убирается в любом случае.
+; Архивы: ProgID и его имя в OpenWithProgids — как «Настройки → Система → Архивы».
+Root: HKCU; Subkey: "Software\Classes\MHFiles.Archive"; ValueType: string; ValueData: "Архив"; Flags: uninsdeletekey; Tasks: archives
+Root: HKCU; Subkey: "Software\Classes\MHFiles.Archive\DefaultIcon"; ValueType: string; ValueData: """{app}\MH-Files.exe"",0"; Tasks: archives
+Root: HKCU; Subkey: "Software\Classes\MHFiles.Archive\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "MH Files"; Tasks: archives
+Root: HKCU; Subkey: "Software\Classes\MHFiles.Archive\shell\open\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%1"""; Tasks: archives
+Root: HKCU; Subkey: "Software\Classes\.zip\OpenWithProgids"; ValueType: none; ValueName: "MHFiles.Archive"; Flags: uninsdeletevalue; Tasks: archives
+Root: HKCU; Subkey: "Software\Classes\.7z\OpenWithProgids"; ValueType: none; ValueName: "MHFiles.Archive"; Flags: uninsdeletevalue; Tasks: archives
+Root: HKCU; Subkey: "Software\Classes\.rar\OpenWithProgids"; ValueType: none; ValueName: "MHFiles.Archive"; Flags: uninsdeletevalue; Tasks: archives
+
+; Пункт меню, папки по умолчанию и архивы мог включить и сам пользователь из настроек (без
+; задачи установщика) — при удалении программы всё это убирается в любом случае.
 [Code]
+// Двойной щелчок по папкам возвращается Проводнику, только если там по-прежнему MH Files.
+procedure RestoreDefaultVerb(const Key: String);
+var
+  Verb: String;
+begin
+  if RegQueryStringValue(HKCU, Key, '', Verb) and (Verb = 'MHFiles') then
+    RegDeleteValue(HKCU, Key, '');
+end;
+
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usPostUninstall then
   begin
+    RestoreDefaultVerb('Software\Classes\Directory\shell');
+    RestoreDefaultVerb('Software\Classes\Drive\shell');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\MHFiles.Archive');
+    RegDeleteValue(HKCU, 'Software\Classes\.zip\OpenWithProgids', 'MHFiles.Archive');
+    RegDeleteValue(HKCU, 'Software\Classes\.7z\OpenWithProgids', 'MHFiles.Archive');
+    RegDeleteValue(HKCU, 'Software\Classes\.rar\OpenWithProgids', 'MHFiles.Archive');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Directory\shell\MHFiles');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Directory\Background\shell\MHFiles');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\Drive\shell\MHFiles');

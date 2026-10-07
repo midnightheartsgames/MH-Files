@@ -9,6 +9,7 @@ pub mod instance;
 pub mod integration;
 pub mod media;
 pub mod menu;
+pub mod net;
 pub mod ops;
 pub mod pdf;
 pub mod preview_handler;

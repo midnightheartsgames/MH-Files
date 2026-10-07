@@ -110,6 +110,7 @@ commands! {
     ClosePane => "Закрыть панель", ["close pane"], ["Ctrl+Shift+W"];
     NextPane => "Следующая панель", ["switch pane"], ["Tab", "F6"];
     Settings => "Настройки", ["settings", "options", "preferences"], ["Ctrl+Comma"];
+    CheckUpdates => "Проверить обновления", ["update", "новая версия", "обновить программу"], [];
 }
 
 impl CommandId {
