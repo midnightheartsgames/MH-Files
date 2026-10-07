@@ -37,6 +37,8 @@ const SAVE_EVERY: Duration = Duration::from_secs(15 * 60);
 pub enum VolumeState {
     /// Читается снимок.
     Loading,
+    /// Имена читаются из MFT (администратор, целый том NTFS).
+    ReadingMft,
     /// Обход диска; сколько папок прочитано.
     Scanning {
         dirs: usize,
@@ -79,6 +81,7 @@ impl IndexStatus {
             matches!(
                 v.state,
                 VolumeState::Loading
+                    | VolumeState::ReadingMft
                     | VolumeState::Scanning { .. }
                     | VolumeState::CatchingUp { .. }
             )
@@ -129,6 +132,8 @@ struct Shared {
     /// Перезапуски по смене настроек идут строго по очереди.
     restart: Mutex<()>,
     last_notice: Mutex<Instant>,
+    /// Идёт опрос подключённых дисков (съёмные и сетевые в индексе).
+    polling: AtomicBool,
 }
 
 #[derive(Default)]
@@ -154,6 +159,7 @@ impl Indexer {
                 state: Mutex::new(State::default()),
                 restart: Mutex::new(()),
                 last_notice: Mutex::new(Instant::now()),
+                polling: AtomicBool::new(false),
             }),
         }
     }
@@ -162,6 +168,14 @@ impl Indexer {
     pub fn configure(&self, settings: &IndexSettings) {
         if self.shared.state.lock().settings.as_ref() == Some(settings) {
             return;
+        }
+        if settings.enabled
+            && settings.roots.is_empty()
+            && (settings.removable || settings.network)
+            && !self.shared.polling.swap(true, Ordering::Relaxed)
+        {
+            let shared = self.shared.clone();
+            self.shared.workers.spawn("index-drives", move |_| poll_drives(&shared));
         }
         self.shared.state.lock().settings = Some(settings.clone());
         let shared = self.shared.clone();
@@ -286,7 +300,7 @@ impl Shared {
 /// Вложенные корни отбрасываются: их содержимое уже в объемлющем.
 fn roots(settings: &IndexSettings) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = if settings.roots.is_empty() {
-        default_roots()
+        default_roots(settings)
     } else {
         settings.roots.iter().map(|r| mh_files_core::location::normalize(r)).collect()
     };
@@ -297,12 +311,17 @@ fn roots(settings: &IndexSettings) -> Vec<PathBuf> {
     roots
 }
 
-fn default_roots() -> Vec<PathBuf> {
+fn default_roots(settings: &IndexSettings) -> Vec<PathBuf> {
     if cfg!(windows) {
         use mh_files_platform::drives::{DriveKind, drive_roots};
         drive_roots()
             .into_iter()
-            .filter(|(_, kind)| *kind == DriveKind::Fixed)
+            .filter(|(_, kind)| match kind {
+                DriveKind::Fixed => true,
+                DriveKind::Removable => settings.removable,
+                DriveKind::Network => settings.network,
+                _ => false,
+            })
             .map(|(root, _)| root)
             .collect()
     } else {
@@ -310,8 +329,51 @@ fn default_roots() -> Vec<PathBuf> {
     }
 }
 
+/// Как часто проверять, не подключили ли или отключили диск.
+const DRIVES_EVERY: Duration = Duration::from_secs(10);
+
+/// Съёмные и сетевые диски приходят и уходят: тома подключённых запускаются, отключённых —
+/// останавливаются (их снимок остаётся до следующего раза). Остальные тома не трогаются.
+/// Опрос кончается, когда настройки перестают его требовать.
+fn poll_drives(shared: &Arc<Shared>) {
+    loop {
+        std::thread::sleep(DRIVES_EVERY);
+        let settings = shared.state.lock().settings.clone();
+        let Some(settings) =
+            settings.filter(|s| s.enabled && s.roots.is_empty() && (s.removable || s.network))
+        else {
+            shared.polling.store(false, Ordering::Relaxed);
+            return;
+        };
+        let _order = shared.restart.lock();
+        let wanted = roots(&settings);
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut shared.state.lock().volumes)
+            .into_iter()
+            .partition(|volume| !wanted.contains(&volume.root));
+        let added: Vec<PathBuf> =
+            wanted.into_iter().filter(|root| !kept.iter().any(|v| &v.root == root)).collect();
+        let changed = !gone.is_empty() || !added.is_empty();
+        shared.state.lock().volumes = kept;
+        stop_volumes(gone, Duration::from_secs(10));
+        // Пока ждали остановки, настройки могли смениться — тогда тома запустит configure.
+        if shared.state.lock().settings.as_ref() != Some(&settings) {
+            continue;
+        }
+        let started: Vec<Arc<Volume>> =
+            added.into_iter().map(|root| start_volume(shared, root, &settings)).collect();
+        shared.state.lock().volumes.extend(started);
+        if changed {
+            shared.notify(true, true);
+        }
+    }
+}
+
 fn stop_all(shared: &Shared, wait: Duration) {
     let volumes = std::mem::take(&mut shared.state.lock().volumes);
+    stop_volumes(volumes, wait);
+}
+
+fn stop_volumes(volumes: Vec<Arc<Volume>>, wait: Duration) {
     let deadline = Instant::now() + wait;
     let mut done = Vec::new();
     for volume in &volumes {
@@ -445,6 +507,13 @@ impl Volume {
     /// Полный обход. `true` — дошёл до конца.
     fn scan(&self, shared: &Shared) -> bool {
         let mark = if shared.elevated { volume::journal_state(&self.root).ok() } else { None };
+        // Пустой индекс целого тома у администратора — сначала все имена из MFT за секунды:
+        // поиск работает сразу, а обход следом приносит размеры и даты.
+        if mark.is_some() && self.index.read().is_empty() && is_volume_root(&self.root) {
+            self.set_state(shared, VolumeState::ReadingMft);
+            self.read_mft();
+            shared.notify(true, true);
+        }
         self.set_state(shared, VolumeState::Scanning { dirs: 0 });
         let mut last = Instant::now();
         let finished = self.walk(ROOT, self.root.clone(), |dirs| {
@@ -460,6 +529,31 @@ impl Volume {
             index.journal = mark.map(|m| JournalMark { id: m.id, next_usn: m.next_usn });
         }
         finished
+    }
+
+    /// Имена тома из MFT; не вышло — ничего страшного, будет обычный обход.
+    fn read_mft(&self) {
+        let Ok(records) = volume::mft_records(&self.root) else { return };
+        let records = records
+            .into_iter()
+            .map(|record| {
+                let info = NodeInfo {
+                    is_dir: record.is_dir,
+                    size: 0,
+                    modified: i64::MIN,
+                    hidden: record.hidden,
+                    system: record.system,
+                };
+                (record.id, record.parent, record.name, info)
+            })
+            .collect();
+        let index =
+            VolumeIndex::from_records(self.root.clone(), records, volume::MFT_ROOT, |path| {
+                self.excluded(path)
+            });
+        if !self.stopped() {
+            *self.index.write() = index;
+        }
     }
 
     /// Досмотр по журналу USN. `false` — журналу доверять нельзя, нужен полный обход.
@@ -504,6 +598,11 @@ impl Volume {
             *index = compact;
         }
     }
+}
+
+/// Корень тома (`C:\`), а не папка на нём: MFT описывает том целиком.
+fn is_volume_root(root: &Path) -> bool {
+    root.parent().is_none() && root.has_root()
 }
 
 /// Содержимое папки для индекса и признак «ссылка» у каждой записи.

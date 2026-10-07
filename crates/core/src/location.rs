@@ -9,10 +9,12 @@ pub enum Location {
     /// Список дисков.
     Computer,
     Dir(PathBuf),
-    /// Рекурсивный поиск по `root`.
+    /// Рекурсивный поиск по `root`: по имени или (`content`) по тексту внутри файлов.
     Search {
         root: PathBuf,
         query: String,
+        #[serde(default)]
+        content: bool,
     },
     /// Поиск по индексу всех дисков.
     Index {
@@ -73,6 +75,35 @@ impl Location {
         path
     }
 
+    /// Для пути внутри архива — архив и путь в нём: `C:\a.zip\docs` → (`C:\a.zip`,
+    /// `docs`). Архив узнаётся по имени (zip, 7z, rar) ближайшего такого звена; так же
+    /// находится архив, вложенный в другой (`C:\a.zip\b.zip\x` → `C:\a.zip\b.zip`, `x`).
+    /// Ввода-вывода нет, поэтому папка с именем `что-то.zip` на диске приняла бы себя за
+    /// архив — такое бывает редко, и только для подъёма вверх из вложенного архива.
+    pub fn containing_archive(path: &Path) -> Option<(PathBuf, String)> {
+        let archive = path.ancestors().find(|ancestor| {
+            ancestor
+                .file_name()
+                .is_some_and(|name| crate::entry::is_archive_name(&name.to_string_lossy()))
+        })?;
+        let inner = path.strip_prefix(archive).ok()?;
+        let inner: Vec<String> =
+            inner.iter().map(|part| part.to_string_lossy().into_owned()).collect();
+        Some((archive.to_path_buf(), inner.join("/")))
+    }
+
+    /// Место, где лежит файл архива: обычная папка или, у вложенного архива, папка
+    /// внешнего архива.
+    fn archive_home(archive: &Path) -> Location {
+        match archive.parent() {
+            None => Location::Computer,
+            Some(parent) => match Location::containing_archive(parent) {
+                Some((outer, inner)) => Location::Archive { archive: outer, inner },
+                None => Location::Dir(parent.to_path_buf()),
+            },
+        }
+    }
+
     /// Куда ведёт папка с путём `path` из этого места: внутри архива — глубже в архив,
     /// иначе — обычная папка.
     pub fn enter(&self, path: &Path) -> Location {
@@ -103,6 +134,7 @@ impl Location {
         match self {
             Location::Computer => COMPUTER_TITLE.to_string(),
             Location::Dir(path) => path_label(path),
+            Location::Search { query, content: true, .. } => format!("Текст: {query}"),
             Location::Search { query, .. } => format!("Поиск: {query}"),
             Location::Index { query } if query.is_empty() => INDEX_TITLE.to_string(),
             Location::Index { query } => format!("Везде: {query}"),
@@ -131,11 +163,7 @@ impl Location {
             Location::Archive { archive, inner } => {
                 let inner = inner.trim_matches('/');
                 if inner.is_empty() {
-                    return Some(
-                        archive
-                            .parent()
-                            .map_or(Location::Computer, |p| Location::Dir(p.to_path_buf())),
-                    );
+                    return Some(Location::archive_home(archive));
                 }
                 let parent = inner.rsplit_once('/').map_or("", |(parent, _)| parent);
                 Some(Location::Archive { archive: archive.clone(), inner: parent.to_string() })
@@ -155,7 +183,18 @@ impl Location {
             Location::Computer => return crumbs,
             Location::Dir(path) => path,
             Location::Search { root, .. } => root,
-            Location::Archive { archive, .. } => archive.parent().unwrap_or(archive),
+            Location::Archive { archive, inner } => {
+                // Вложенный архив: звенья внешнего архива, затем этого.
+                if let Location::Archive { archive: outer, inner: outer_inner } =
+                    Location::archive_home(archive)
+                {
+                    let mut crumbs =
+                        Location::Archive { archive: outer, inner: outer_inner }.crumbs();
+                    push_archive_crumbs(&mut crumbs, archive, inner);
+                    return crumbs;
+                }
+                archive.parent().unwrap_or(archive)
+            }
             Location::Sort { root } => root,
             Location::Duplicates { roots } => match roots.as_slice() {
                 [root] => root,
@@ -183,10 +222,9 @@ impl Location {
             });
         }
         match self {
-            Location::Search { query, .. } => {
-                crumbs.push(Crumb {
-                    label: format!("Поиск «{query}»"), location: self.clone()
-                });
+            Location::Search { query, content, .. } => {
+                let what = if *content { "Текст" } else { "Поиск" };
+                crumbs.push(Crumb { label: format!("{what} «{query}»"), location: self.clone() });
             }
             Location::Duplicates { .. } => {
                 crumbs.push(Crumb { label: DUPLICATES_TITLE.into(), location: self.clone() });
@@ -195,22 +233,26 @@ impl Location {
                 crumbs.push(Crumb { label: SORT_TITLE.into(), location: self.clone() });
             }
             Location::Archive { archive, inner } => {
-                let root = Location::Archive { archive: archive.clone(), inner: String::new() };
-                crumbs.push(Crumb { label: path_label(archive), location: root });
-                let mut current = String::new();
-                for part in inner.split('/').filter(|p| !p.is_empty()) {
-                    if !current.is_empty() {
-                        current.push('/');
-                    }
-                    current.push_str(part);
-                    let location =
-                        Location::Archive { archive: archive.clone(), inner: current.clone() };
-                    crumbs.push(Crumb { label: part.to_string(), location });
-                }
+                push_archive_crumbs(&mut crumbs, archive, inner)
             }
             _ => {}
         }
         crumbs
+    }
+}
+
+/// Звенья архива: сам архив и папки внутри до `inner`.
+fn push_archive_crumbs(crumbs: &mut Vec<Crumb>, archive: &Path, inner: &str) {
+    let root = Location::Archive { archive: archive.to_path_buf(), inner: String::new() };
+    crumbs.push(Crumb { label: path_label(archive), location: root });
+    let mut current = String::new();
+    for part in inner.split('/').filter(|p| !p.is_empty()) {
+        if !current.is_empty() {
+            current.push('/');
+        }
+        current.push_str(part);
+        let location = Location::Archive { archive: archive.to_path_buf(), inner: current.clone() };
+        crumbs.push(Crumb { label: part.to_string(), location });
     }
 }
 
@@ -274,7 +316,8 @@ mod tests {
         assert_eq!(labels, [COMPUTER_TITLE, "/", "home", "user"]);
         assert_eq!(dir.title(), "user");
         assert_eq!(Location::Dir(PathBuf::from("/")).title(), "/");
-        let search = Location::Search { root: PathBuf::from("/home"), query: "x".into() };
+        let search =
+            Location::Search { root: PathBuf::from("/home"), query: "x".into(), content: false };
         assert_eq!(search.crumbs().last().unwrap().label, "Поиск «x»");
         assert_eq!(search.dir(), None);
         let index = Location::Index { query: "x".into() };
@@ -312,6 +355,30 @@ mod tests {
             Location::archive_path(&archive, "docs/old/"),
             PathBuf::from("/home/a.zip/docs/old")
         );
+    }
+
+    #[test]
+    fn nested_archives() {
+        let nested = PathBuf::from("/home/a.zip/sub/b.7z");
+        let inside = Location::Archive { archive: nested.clone(), inner: "x".into() };
+        let root = Location::Archive { archive: nested.clone(), inner: String::new() };
+        assert_eq!(inside.parent(), Some(root.clone()));
+        assert_eq!(
+            root.parent(),
+            Some(Location::Archive { archive: "/home/a.zip".into(), inner: "sub".into() }),
+            "из корня вложенного архива — в папку внешнего"
+        );
+        let labels: Vec<String> = inside.crumbs().into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, [COMPUTER_TITLE, "/", "home", "a.zip", "sub", "b.7z", "x"]);
+        assert_eq!(
+            inside.crumbs()[4].location,
+            Location::Archive { archive: "/home/a.zip".into(), inner: "sub".into() }
+        );
+        assert_eq!(
+            Location::containing_archive(Path::new("/home/a.zip/sub/b.7z/x/y.txt")),
+            Some((nested, "x/y.txt".into()))
+        );
+        assert_eq!(Location::containing_archive(Path::new("/home/x/y.txt")), None);
     }
 
     #[test]

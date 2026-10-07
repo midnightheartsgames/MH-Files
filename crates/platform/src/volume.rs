@@ -69,3 +69,34 @@ pub fn changed_dirs(root: &Path, since: Journal) -> Result<JournalChanges, Strin
         Err("журнал USN есть только в Windows".into())
     }
 }
+
+/// Запись главной таблицы файлов NTFS: номер, номер родительской папки и имя. Размеров и
+/// дат здесь нет — их приносит обычный обход папок следом.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MftRecord {
+    /// Номер записи (без номера последовательности).
+    pub id: u64,
+    pub parent: u64,
+    pub name: String,
+    pub is_dir: bool,
+    pub hidden: bool,
+    pub system: bool,
+}
+
+/// Номер корневой папки тома NTFS.
+pub const MFT_ROOT: u64 = 5;
+
+/// Все имена тома из MFT (`FSCTL_ENUM_USN_DATA`): секунды вместо минут обхода, но только
+/// с правами администратора и только для целого тома NTFS (`C:\`). Служебные файлы NTFS
+/// (`$MFT`, `$Extend`…) отброшены.
+pub fn mft_records(root: &Path) -> Result<Vec<MftRecord>, String> {
+    #[cfg(windows)]
+    {
+        crate::win::volume::mft_records(root)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        Err("MFT есть только в Windows".into())
+    }
+}

@@ -90,6 +90,8 @@ pub struct DuplicatesView {
     pub done: bool,
     /// Какую копию оставлять при «Отметить лишние».
     pub keep: mh_files_core::duplicates::Keep,
+    /// Исключения в поле правки, по одному на строку; `None` — поле ещё не открывали.
+    pub exclude_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -115,6 +117,8 @@ pub struct Tab {
     pub search: Option<SearchProgress>,
     pub index: Option<IndexView>,
     pub duplicates: Option<DuplicatesView>,
+    /// С чем искать дубликаты (из настроек): порог размера и исключения.
+    pub duplicate_options: DuplicateOptions,
     /// Сортировщик во вкладке.
     pub sort: Option<Box<crate::sorter::SortView>>,
     /// Вид «Колонки»: какое место было в каждой колонке в прошлом кадре — чтобы прокрутить
@@ -181,6 +185,7 @@ impl Tab {
             search: None,
             index: None,
             duplicates: None,
+            duplicate_options: DuplicateOptions::default(),
             sort: None,
             columns_shown: Vec::new(),
             select_first: false,
@@ -299,12 +304,13 @@ impl Tab {
                 }
                 self.cancel = Some(workers.list(ticket, dir));
             }
-            Location::Search { root, query } => {
+            Location::Search { root, query, content } => {
                 self.watch = None;
                 self.staging = None;
                 self.listing.reset();
                 self.search = Some(SearchProgress::default());
-                let query = SearchQuery { text: query, include_hidden: self.options.show_hidden };
+                let include_hidden = self.options.show_hidden;
+                let query = SearchQuery { text: query, include_hidden, content };
                 self.cancel = Some(workers.search(ticket, root, query));
             }
             Location::Archive { archive, inner } => {
@@ -324,7 +330,7 @@ impl Tab {
                 self.duplicates = Some(DuplicatesView::default());
                 let options = DuplicateOptions {
                     include_hidden: self.options.show_hidden,
-                    ..DuplicateOptions::default()
+                    ..self.duplicate_options.clone()
                 };
                 self.cancel = Some(workers.duplicates(ticket, roots, options));
             }

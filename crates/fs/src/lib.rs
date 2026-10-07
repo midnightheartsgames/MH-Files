@@ -17,9 +17,11 @@ use mh_files_platform::Waker;
 use mh_files_platform::clipboard::ClipboardFiles;
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
+use mh_files_platform::integration;
 use mh_files_platform::shell::MenuChoice;
 
 pub mod archive;
+mod archive_tool;
 pub mod duplicates;
 pub mod images;
 pub mod indexer;
@@ -34,7 +36,7 @@ pub mod sorting;
 pub mod transfer;
 pub mod watch;
 
-pub use duplicates::{DuplicateOptions, DuplicateProgress};
+pub use duplicates::{DuplicateOptions, DuplicateProgress, LinkReport};
 pub use images::{ImageKey, ImageKind, ImageResult};
 pub use indexer::{IndexResults, IndexStatus, Indexer, VolumeState, VolumeStatus};
 pub use preview::{Preview, PreviewRequest};
@@ -204,9 +206,20 @@ pub enum Event {
         report: mh_files_core::sorting::Report,
         journal: PathBuf,
     },
-    /// Есть ли пункт «Открыть в MH Files» в меню Проводника; ошибка — если менять не вышло.
-    ExplorerMenu {
-        installed: bool,
+    /// categories.json записан из настроек: ошибка или путь копии испорченного файла.
+    CategoriesSaved {
+        result: Result<Option<PathBuf>, String>,
+    },
+    /// Лишние копии заменены жёсткими ссылками.
+    DuplicatesLinked {
+        ticket: Ticket,
+        report: LinkReport,
+    },
+    /// Итог проверки обновлений.
+    Update(Result<mh_files_core::update::Check, String>),
+    /// Что из встраивания в Проводник сейчас есть; ошибка — если менять не вышло.
+    Integration {
+        status: mh_files_platform::integration::Status,
         error: Option<String>,
     },
     /// Последняя операция сортировщика, которую ещё можно отменить.
@@ -510,6 +523,53 @@ impl Workers {
         cancel
     }
 
+    /// Сортировка по расписанию: план и сразу выполнение всех его строк, с журналом (её
+    /// можно отменить). Итог — `SortDone` с этим `ticket`.
+    pub fn sort_scheduled(
+        &self,
+        ticket: Ticket,
+        options: mh_files_core::sorting::ScanOptions,
+        mode: mh_files_core::sorting::Mode,
+        remove_empty: bool,
+        classifier: Arc<mh_files_core::sorting::Classifier>,
+        history: PathBuf,
+    ) {
+        self.spawn("sort-scheduled", move |workers| {
+            use mh_files_core::sorting::{Action, Report};
+            let never = AtomicBool::new(false);
+            let refused = |note: String| {
+                let mut report = Report::new(Action::Sort(mode), 0);
+                report.note = Some(note);
+                report
+            };
+            let (report, journal) =
+                if let Some(reason) = sorting::danger_reason(&options.root, options.recursive) {
+                    (refused(reason.to_string()), PathBuf::new())
+                } else if !options.root.is_dir() {
+                    (refused(format!("нет папки {}", options.root.display())), PathBuf::new())
+                } else {
+                    match sorting::scan(&options, &classifier, &never, &mut |_| {}) {
+                        Some(plan) if !plan.moves.is_empty() => {
+                            let job = sorting::SortJob {
+                                source: plan.root,
+                                output: plan.output,
+                                mode,
+                                remove_empty: remove_empty && options.recursive,
+                                moves: plan.moves,
+                                journal_path: sorting::new_journal_path(&history),
+                            };
+                            let journal = job.journal_path.clone();
+                            let report = sorting::run_sort(job, &never, &mut |_, _, _| {});
+                            sorting::prune(&history, sorting::JOURNAL_KEEP);
+                            (report, journal)
+                        }
+                        _ => (Report::new(Action::Sort(mode), 0), PathBuf::new()),
+                    }
+                };
+            workers.send(Event::SortDone { ticket, report, journal });
+        });
+    }
+
     /// Найти последнюю операцию сортировщика, которую можно отменить.
     pub fn sort_last(&self, ticket: Ticket, history: PathBuf) {
         self.spawn("sort-last", move |workers| {
@@ -518,21 +578,43 @@ impl Workers {
         });
     }
 
-    /// Пункт «Открыть в MH Files» в Проводнике: `Some(true)` — добавить, `Some(false)` —
-    /// убрать, `None` — только узнать, есть ли. Реестр — в фоне.
-    pub fn explorer_menu(&self, change: Option<bool>) {
-        use mh_files_platform::integration;
-        self.spawn("explorer-menu", move |workers| {
-            let error = match change {
-                Some(true) => match std::env::current_exe() {
-                    Ok(exe) => integration::install_explorer_menu(&exe).err(),
-                    Err(error) => Some(error.to_string()),
-                },
-                Some(false) => integration::uninstall_explorer_menu().err(),
-                None => None,
-            };
-            let installed = integration::explorer_menu_installed();
-            workers.send(Event::ExplorerMenu { installed, error });
+    /// Записать categories.json (правка категорий в настройках).
+    pub fn save_categories(&self, config: mh_files_core::sorting::Config, path: PathBuf) {
+        self.spawn("save-categories", move |workers| {
+            let result = sorting::replace_categories(&config, &path);
+            workers.send(Event::CategoriesSaved { result });
+        });
+    }
+
+    /// Встраивание в Проводник: `Some((что, включить))` — изменить, `None` — только узнать,
+    /// что сейчас есть. Реестр — в фоне.
+    pub fn integration(&self, change: Option<(integration::Feature, bool)>) {
+        self.spawn("integration", move |workers| {
+            let error = change.and_then(|(feature, on)| match std::env::current_exe() {
+                Ok(exe) => integration::set(feature, &exe, on).err(),
+                Err(error) => Some(error.to_string()),
+            });
+            workers.send(Event::Integration { status: integration::status(), error });
+        });
+    }
+
+    /// Проверить обновления на GitHub Releases (по кнопке, один запрос).
+    pub fn check_updates(&self) {
+        self.spawn("update-check", move |workers| {
+            use mh_files_core::update;
+            let headers =
+                [("Accept", "application/vnd.github+json"), ("X-GitHub-Api-Version", "2022-11-28")];
+            let result = mh_files_platform::net::get(
+                "api.github.com",
+                &update::releases_path(),
+                &headers,
+                4 << 20,
+            )
+            .map_err(|error| format!("GitHub недоступен: {error}"))
+            .and_then(|body| {
+                update::check(&String::from_utf8_lossy(&body), env!("CARGO_PKG_VERSION"))
+            });
+            workers.send(Event::Update(result));
         });
     }
 
@@ -554,6 +636,18 @@ impl Workers {
             }
         });
         cancel
+    }
+
+    /// Заменить лишние копии жёсткими ссылками (см. `duplicates::replace_with_links`).
+    pub fn link_duplicates(
+        &self,
+        ticket: Ticket,
+        pairs: Vec<(PathBuf, mh_files_core::duplicates::Member, u64)>,
+    ) {
+        self.spawn("duplicates-link", move |workers| {
+            let report = duplicates::replace_with_links(&pairs, &CancelToken::default());
+            workers.send(Event::DuplicatesLinked { ticket, report });
+        });
     }
 
     pub fn batch_rename(&self, ticket: Ticket, plan: mh_files_core::rename::Plan) {

@@ -35,6 +35,7 @@ const IN_TEXT: &[CommandId] = &[
     CommandId::Refresh,
     CommandId::Filter,
     CommandId::Search,
+    CommandId::SearchContent,
     CommandId::SearchEverywhere,
 ];
 
@@ -315,9 +316,10 @@ impl FilesApp {
             GoForward => tab.history.can_forward(),
             GoUp => tab.location.parent().is_some(),
             Paste | NewFolder | OpenTerminal => has_dir,
-            Search => has_dir,
+            Search | SearchContent => has_dir,
             SaveSearch => matches!(&tab.location, Location::Index { query } if !query.is_empty()),
             Reindex => self.indexer.status().enabled,
+            CheckUpdates => !self.update.checking,
             CopyToOtherPane | MoveToOtherPane | OpenInOtherPane => {
                 has_targets && self.other_pane().is_some()
             }
@@ -431,6 +433,11 @@ impl FilesApp {
                     self.palette = Some(palette::State::search(dir));
                 }
             }
+            SearchContent => {
+                if let Some(dir) = dir {
+                    self.palette = Some(palette::State::search_content(dir));
+                }
+            }
             Extract => self.extract_command(false),
             ExtractHere => self.extract_command(true),
             FindDuplicates => self.find_duplicates(),
@@ -462,6 +469,7 @@ impl FilesApp {
                     }
                 }
             }
+            CheckUpdates => self.check_updates(),
             Reindex => {
                 self.indexer.rescan();
                 self.set_status("индекс перестраивается в фоне", Level::Info);
@@ -671,7 +679,7 @@ impl FilesApp {
             }
             ClosePane => self.close_pane(self.focused),
             NextPane => self.focused = self.layout.next_pane(self.focused, false),
-            Settings => self.settings_window.open(&self.settings),
+            Settings => self.settings_window.open(&self.settings, &self.sorter.config),
         }
     }
 
@@ -851,9 +859,25 @@ impl FilesApp {
             );
             return;
         }
+        if writable_zip(&dest).is_some() {
+            self.add_to_zip(sources, dest);
+            return;
+        }
         // Как в Проводнике: на тот же диск — перемещение, на другой — копирование.
         let copy = copy.unwrap_or_else(|| sources.iter().any(|p| root_of(p) != root_of(&dest)));
         self.start_transfer(Transfer { sources, dest, copy }, None);
+    }
+
+    /// Бросок в zip: копирование в «сжатую папку» Проводника (`IFileOperation`) — Windows
+    /// сама дописывает архив и спрашивает про занятые имена. Своего кода записи в архив нет.
+    fn add_to_zip(&mut self, sources: Vec<PathBuf>, dest: PathBuf) {
+        if !cfg!(windows) {
+            self.set_status("запись в архив есть только в Windows", Level::Error);
+            return;
+        }
+        let op =
+            FileOp::Copy { sources, dest, on_conflict: mh_files_platform::ops::OnConflict::Ask };
+        self.submit(op, None);
     }
 
     fn add_favorites(&mut self, group: usize, paths: Vec<PathBuf>) {
@@ -891,4 +915,13 @@ impl FilesApp {
             );
         }
     }
+}
+
+/// Куда бросают — внутрь zip (сам архив или папка в нём)? Тогда архив. Только zip на диске:
+/// 7z и rar Проводник не пишет, а во вложенный архив — некуда.
+pub fn writable_zip(dest: &std::path::Path) -> Option<PathBuf> {
+    let (archive, _) = Location::containing_archive(dest)?;
+    let name = archive.file_name()?.to_string_lossy();
+    let nested = archive.parent().and_then(Location::containing_archive).is_some();
+    (mh_files_core::entry::extension_of(&name) == "zip" && !nested).then_some(archive)
 }

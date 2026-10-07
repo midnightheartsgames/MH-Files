@@ -349,6 +349,46 @@ impl VolumeIndex {
         nodes
     }
 
+    /// Индекс из плоского списка «номер, номер родителя, имя, сведения» — так отдаёт имена
+    /// главная таблица файлов NTFS (MFT): все сразу, в порядке номеров, а не по папкам.
+    /// Узлы добавляются обходом в ширину от `root_id`, поэтому родитель остаётся старше
+    /// ребёнка; записи, до которых от корня не дойти (служебные файлы NTFS, сироты), и
+    /// папки, для которых `skip` вернул `true` (исключения), не попадают в индекс вместе со
+    /// всем содержимым.
+    pub fn from_records(
+        root: PathBuf,
+        records: Vec<(u64, u64, String, NodeInfo)>,
+        root_id: u64,
+        skip: impl Fn(&Path) -> bool,
+    ) -> VolumeIndex {
+        let mut index = VolumeIndex::new(root);
+        let mut children: HashMap<u64, Vec<usize>> = HashMap::new();
+        for (i, (id, parent, _, _)) in records.iter().enumerate() {
+            // Корень NTFS ссылается сам на себя.
+            if id != parent {
+                children.entry(*parent).or_default().push(i);
+            }
+        }
+        let mut queue = std::collections::VecDeque::from([(root_id, ROOT, index.root.clone())]);
+        while let Some((id, node, path)) = queue.pop_front() {
+            let Some(kids) = children.remove(&id) else { continue };
+            for i in kids {
+                let (child_id, _, name, info) = &records[i];
+                if info.is_dir {
+                    let child_path = path.join(name);
+                    if skip(&child_path) {
+                        continue;
+                    }
+                    let child = index.push(node, name, *info);
+                    queue.push_back((*child_id, child, child_path));
+                } else {
+                    index.push(node, name, *info);
+                }
+            }
+        }
+        index
+    }
+
     /// Жив ли узел: не удалён ни он, ни его папки.
     pub fn is_alive(&self, node: u32) -> bool {
         (node as usize) < self.parent.len() && self.alive(node)
@@ -622,6 +662,38 @@ pub(crate) mod tests {
             .iter()
             .map(|&(n, _)| index.name(n).to_string())
             .collect()
+    }
+
+    #[test]
+    fn builds_from_flat_records() {
+        let record = |id, parent, name: &str, info| (id, parent, name.to_string(), info);
+        // Порядок номеров: ребёнок раньше родителя, служебный файл и сирота.
+        let records = vec![
+            record(5, 5, "", dir()),
+            record(3, 5, "$MFT", file(1, 0)),
+            record(40, 30, "deep.txt", file(2, 0)),
+            record(30, 20, "Sub", dir()),
+            record(20, 5, "Docs", dir()),
+            record(21, 5, "a.txt", file(3, 0)),
+            record(50, 99, "orphan.txt", file(4, 0)),
+            record(60, 5, "Skip", dir()),
+            record(61, 60, "hidden.txt", file(5, 0)),
+        ];
+        let index = VolumeIndex::from_records(PathBuf::from("/v"), records, 5, |path| {
+            path.ends_with("Skip")
+        });
+        let deep = index.lookup(Path::new("/v/Docs/Sub/deep.txt")).unwrap();
+        assert!(index.parent_of(deep) > index.lookup(Path::new("/v/Docs")).unwrap());
+        assert!(index.lookup(Path::new("/v/a.txt")).is_some());
+        assert!(index.lookup(Path::new("/v/orphan.txt")).is_none());
+        assert!(index.lookup(Path::new("/v/Skip")).is_none(), "исключённая папка");
+        // Служебные имена отсекает вызывающий (по номерам); здесь — только недостижимые.
+        assert_eq!(index.len(), 5);
+        let mut i = 1;
+        while (i as usize) < index.parent.len() {
+            assert!(index.parent_of(i) < i, "родитель старше ребёнка");
+            i += 1;
+        }
     }
 
     #[test]

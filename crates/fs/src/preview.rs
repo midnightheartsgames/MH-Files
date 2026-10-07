@@ -184,6 +184,13 @@ fn in_archive(request: &PreviewRequest, archive: &Path, inner: &str) -> Preview 
     }
     let name = request.path.file_name().unwrap_or_default().to_string_lossy();
     let ext = mh_files_core::entry::extension_of(&name);
+    // Архив в архиве — сводка, как у обычного.
+    if archive::is_archive_ext(&ext) {
+        return match archive::folder_totals(&request.path, "") {
+            Ok((dirs, files, bytes)) => Preview::Archive { dirs, files, bytes },
+            Err(error) => Preview::Error(error),
+        };
+    }
     if decodable(&ext) {
         return match archive::read(archive, inner, request.image_limit)
             .and_then(|bytes| decode_bytes(&bytes, request.max_side))

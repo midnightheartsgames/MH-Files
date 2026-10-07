@@ -34,6 +34,58 @@ pub struct Settings {
     pub saved_searches: Vec<SavedSearch>,
     pub sorting: SortSettings,
     pub system: SystemSettings,
+    pub duplicates: DuplicateSettings,
+    /// Папки, которые сортировщик раскладывает сам по расписанию (пока программа открыта).
+    pub sort_schedules: Vec<SortSchedule>,
+}
+
+/// Сортировка папки по расписанию.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SortSchedule {
+    pub folder: std::path::PathBuf,
+    /// Раз в столько часов.
+    pub every_hours: u32,
+    /// Последний запуск, секунды Unix; 0 — ещё не было.
+    #[serde(default)]
+    pub last_run: i64,
+    /// Галочки сортировщика на момент, когда расписание включили.
+    #[serde(default)]
+    pub options: SortSettings,
+}
+
+impl SortSchedule {
+    /// Варианты периода: часы и подпись.
+    pub const PERIODS: [(u32, &'static str); 4] =
+        [(1, "каждый час"), (6, "каждые 6 часов"), (24, "раз в день"), (168, "раз в неделю")];
+
+    /// Пора ли запускать в момент `now` (секунды Unix).
+    pub fn due(&self, now: i64) -> bool {
+        self.every_hours > 0 && now - self.last_run >= i64::from(self.every_hours) * 3600
+    }
+
+    pub fn period_label(&self) -> String {
+        Self::PERIODS.iter().find(|(hours, _)| *hours == self.every_hours).map_or_else(
+            || format!("каждые {} ч", self.every_hours),
+            |(_, label)| label.to_string(),
+        )
+    }
+}
+
+/// Поиск дубликатов.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DuplicateSettings {
+    /// Файлы меньше, байт, не сравниваются.
+    pub min_size: u64,
+    /// Что пропускать: имя папки или файла (`node_modules`), маска (`*.tmp`) или полный
+    /// путь папки (`D:\Резерв`). См. `duplicates::excluded`.
+    pub exclude: Vec<String>,
+}
+
+impl Default for DuplicateSettings {
+    fn default() -> DuplicateSettings {
+        DuplicateSettings { min_size: 1, exclude: vec![".git".into(), "node_modules".into()] }
+    }
 }
 
 /// Как программа живёт в системе.
@@ -97,6 +149,12 @@ pub struct IndexSettings {
     /// Досканировать при запуске папки, изменённые пока программа была закрыта. Без журнала
     /// USN (нужны права администратора) — полный обход в фоне.
     pub rescan_on_start: bool,
+    /// Когда `roots` пусто: индексировать и съёмные диски (флешки, внешние диски) — пока
+    /// они подключены.
+    pub removable: bool,
+    /// То же для сетевых дисков с буквой. Изменения в сети видны не всегда сразу: сервер
+    /// может не сообщать о них.
+    pub network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +170,8 @@ impl Default for IndexSettings {
             roots: Vec::new(),
             exclude: Vec::new(),
             rescan_on_start: true,
+            removable: false,
+            network: false,
         }
     }
 }
@@ -176,6 +236,8 @@ pub struct Preview {
     pub image_limit_mb: u32,
     /// Документы Office и прочее — обработчиками предпросмотра Windows в Инспекторе.
     pub handlers: bool,
+    /// Видео и звук играют прямо в быстром просмотре (Media Foundation).
+    pub media: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +274,8 @@ impl Default for Settings {
             saved_searches: Vec::new(),
             sorting: SortSettings::default(),
             system: SystemSettings::default(),
+            duplicates: DuplicateSettings::default(),
+            sort_schedules: Vec::new(),
         }
     }
 }
@@ -258,7 +322,13 @@ impl Default for Panes {
 
 impl Default for Preview {
     fn default() -> Preview {
-        Preview { thumbnails: true, text_limit_kb: 256, image_limit_mb: 64, handlers: true }
+        Preview {
+            thumbnails: true,
+            text_limit_kb: 256,
+            image_limit_mb: 64,
+            handlers: true,
+            media: true,
+        }
     }
 }
 
@@ -316,6 +386,28 @@ fn migrate(value: serde_json::Value, version: u32) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn schedules_are_due_by_period() {
+        let mut schedule = SortSchedule {
+            folder: "D:/Загрузки".into(),
+            every_hours: 24,
+            last_run: 0,
+            options: SortSettings::default(),
+        };
+        assert!(schedule.due(1_760_000_000), "ещё не запускалось");
+        schedule.last_run = 100_000;
+        assert!(!schedule.due(100_000 + 23 * 3600));
+        assert!(schedule.due(100_000 + 24 * 3600));
+        assert_eq!(schedule.period_label(), "раз в день");
+        schedule.every_hours = 0;
+        assert!(!schedule.due(i64::MAX / 2), "период 0 — выключено");
+        let json = r#"{"sort_schedules":[{"folder":"C:/x","every_hours":6}]}"#;
+        let (parsed, error) = Settings::parse(json);
+        assert!(error.is_none());
+        assert_eq!(parsed.sort_schedules[0].every_hours, 6);
+        assert_eq!(parsed.sort_schedules[0].options, SortSettings::default());
+    }
 
     #[test]
     fn round_trip_and_defaults() {

@@ -1,7 +1,7 @@
 //! Группы одинаковых файлов и выбор «лишних» копий. Поиск с чтением файлов — в `mh-files-fs`;
 //! здесь только то, что проверяется без диска.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 /// Файлы с одинаковым содержимым.
@@ -74,6 +74,41 @@ impl Group {
     }
 }
 
+/// Пропустить ли папку или файл при поиске дубликатов. Правило — полный путь папки (есть
+/// `\\`, `/` или `:`; всё внутри неё), маска с `*` и `?` или имя целиком; регистр не важен.
+pub fn excluded(path: &Path, rules: &[String]) -> bool {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let lower_path = path.to_string_lossy().to_lowercase().replace('\\', "/");
+    rules.iter().map(|rule| rule.trim()).filter(|rule| !rule.is_empty()).any(|rule| {
+        let rule = rule.to_lowercase();
+        if rule.contains(['\\', '/', ':']) {
+            let rule = rule.replace('\\', "/");
+            let rule = rule.trim_end_matches('/');
+            lower_path == rule || lower_path.starts_with(&format!("{rule}/"))
+        } else if rule.contains(['*', '?']) {
+            let pattern: Vec<char> = rule.chars().collect();
+            let name: Vec<char> = name.chars().collect();
+            crate::filter::glob_match(&pattern, &name)
+        } else {
+            name == rule
+        }
+    })
+}
+
+impl Group {
+    /// Пары «оставляемая копия → лишняя» — для замены лишних жёсткими ссылками.
+    pub fn link_plan(&self, keep: Keep) -> Vec<(PathBuf, Member)> {
+        let keeper = self.keeper(keep);
+        let target = self.files[keeper].path.clone();
+        self.files
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != keeper)
+            .map(|(_, member)| (target.clone(), member.clone()))
+            .collect()
+    }
+}
+
 /// Порядок показа: сначала группы, которые освободят больше места.
 pub fn sort_groups(groups: &mut [Group]) {
     for group in groups.iter_mut() {
@@ -101,6 +136,27 @@ mod tests {
             path: PathBuf::from(path),
             modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000 - age)),
         }
+    }
+
+    #[test]
+    fn exclusions() {
+        let rules: Vec<String> =
+            ["node_modules", "*.TMP", "D:\\Резерв\\", " "].into_iter().map(String::from).collect();
+        assert!(excluded(Path::new("C:/p/Node_Modules"), &rules));
+        assert!(excluded(Path::new("C:/p/a.tmp"), &rules));
+        assert!(excluded(Path::new("D:\\резерв"), &rules));
+        assert!(excluded(Path::new("D:\\Резерв\\2024"), &rules));
+        assert!(!excluded(Path::new("D:\\Резервы"), &rules));
+        assert!(!excluded(Path::new("C:/p/a.txt"), &rules));
+    }
+
+    #[test]
+    fn link_plan_points_to_keeper() {
+        let group = Group { size: 5, files: vec![copy("/a", 1), copy("/b", 9), copy("/c", 3)] };
+        let plan = group.link_plan(Keep::Oldest);
+        assert_eq!(plan.len(), 2);
+        assert!(plan.iter().all(|(target, _)| target == &PathBuf::from("/b")));
+        assert_eq!(plan[0].1.path, PathBuf::from("/a"));
     }
 
     #[test]

@@ -80,6 +80,32 @@ pub fn extension_of(name: &str) -> String {
     }
 }
 
+/// Расширения архивов, которые открываются как папки.
+pub const ARCHIVE_EXTENSIONS: [&str; 3] = ["zip", "7z", "rar"];
+
+/// Можно ли открыть файл с таким именем как папку (zip, 7z, rar).
+pub fn is_archive_name(name: &str) -> bool {
+    ARCHIVE_EXTENSIONS.contains(&extension_of(name).as_str())
+}
+
+/// Видео или звук — то, что играет быстрый просмотр.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    Video,
+    Audio,
+}
+
+/// Вид медиафайла по имени; `None` — не медиа.
+pub fn media_kind(name: &str) -> Option<MediaKind> {
+    match extension_of(name).as_str() {
+        "mp4" | "m4v" | "mov" | "mkv" | "avi" | "wmv" | "webm" | "mpg" | "mpeg" | "ts" | "mts"
+        | "m2ts" | "3gp" | "asf" => Some(MediaKind::Video),
+        "mp3" | "m4a" | "aac" | "wav" | "flac" | "ogg" | "opus" | "wma" | "aiff" | "aif"
+        | "ac3" | "amr" => Some(MediaKind::Audio),
+        _ => None,
+    }
+}
+
 /// Имя без расширения (у папок — всё имя).
 pub fn stem_of(name: &str, is_dir: bool) -> &str {
     if is_dir {

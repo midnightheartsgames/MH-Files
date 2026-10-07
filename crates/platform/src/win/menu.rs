@@ -6,6 +6,7 @@
 //! расширений остаются пустыми.
 
 use std::cell::RefCell;
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
@@ -21,8 +22,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE,
-    CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, GCS_VERBW, IContextMenu,
-    IContextMenu2, IContextMenu3, ILFindLastID, IShellFolder, SHBindToObject, SHBindToParent,
+    CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, DEFCONTEXTMENU, GCS_VERBW,
+    IContextMenu, IContextMenu2, IContextMenu3, ILFindLastID, IShellFolder, SHBindToObject,
+    SHBindToParent, SHCreateDefaultContextMenu,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos,
@@ -34,7 +36,7 @@ use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PSTR, w};
 
 use super::com::{Apartment, describe, owner_hwnd, wide};
 use super::shell::Pidls;
-use crate::shell::MenuChoice;
+use crate::shell::{MenuChoice, MenuGate};
 
 /// Номера команд расширений. Ноль `TrackPopupMenuEx` возвращает, если ничего не выбрали.
 const FIRST_COMMAND: u32 = 1;
@@ -47,7 +49,13 @@ const CMIC_MASK_NOASYNC: u32 = 0x100;
 
 const CLASS_NAME: PCWSTR = w!("MHFilesShellMenuOwner");
 
-pub fn context_menu(paths: &[PathBuf]) -> Result<MenuChoice, String> {
+/// `extensions` — с пунктами сторонних расширений (как в Проводнике); без них меню собирает
+/// сама Windows из своих команд — так оно не зависнет на чужой библиотеке.
+pub fn context_menu(
+    paths: &[PathBuf],
+    gate: &MenuGate,
+    extensions: bool,
+) -> Result<MenuChoice, String> {
     let _com = Apartment::sta();
     let _ole = Ole::init();
     let first = paths.first().ok_or("нет объектов для меню")?;
@@ -63,14 +71,33 @@ pub fn context_menu(paths: &[PathBuf]) -> Result<MenuChoice, String> {
             .map_err(|error| describe("папка объектов недоступна", &error))?;
         let children: Vec<*const ITEMIDLIST> =
             absolute.iter().map(|&pidl| ILFindLastID(pidl).cast_const()).collect();
-        folder
-            .GetUIObjectOf(window.hwnd, &children, None)
-            .map_err(|error| describe("меню объектов недоступно", &error))?
+        if extensions {
+            folder
+                .GetUIObjectOf(window.hwnd, &children, None)
+                .map_err(|error| describe("меню объектов недоступно", &error))?
+        } else {
+            let parent = first.parent().ok_or("у объекта нет папки")?;
+            let parent = Pidls::new(&[parent.to_path_buf()])?;
+            let mut children: Vec<*mut ITEMIDLIST> =
+                children.iter().map(|&pidl| pidl.cast_mut()).collect();
+            // Без ключей реестра (`aKeys`) в меню только встроенные команды Windows.
+            let mut info = DEFCONTEXTMENU {
+                hwnd: window.hwnd,
+                pidlFolder: parent.as_const()[0].cast_mut(),
+                psf: ManuallyDrop::new(Some(folder)),
+                cidl: children.len() as u32,
+                apidl: children.as_mut_ptr(),
+                ..Default::default()
+            };
+            let menu = SHCreateDefaultContextMenu(&info);
+            ManuallyDrop::drop(&mut info.psf);
+            menu.map_err(|error| describe("меню объектов недоступно", &error))?
+        }
     };
-    show(&menu, &window, None)
+    show(&menu, &window, None, gate)
 }
 
-pub fn background_menu(dir: &Path) -> Result<MenuChoice, String> {
+pub fn background_menu(dir: &Path, gate: &MenuGate) -> Result<MenuChoice, String> {
     let _com = Apartment::sta();
     let _ole = Ole::init();
     let pidls = Pidls::new(std::slice::from_ref(&dir.to_path_buf()))?;
@@ -86,13 +113,14 @@ pub fn background_menu(dir: &Path) -> Result<MenuChoice, String> {
             .map_err(|error| describe("меню папки недоступно", &error))?
     };
     let dir_w = wide(dir);
-    show(&menu, &window, Some(PCWSTR(dir_w.as_ptr())))
+    show(&menu, &window, Some(PCWSTR(dir_w.as_ptr())), gate)
 }
 
 fn show(
     menu: &IContextMenu,
     window: &OwnerWindow,
     directory: Option<PCWSTR>,
+    gate: &MenuGate,
 ) -> Result<MenuChoice, String> {
     let popup = Popup::new()?;
     let shift = key_down(VK_SHIFT);
@@ -105,6 +133,10 @@ fn show(
     unsafe { menu.QueryContextMenu(popup.0, 0, FIRST_COMMAND, LAST_COMMAND, flags) }
         .ok()
         .map_err(|error| describe("меню не собрано", &error))?;
+    // Пока расширения собирали меню, его могли перестать ждать (сторож в fs::shell).
+    if !gate.try_show() {
+        return Ok(MenuChoice::Dismissed);
+    }
 
     let _active = Active::new(menu);
     let mut cursor = POINT::default();

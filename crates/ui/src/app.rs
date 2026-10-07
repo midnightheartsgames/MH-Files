@@ -77,6 +77,16 @@ pub struct DragFiles {
     pub paths: Vec<PathBuf>,
     /// Тащат из архива: бросок извлекает, а не копирует.
     pub archive: Option<PathBuf>,
+    /// Тащат правой кнопкой: при отпускании — меню «Копировать / Переместить / Ярлыки».
+    pub right: bool,
+}
+
+/// Меню после броска правой кнопкой, как в Проводнике.
+pub struct DropMenu {
+    pub paths: Vec<PathBuf>,
+    pub dest: PathBuf,
+    pub archive: Option<PathBuf>,
+    pub at: egui::Pos2,
 }
 
 /// Куда можно бросить файлы: папка-строка, вкладка, пункт боковой панели.
@@ -196,6 +206,13 @@ pub enum Action {
     },
 }
 
+/// Проверка обновлений по кнопке.
+#[derive(Default)]
+pub struct UpdateState {
+    pub checking: bool,
+    pub result: Option<Result<mh_files_core::update::Check, String>>,
+}
+
 pub struct FilesApp {
     pub settings: Settings,
     pub keymap: Keymap,
@@ -211,10 +228,14 @@ pub struct FilesApp {
     incoming: Option<crossbeam_channel::Receiver<Vec<crate::startup::Target>>>,
     /// Сервер единственной копии.
     _instance: Option<Box<dyn std::any::Any>>,
-    /// Прошлый запуск кончился сбоем: отчёт для «Настройки → Система».
+    /// Прошлый запуск кончился сбоем: отчёт для «Настройки › Система».
     pub previous: crate::crash::Previous,
-    /// Пункт «Открыть в MH Files» в Проводнике: есть ли (узнаётся в фоне).
-    pub explorer_menu: Option<bool>,
+    /// Проверка обновлений: идёт ли и чем кончилась.
+    pub update: UpdateState,
+    /// Когда последний раз проверялось расписание сортировки.
+    pub schedule_checked: Option<Instant>,
+    /// Встраивание в Проводник: что есть (узнаётся в фоне).
+    pub integration: Option<mh_files_platform::integration::Status>,
     /// Сортировщик: категории и журналы.
     pub sorter: crate::sorter::Shared,
     /// Идущие извлечения из архивов.
@@ -244,6 +265,7 @@ pub struct FilesApp {
     /// Куда бросят, если отпустить сейчас (по прошлому кадру) — для подсветки.
     pub drop_hover: Option<PathBuf>,
     pub crumb_menu: Option<CrumbMenu>,
+    pub drop_menu: Option<DropMenu>,
     pub columns: Columns,
     /// Первый шаг последовательности клавиш и когда он нажат.
     pub pending_chord: Option<(egui::KeyboardShortcut, Instant)>,
@@ -300,7 +322,9 @@ impl FilesApp {
             incoming: startup.incoming,
             _instance: startup.keepalive,
             previous: startup.previous.clone(),
-            explorer_menu: None,
+            integration: None,
+            update: UpdateState::default(),
+            schedule_checked: None,
             extractions: Vec::new(),
             next_extract: 0,
             events,
@@ -323,6 +347,7 @@ impl FilesApp {
             drop_zones: Vec::new(),
             drop_hover: None,
             crumb_menu: None,
+            drop_menu: None,
             columns: Columns::default(),
             pending_chord: None,
             folder_sizes: HashMap::new(),
@@ -341,13 +366,13 @@ impl FilesApp {
         app.restore(restored.unwrap_or_else(|| Session::single(app.home_location())));
         app.workers.drives();
         app.workers.known_folders();
-        app.workers.explorer_menu(None);
+        app.workers.integration(None);
         // Пути из командной строки: без восстановленного сеанса первый — в домашнюю вкладку.
         app.open_targets_from_outside(startup.open, fresh);
         // Сбой — только паника с отчётом; без отчёта процесс сняли или выключили компьютер.
         if startup.previous.report.is_some() {
             app.set_status(
-                "прошлый запуск закончился сбоем — отчёт в «Настройки → Система»",
+                "прошлый запуск закончился сбоем — отчёт в «Настройки › Система»",
                 Level::Error,
             );
         } else if let Some(old) = &startup.upgraded_from {
@@ -380,7 +405,8 @@ impl FilesApp {
     }
 
     /// Открыть пути, пришедшие снаружи (командная строка, следующий запуск): папки —
-    /// вкладками, файлы — своей папкой с выделением. `replace_first` — первый путь занимает
+    /// вкладками, архивы — как папки (так их открывает «Открыть с помощью → MH Files»),
+    /// остальные файлы — своей папкой с выделением. `replace_first` — первый путь занимает
     /// текущую вкладку вместо новой.
     pub fn open_targets_from_outside(
         &mut self,
@@ -388,6 +414,19 @@ impl FilesApp {
         mut replace_first: bool,
     ) {
         for (path, is_dir) in targets {
+            let archive = !is_dir
+                && path.file_name().is_some_and(|name| {
+                    mh_files_fs::archive::is_archive_name(&name.to_string_lossy())
+                });
+            if archive {
+                let target = if replace_first { Target::Current } else { Target::NewTab };
+                replace_first = false;
+                self.open_location(
+                    Location::Archive { archive: path, inner: String::new() },
+                    target,
+                );
+                continue;
+            }
             let (dir, select) = if is_dir {
                 (path, None)
             } else {
@@ -405,6 +444,33 @@ impl FilesApp {
                 tab.reveal_pending();
             }
         }
+    }
+
+    pub fn check_updates(&mut self) {
+        if !self.update.checking {
+            self.update.checking = true;
+            self.workers.check_updates();
+            self.set_status("проверяю обновления…", Level::Info);
+        }
+    }
+
+    fn on_update(&mut self, result: Result<mh_files_core::update::Check, String>) {
+        use mh_files_core::update::Check;
+        self.update.checking = false;
+        match &result {
+            Ok(Check::UpToDate) => self.set_status(
+                format!("установлена последняя версия — {}", env!("CARGO_PKG_VERSION")),
+                Level::Info,
+            ),
+            Ok(Check::Available(release)) => self.set_status(
+                format!("доступна MH Files {} — «Настройки › О программе»", release.version),
+                Level::Info,
+            ),
+            Err(error) => {
+                self.set_status(format!("обновления не проверены: {error}"), Level::Error)
+            }
+        }
+        self.update.result = Some(result);
     }
 
     pub fn home_location(&self) -> Location {
@@ -432,6 +498,7 @@ impl FilesApp {
         let id = self.new_id();
         let options = ViewOptions { sort: session.sort, ..self.view_options() };
         let mut tab = Tab::new(id, session.location.clone(), session.view, options);
+        tab.duplicate_options = self.duplicate_options();
         tab.reload(&self.workers, false);
         tab
     }
@@ -534,7 +601,12 @@ impl FilesApp {
         }
         let workers = self.workers.clone();
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
-            if tab.dir().is_some_and(|dir| dirs.contains(&dir)) {
+            // Архив перечитывается, если менялось что-то в нём (запись в zip).
+            let archive_touched = match &tab.location {
+                Location::Archive { archive, .. } => dirs.iter().any(|d| d.starts_with(archive)),
+                _ => false,
+            };
+            if archive_touched || tab.dir().is_some_and(|dir| dirs.contains(&dir)) {
                 tab.reload(&workers, true);
             }
         }
@@ -694,8 +766,17 @@ impl FilesApp {
                 self.on_sort_done(ticket, report, journal)
             }
             Event::SortLast { ticket, last } => self.on_sort_last(ticket, last),
-            Event::ExplorerMenu { installed, error } => {
-                self.explorer_menu = Some(installed);
+            Event::CategoriesSaved { result } => match result {
+                Ok(None) => self.set_status("категории сохранены", Level::Info),
+                Ok(Some(copy)) => self.set_status(
+                    format!("категории сохранены; прежний файл с ошибкой — {}", copy.display()),
+                    Level::Info,
+                ),
+                Err(error) => self.set_status(error, Level::Error),
+            },
+            Event::Update(result) => self.on_update(result),
+            Event::Integration { status, error } => {
+                self.integration = Some(status);
                 if let Some(error) = error {
                     self.set_status(error, Level::Error);
                 }
@@ -709,6 +790,25 @@ impl FilesApp {
             Event::DuplicatesProgress { ticket, progress } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
                     tab.on_duplicates_progress(ticket, progress);
+                }
+            }
+            Event::DuplicatesLinked { ticket, report } => {
+                let level = if report.failed.is_empty() { Level::Info } else { Level::Error };
+                let mut text = format!(
+                    "жёсткими ссылками заменено {} — освобождено {}",
+                    mh_files_core::format::items(report.linked),
+                    mh_files_core::format::size(report.freed)
+                );
+                if let Some(first) = report.failed.first() {
+                    text.push_str(&format!(
+                        "; не вышло: {} (первое: {first})",
+                        report.failed.len()
+                    ));
+                }
+                self.set_status(text, level);
+                let workers = self.workers.clone();
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    tab.reload(&workers, false);
                 }
             }
             Event::DuplicatesDone { ticket, result } => {
@@ -841,6 +941,8 @@ impl FilesApp {
                 .exact_size(crate::titlebar::HEIGHT)
                 .frame(egui::Frame::new().fill(theme::PANEL))
                 .show(ui, |ui| crate::titlebar::show(ui, self));
+        } else {
+            mh_files_platform::window::set_maximize_button(None);
         }
 
         egui::Panel::bottom("status")
@@ -888,6 +990,7 @@ impl FilesApp {
             });
 
         pane_view::crumb_menu(&ctx, self);
+        self.show_drop_menu(&ctx);
         if let Some(mut palette) = self.palette.take()
             && palette::show(&ctx, self, &mut palette)
         {
@@ -908,6 +1011,7 @@ impl FilesApp {
         self.run_actions(&ctx);
         self.drive_index_tabs(&ctx);
         self.drive_sorters();
+        self.run_schedules(&ctx);
         if self.settings.appearance.custom_title_bar {
             crate::titlebar::borders(&ctx);
         }
@@ -1066,6 +1170,15 @@ impl FilesApp {
             if let (Some(payload), Some(pos)) = (payload, pointer)
                 && let Some(zone) = self.zone_at(pos).cloned()
             {
+                if payload.right && zone.favorite_group.is_none() {
+                    self.drop_menu = Some(DropMenu {
+                        paths: payload.paths.clone(),
+                        dest: zone.dir,
+                        archive: payload.archive.clone(),
+                        at: pos,
+                    });
+                    return;
+                }
                 match &payload.archive {
                     Some(archive) if zone.favorite_group.is_none() => {
                         self.extract_drop(archive.clone(), payload.paths.clone(), zone.dir)
@@ -1106,7 +1219,10 @@ impl FilesApp {
                 Some(pos) => !window.contains(pos),
                 None => true,
             };
-            (left || i.pointer.hover_pos().is_none(), i.pointer.primary_down())
+            (
+                left || i.pointer.hover_pos().is_none(),
+                i.pointer.primary_down() || i.pointer.secondary_down(),
+            )
         });
         if !(outside && down) {
             return false;
@@ -1116,7 +1232,7 @@ impl FilesApp {
             return false;
         }
         let Some(payload) = egui::DragAndDrop::take_payload::<DragFiles>(ctx) else { return false };
-        match mh_files_platform::dnd::drag_out(&payload.paths) {
+        match mh_files_platform::dnd::drag_out(&payload.paths, payload.right) {
             Ok(mh_files_platform::dnd::DropEffect::Move) => {
                 let dirs: Vec<PathBuf> =
                     payload.paths.iter().filter_map(|p| p.parent().map(PathBuf::from)).collect();
@@ -1126,6 +1242,62 @@ impl FilesApp {
             Err(error) => self.set_status(error, Level::Error),
         }
         true
+    }
+
+    /// Меню броска правой кнопкой: «Копировать сюда», «Переместить сюда», «Создать ярлыки»;
+    /// для файлов из архива — «Извлечь сюда».
+    fn show_drop_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = &self.drop_menu else { return };
+        let mut choice = None;
+        let in_archive = menu.archive.is_some();
+        let area = egui::Area::new(Id::new("drop-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.at)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(190.0);
+                    let mut item = |ui: &mut egui::Ui, text: &str, value: u8| {
+                        if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                            choice = Some(value);
+                        }
+                    };
+                    if in_archive {
+                        item(ui, "Извлечь сюда", 1);
+                    } else {
+                        item(ui, "Копировать сюда", 1);
+                        item(ui, "Переместить сюда", 2);
+                        item(ui, "Создать ярлыки", 3);
+                    }
+                    ui.separator();
+                    item(ui, "Отмена", 0);
+                });
+            });
+        let pressed_outside = ctx.input(|i| i.pointer.any_pressed())
+            && !area.response.contains_pointer()
+            && area.response.rect.width() > 0.0;
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if choice.is_none() && !pressed_outside && !escape {
+            return;
+        }
+        let Some(menu) = self.drop_menu.take() else { return };
+        match (choice, menu.archive) {
+            (Some(1), Some(archive)) => self.extract_drop(archive, menu.paths, menu.dest),
+            (Some(1), None) => self.actions.push(Action::Drop {
+                paths: menu.paths,
+                dest: menu.dest,
+                copy: Some(true),
+            }),
+            (Some(2), None) => self.actions.push(Action::Drop {
+                paths: menu.paths,
+                dest: menu.dest,
+                copy: Some(false),
+            }),
+            (Some(3), None) => self.workers.shell(mh_files_fs::ShellJob::CreateShortcuts {
+                targets: menu.paths,
+                dest: menu.dest,
+            }),
+            _ => {}
+        }
     }
 
     /// Куда встанет перетаскиваемая вкладка, если отпустить в `pos`.
@@ -1295,6 +1467,15 @@ impl FilesApp {
                 !settings.appearance.custom_title_bar,
             ));
         }
+        let mut settings = settings;
+        // Пока окно настроек было открыто, расписание могло отработать: его время новее.
+        for schedule in &mut settings.sort_schedules {
+            if let Some(current) =
+                self.settings.sort_schedules.iter().find(|s| s.folder == schedule.folder)
+            {
+                schedule.last_run = schedule.last_run.max(current.last_run);
+            }
+        }
         self.settings = settings;
         self.refresh_view_options();
         self.save_settings();
@@ -1302,9 +1483,20 @@ impl FilesApp {
 
     pub fn refresh_view_options(&mut self) {
         let base = self.view_options();
+        let duplicates = self.duplicate_options();
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             let sort = tab.options.sort;
             tab.set_options(ViewOptions { sort, ..base });
+            tab.duplicate_options = duplicates.clone();
+        }
+    }
+
+    /// Порог размера и исключения для поиска дубликатов — из настроек.
+    pub fn duplicate_options(&self) -> mh_files_fs::DuplicateOptions {
+        mh_files_fs::DuplicateOptions {
+            min_size: self.settings.duplicates.min_size.max(1),
+            exclude: self.settings.duplicates.exclude.clone(),
+            ..Default::default()
         }
     }
 

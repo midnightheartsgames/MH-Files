@@ -10,7 +10,7 @@ use windows::Win32::System::Com::IDataObject;
 use windows::Win32::System::Ole::{
     DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE, IDropSource, IDropSource_Impl,
 };
-use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
+use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Shell::{
     BHID_DataObject, IShellItemArray, SHCreateShellItemArrayFromIDLists, SHDoDragDrop,
 };
@@ -20,7 +20,7 @@ use super::com::{describe, owner_hwnd};
 use super::shell::Pidls;
 use crate::dnd::DropEffect;
 
-pub fn drag_out(paths: &[PathBuf]) -> Result<DropEffect, String> {
+pub fn drag_out(paths: &[PathBuf], right: bool) -> Result<DropEffect, String> {
     if paths.is_empty() {
         return Err("нечего перетаскивать".into());
     }
@@ -34,7 +34,9 @@ pub fn drag_out(paths: &[PathBuf]) -> Result<DropEffect, String> {
             .BindToHandler(None, &BHID_DataObject)
             .map_err(|error| describe("не удалось собрать список объектов", &error))?
     };
-    let source: IDropSource = DropSource.into();
+    let button = if right { MK_RBUTTON } else { MK_LBUTTON };
+    let source: IDropSource =
+        DropSource { button, other: if right { MK_LBUTTON } else { MK_RBUTTON } }.into();
     // SAFETY: вызов в потоке, получающем ввод мыши; сам крутит цикл сообщений до отпускания.
     let effect = unsafe {
         SHDoDragDrop(
@@ -62,15 +64,19 @@ fn drop_effect(effect: DROPEFFECT) -> DropEffect {
     }
 }
 
-/// Источник перетаскивания: отпустили левую кнопку — бросить, Esc — отменить.
+/// Источник перетаскивания: отпустили свою кнопку — бросить; Esc или вторая кнопка —
+/// отменить, как в Проводнике.
 #[implement(IDropSource)]
-struct DropSource;
+struct DropSource {
+    button: MODIFIERKEYS_FLAGS,
+    other: MODIFIERKEYS_FLAGS,
+}
 
 impl IDropSource_Impl for DropSource_Impl {
     fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
-        if escape.as_bool() {
+        if escape.as_bool() || keys.0 & self.other.0 != 0 {
             DRAGDROP_S_CANCEL
-        } else if keys.0 & MK_LBUTTON.0 == 0 {
+        } else if keys.0 & self.button.0 == 0 {
             DRAGDROP_S_DROP
         } else {
             S_OK

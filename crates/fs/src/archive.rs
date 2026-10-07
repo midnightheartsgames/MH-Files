@@ -1,8 +1,12 @@
-//! Архивы как папки: zip и 7z, только чтение.
+//! Архивы как папки: zip и 7z — своим кодом, rar — через 7-Zip или `tar.exe` Windows
+//! ([`crate::archive_tool`]); только чтение.
 //!
 //! Внутри архива у записи путь вида `C:\загрузки\a.zip\docs\x.txt` — такого пути на диске нет,
 //! [`split`] находит в нём файл архива и путь внутри. Оглавление архива читается один раз и
 //! держится в маленьком кэше: переходы по папкам архива не перечитывают его заново.
+//!
+//! Архив в архиве (`a.zip\b.7z\x.txt`) открывается так же: вложенный архив копируется во
+//! временную папку один раз (по размеру и дате внешнего), дальше всё как с обычным.
 //!
 //! Имена при извлечении проверяются: `..`, абсолютные пути и символы, запрещённые в Windows,
 //! не дают записать файл мимо папки назначения.
@@ -25,11 +29,11 @@ const CACHE_SIZE: usize = 4;
 
 /// Можно ли открыть файл с таким расширением как папку.
 pub fn is_archive_ext(ext: &str) -> bool {
-    matches!(ext, "zip" | "7z")
+    mh_files_core::entry::ARCHIVE_EXTENSIONS.contains(&ext)
 }
 
 pub fn is_archive_name(name: &str) -> bool {
-    is_archive_ext(&mh_files_core::entry::extension_of(name))
+    mh_files_core::entry::is_archive_name(name)
 }
 
 /// Запись оглавления.
@@ -47,9 +51,20 @@ struct Item {
     modified: Option<SystemTime>,
 }
 
+/// Чем читать архив.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Kind {
+    Zip,
+    Seven,
+    /// Внешняя программа (rar).
+    Tool(crate::archive_tool::Tool),
+}
+
 #[derive(Debug)]
 struct Contents {
-    seven: bool,
+    kind: Kind,
+    /// Файл архива на диске; у вложенного — его копия во временной папке.
+    file: PathBuf,
     items: Vec<Item>,
 }
 
@@ -58,7 +73,32 @@ type Key = (PathBuf, u64, Option<SystemTime>);
 static CACHE: Mutex<Vec<(Key, Arc<Contents>)>> = Mutex::new(Vec::new());
 
 /// Файл архива и путь внутри для пути, проходящего через архив. `None` — путь обычный.
+/// Если путь проходит через вложенный архив, «файл архива» — путь вложенного через внешний
+/// (`a.zip\b.7z`), а путь внутри — уже в нём.
 pub fn split(path: &Path) -> Option<(PathBuf, String)> {
+    let (mut archive, inner) = real_split(path)?;
+    let parts: Vec<&str> = inner.split('/').filter(|p| !p.is_empty()).collect();
+    let mut start = 0;
+    // Последнее звено — сама запись: вложенным архивом могут быть только звенья до неё.
+    for end in 0..parts.len().saturating_sub(1) {
+        if !is_archive_name(parts[end]) {
+            continue;
+        }
+        let candidate = parts[start..=end].join("/");
+        let is_file = contents(&archive)
+            .is_ok_and(|c| c.items.iter().any(|i| !i.is_dir && i.inner == candidate));
+        if is_file {
+            for part in &parts[start..=end] {
+                archive.push(part);
+            }
+            start = end + 1;
+        }
+    }
+    Some((archive, parts[start..].join("/")))
+}
+
+/// Ближайший настоящий файл архива на диске среди предков пути.
+fn real_split(path: &Path) -> Option<(PathBuf, String)> {
     for ancestor in path.ancestors().skip(1) {
         match std::fs::metadata(ancestor) {
             Ok(meta) if meta.is_file() => {
@@ -77,6 +117,112 @@ pub fn split(path: &Path) -> Option<(PathBuf, String)> {
         }
     }
     None
+}
+
+/// Файл архива на диске: сам `archive` или, у вложенного, его копия во временной папке.
+fn resolve(archive: &Path) -> Result<PathBuf, String> {
+    if std::fs::metadata(archive).is_ok_and(|meta| meta.is_file()) {
+        return Ok(archive.to_path_buf());
+    }
+    let (outer, inner) =
+        split(archive).ok_or_else(|| format!("{}: архив не найден", archive.display()))?;
+    nested_copy(&outer, &inner)
+}
+
+/// Временная папка вложенных архивов.
+pub fn nested_dir() -> PathBuf {
+    std::env::temp_dir().join("MH Files").join("nested")
+}
+
+/// Скопировать вложенный архив `inner` из `outer` во временную папку (если копии ещё нет).
+/// Имя копии зависит от внешнего архива, его размера и даты — изменился внешний, будет новая.
+fn nested_copy(outer: &Path, inner: &str) -> Result<PathBuf, String> {
+    let contents = contents(outer)?;
+    let item = contents
+        .items
+        .iter()
+        .find(|i| !i.is_dir && i.inner == inner)
+        .ok_or_else(|| format!("в архиве нет файла «{inner}»"))?;
+    let meta = std::fs::metadata(&contents.file).map_err(|e| e.to_string())?;
+    let stamp = meta.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    let key = format!("{}|{}|{:?}|{inner}", contents.file.display(), meta.len(), stamp);
+    let hash = key.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let dir = nested_dir();
+    let name = safe_component(name_of(inner)).unwrap_or_else(|| "archive".into());
+    let path = dir.join(format!("{hash:016x}-{name}"));
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() == item.size) {
+        return Ok(path);
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    forget_old_copies(&dir);
+    let temp = path.with_extension("part");
+    let written = (|| {
+        let mut out = BufWriter::new(File::create(&temp).map_err(|e| e.to_string())?);
+        with_entry(&contents, item, |reader| {
+            std::io::copy(reader, &mut out).map(|_| ()).map_err(|e| format!("{inner}: {e}"))
+        })?;
+        out.into_inner().map_err(|e| e.to_string())?;
+        std::fs::rename(&temp, &path).map_err(|e| e.to_string())
+    })();
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(error);
+    }
+    Ok(path)
+}
+
+/// Копии вложенных архивов старше суток удаляются: временная папка не растёт бесконечно.
+fn forget_old_copies(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day));
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Прочитать одну запись: `use_reader` получает её содержимое потоком.
+fn with_entry(
+    contents: &Contents,
+    item: &Item,
+    use_reader: impl FnOnce(&mut dyn Read) -> Result<(), String>,
+) -> Result<(), String> {
+    match &contents.kind {
+        Kind::Zip => {
+            let mut zip = open_zip(&contents.file)?;
+            let mut file = zip.by_index(item.index).map_err(zip_error)?;
+            use_reader(&mut file)
+        }
+        Kind::Seven => {
+            let mut reader = open_seven(&contents.file)?;
+            let mut use_reader = Some(use_reader);
+            let mut result = Err(format!("в архиве нет файла «{}»", item.inner));
+            reader
+                .for_each_entries(|entry, data| {
+                    if entry.name() != item.raw {
+                        return Ok(true);
+                    }
+                    if let Some(use_reader) = use_reader.take() {
+                        result = use_reader(data);
+                    }
+                    Ok(false)
+                })
+                .map_err(seven_error)?;
+            result
+        }
+        Kind::Tool(tool) => {
+            let mut entry = crate::archive_tool::open(tool, &contents.file, &item.raw)?;
+            use_reader(&mut entry)?;
+            entry.finish()
+        }
+    }
 }
 
 /// Содержимое папки `inner` архива — записи для списка.
@@ -131,14 +277,21 @@ pub fn read(archive: &Path, inner: &str, limit: u64) -> Result<Vec<u8>, String> 
     if item.size > limit {
         return Err("слишком большой файл для предпросмотра".into());
     }
-    if contents.seven {
-        let mut reader = open_seven(archive)?;
+    if contents.kind == Kind::Seven {
+        let mut reader = open_seven(&contents.file)?;
         return reader.read_file(&item.raw).map_err(seven_error);
     }
-    let mut zip = open_zip(archive)?;
-    let mut file = zip.by_index(item.index).map_err(zip_error)?;
     let mut bytes = Vec::with_capacity(item.size as usize);
-    file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    with_entry(&contents, item, |reader| {
+        reader
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })?;
+    if bytes.len() as u64 > limit {
+        return Err("слишком большой файл для предпросмотра".into());
+    }
     Ok(bytes)
 }
 
@@ -224,10 +377,10 @@ pub fn extract(
         }
         Ok(())
     };
-    if contents.seven {
+    if contents.kind == Kind::Seven {
         let by_raw: std::collections::HashMap<&str, &Item> =
             wanted.iter().map(|&n| (contents.items[n].raw.as_str(), &contents.items[n])).collect();
-        let mut reader = open_seven(archive)?;
+        let mut reader = open_seven(&contents.file)?;
         let mut failure = None;
         reader
             .for_each_entries(|entry, data| {
@@ -243,14 +396,22 @@ pub fn extract(
         if let Some(error) = failure {
             return Err(error);
         }
-    } else {
-        let mut zip = open_zip(archive)?;
+    } else if contents.kind == Kind::Zip {
+        let mut zip = open_zip(&contents.file)?;
         let mut indices: Vec<usize> = wanted.iter().copied().collect();
         indices.sort_unstable();
         for n in indices {
             let item = &contents.items[n];
             let mut file = zip.by_index(item.index).map_err(zip_error)?;
             write(item, &mut file)?;
+        }
+    } else {
+        // Внешняя программа: процесс на запись.
+        let mut indices: Vec<usize> = wanted.iter().copied().collect();
+        indices.sort_unstable();
+        for n in indices {
+            let item = &contents.items[n];
+            with_entry(&contents, item, |reader| write(item, reader))?;
         }
     }
     if cancel.is_cancelled() {
@@ -331,16 +492,27 @@ fn normalize(name: &str) -> Option<String> {
 }
 
 fn contents(archive: &Path) -> Result<Arc<Contents>, String> {
-    let meta = std::fs::metadata(archive).map_err(|e| format!("{}: {e}", archive.display()))?;
+    let file = resolve(archive)?;
+    let meta = std::fs::metadata(&file).map_err(|e| format!("{}: {e}", archive.display()))?;
     let key: Key = (archive.to_path_buf(), meta.len(), meta.modified().ok());
     if let Some((_, contents)) = CACHE.lock().iter().find(|(k, _)| *k == key) {
         return Ok(contents.clone());
     }
     let name = archive.file_name().unwrap_or_default().to_string_lossy();
-    let seven = mh_files_core::entry::extension_of(&name) == "7z";
-    let mut items = if seven { read_seven(archive)? } else { read_zip(archive)? };
+    let kind = match mh_files_core::entry::extension_of(&name).as_str() {
+        "7z" => Kind::Seven,
+        "rar" => {
+            Kind::Tool(crate::archive_tool::tool().cloned().ok_or(crate::archive_tool::MISSING)?)
+        }
+        _ => Kind::Zip,
+    };
+    let mut items = match &kind {
+        Kind::Zip => read_zip(&file)?,
+        Kind::Seven => read_seven(&file)?,
+        Kind::Tool(tool) => read_tool(tool, &file)?,
+    };
     add_missing_dirs(&mut items);
-    let contents = Arc::new(Contents { seven, items });
+    let contents = Arc::new(Contents { kind, file, items });
     let mut cache = CACHE.lock();
     cache.retain(|(k, _)| k.0 != key.0);
     cache.push((key, contents.clone()));
@@ -454,6 +626,26 @@ fn read_seven(archive: &Path) -> Result<Vec<Item>, String> {
             modified: entry
                 .has_last_modified_date
                 .then(|| SystemTime::from(entry.last_modified_date())),
+        });
+    }
+    Ok(items)
+}
+
+fn read_tool(tool: &crate::archive_tool::Tool, archive: &Path) -> Result<Vec<Item>, String> {
+    let mut items = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, raw) in crate::archive_tool::list(tool, archive)?.into_iter().enumerate() {
+        let Some(inner) = normalize(&raw.name) else { continue };
+        if !seen.insert(inner.clone()) {
+            continue;
+        }
+        items.push(Item {
+            inner,
+            raw: raw.name,
+            index,
+            is_dir: raw.is_dir,
+            size: if raw.is_dir { 0 } else { raw.size },
+            modified: raw.modified,
         });
     }
     Ok(items)
@@ -577,6 +769,66 @@ mod tests {
         let out = dir.join("out");
         extract(&archive, &["inner".into()], &out, &CancelToken::default(), |_| {}).unwrap();
         assert_eq!(std::fs::read_to_string(out.join("inner/note.txt")).unwrap(), "семь");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nested_archives_open_like_folders() {
+        use zip::write::SimpleFileOptions;
+        let dir = temp("nested");
+        let inner_zip = dir.join("inner.zip");
+        make_zip(&inner_zip);
+        let source = dir.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("deep.txt"), "глубоко").unwrap();
+        let inner_seven = dir.join("inner.7z");
+        sevenz_rust2::compress_to_path(&source, &inner_seven).unwrap();
+        let outer = dir.join("outer.zip");
+        {
+            let mut writer = zip::ZipWriter::new(File::create(&outer).unwrap());
+            let options = SimpleFileOptions::default();
+            writer.start_file("sub/inner.zip", options).unwrap();
+            writer.write_all(&std::fs::read(&inner_zip).unwrap()).unwrap();
+            writer.start_file("inner.7z", options).unwrap();
+            writer.write_all(&std::fs::read(&inner_seven).unwrap()).unwrap();
+            writer.finish().unwrap();
+        }
+        let nested = outer.join("sub").join("inner.zip");
+        let mut names: Vec<String> =
+            list(&nested, "").unwrap().into_iter().map(|e| e.name).collect();
+        names.sort();
+        assert_eq!(names, ["docs", "empty", "top.txt"]);
+        assert_eq!(read(&nested, "docs/readme.txt", 100).unwrap(), b"hello");
+        let through = nested.join("docs").join("readme.txt");
+        assert_eq!(split(&through), Some((nested.clone(), "docs/readme.txt".into())));
+        assert_eq!(split(&nested), Some((outer.clone(), "sub/inner.zip".into())));
+        let seven = outer.join("inner.7z");
+        assert_eq!(read(&seven, "deep.txt", 100).unwrap(), "глубоко".as_bytes());
+        let out = dir.join("out");
+        extract(&nested, &["top.txt".into()], &out, &CancelToken::default(), |_| {}).unwrap();
+        assert_eq!(std::fs::read(out.join("top.txt")).unwrap(), b"top");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// rar читает внешняя программа; настоящего rar здесь не собрать, но 7-Zip и bsdtar
+    /// узнают формат по содержимому — zip под именем .rar проверяет всю дорогу.
+    #[test]
+    fn rar_goes_through_external_tool() {
+        if crate::archive_tool::tool().is_none() {
+            return;
+        }
+        let dir = temp("rar");
+        let archive = dir.join("a.rar");
+        make_zip(&archive);
+        let mut names: Vec<String> =
+            list(&archive, "").unwrap().into_iter().map(|e| e.name).collect();
+        names.sort();
+        assert_eq!(names, ["docs", "empty", "top.txt"]);
+        assert_eq!(read(&archive, "docs/readme.txt", 100).unwrap(), b"hello");
+        assert!(read(&archive, "docs/deep/data.bin", 10).is_err(), "предел размера");
+        let out = dir.join("out");
+        extract(&archive, &["docs".into()], &out, &CancelToken::default(), |_| {}).unwrap();
+        assert_eq!(std::fs::read(out.join("docs/deep/data.bin")).unwrap().len(), 1000);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

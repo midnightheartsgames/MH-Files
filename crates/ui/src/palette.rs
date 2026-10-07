@@ -20,7 +20,7 @@ const ROWS: usize = 12;
 pub enum Mode {
     Commands,
     GoTo { candidates: Vec<Candidate> },
-    Search { root: PathBuf },
+    Search { root: PathBuf, content: bool },
 }
 
 pub struct State {
@@ -58,7 +58,12 @@ impl State {
     }
 
     pub fn search(root: PathBuf) -> State {
-        State::new(Mode::Search { root })
+        State::new(Mode::Search { root, content: false })
+    }
+
+    /// Поиск слов внутри файлов папки и вложенных.
+    pub fn search_content(root: PathBuf) -> State {
+        State::new(Mode::Search { root, content: true })
     }
 
     /// GoTo: кандидаты собираются один раз при открытии из того, что уже известно.
@@ -206,7 +211,12 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp, state: &mut State) -> bool 
     let (title, hint) = match &state.mode {
         Mode::Commands => ("Команды", "Имя команды…"),
         Mode::GoTo { .. } => ("Перейти", "Папка, диск, путь или %переменная%…"),
-        Mode::Search { .. } => ("Поиск во вложенных папках", "Слова или маска: qwen gguf, *.png…"),
+        Mode::Search { content: false, .. } => {
+            ("Поиск во вложенных папках", "Слова или маска: qwen gguf, *.png…")
+        }
+        Mode::Search { content: true, .. } => {
+            ("Поиск по содержимому", "Слова в тексте файлов, маски имён: договор аренды *.txt…")
+        }
     };
     let screen = ctx.content_rect();
     let width = (screen.width() - 40.0).min(640.0);
@@ -292,12 +302,13 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp, state: &mut State) -> bool 
                     .push(Action::Open { location: Location::Dir(candidate.path.clone()), target });
             }
             Row::SearchHere => {
-                if let Mode::Search { root } = &state.mode
+                if let Mode::Search { root, content } = &state.mode
                     && !state.query.trim().is_empty()
                 {
                     let location = Location::Search {
                         root: root.clone(),
                         query: state.query.trim().to_string(),
+                        content: *content,
                     };
                     app.actions.push(Action::Open { location, target: Target::Current });
                 } else {
@@ -374,14 +385,17 @@ fn row_ui(
             );
         }
         Row::SearchHere => {
-            let root = match &state.mode {
-                Mode::Search { root } => root.display().to_string(),
-                _ => String::new(),
+            let (root, content) = match &state.mode {
+                Mode::Search { root, content } => (root.display().to_string(), *content),
+                _ => (String::new(), false),
             };
-            let text = if state.query.trim().is_empty() {
-                format!("Введите запрос — поиск в «{root}» и всех вложенных папках")
-            } else {
-                format!("Искать «{}» в {root}", state.query.trim())
+            let text = match (state.query.trim(), content) {
+                ("", false) => format!("Введите запрос — поиск в «{root}» и всех вложенных папках"),
+                ("", true) => {
+                    format!("Введите слова — поиск в текстовых файлах «{root}» и вложенных папок")
+                }
+                (query, false) => format!("Искать «{query}» в {root}"),
+                (query, true) => format!("Искать текст «{query}» в файлах {root}"),
             };
             painter.text(
                 left,

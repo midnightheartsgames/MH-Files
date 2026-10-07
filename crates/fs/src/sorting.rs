@@ -84,7 +84,27 @@ pub fn save_categories(config: &Config, path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(path, config.to_json())
+    // Через временный файл: при сбое остаётся прежний файл целиком.
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, config.to_json())?;
+    fs::rename(&temp, path)
+}
+
+/// Записать категории из настроек. Испорченный файл (его правили руками и ошиблись) не
+/// пропадает: сначала копируется в `categories.json.broken`. Возвращает путь копии.
+pub fn replace_categories(config: &Config, path: &Path) -> Result<Option<PathBuf>, String> {
+    let broken = match fs::read_to_string(path) {
+        Ok(text) if Config::parse(&text).is_err() => {
+            let copy = path.with_extension("json.broken");
+            fs::copy(path, &copy)
+                .map_err(|e| format!("Не удалось сохранить копию {}: {e}", copy.display()))?;
+            Some(copy)
+        }
+        _ => None,
+    };
+    save_categories(config, path)
+        .map_err(|e| format!("Не удалось записать {}: {e}", path.display()))?;
+    Ok(broken)
 }
 
 /// Почему эту папку сортировать нельзя (или `None`, если можно).
@@ -195,7 +215,18 @@ pub fn scan(
                 None
             }
         });
-        let mut dir = opts.output.join(&class.category);
+        let meta = entry.metadata().ok();
+        let size = meta.as_ref().map_or(0, |m| m.len());
+        let age_days = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| age.as_secs() / 86_400);
+        // Правило по дате и размеру — раньше категории: «Архив\Видео».
+        let mut dir = match classifier.rule_folder(&class.category, size, age_days) {
+            Some(folder) => opts.output.join(folder).join(&class.category),
+            None => opts.output.join(&class.category),
+        };
         if opts.type_folders {
             dir.push(&class.type_folder);
         }
@@ -214,7 +245,7 @@ pub fn scan(
             dst,
             category: class.category,
             ext: class.ext,
-            size: entry.metadata().map(|m| m.len()).unwrap_or(0),
+            size,
             by_content: class.by_content,
             enabled: true,
         });
@@ -566,6 +597,25 @@ pub fn prune(dir: &Path, keep: usize) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn replacing_keeps_broken_file() {
+        let dir = std::env::temp_dir().join(format!("mh-files-categories-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join(CONFIG_FILE);
+        // Файла нет — просто пишется.
+        assert_eq!(replace_categories(&Config::default(), &path), Ok(None));
+        assert!(Config::parse(&fs::read_to_string(&path).unwrap()).is_ok());
+        // Испорченный — копия рядом, затем новый.
+        touch(&path, "{ испорчен");
+        let config = Config { unknown_category: "Разное".into(), ..Config::default() };
+        let copy = replace_categories(&config, &path).unwrap().expect("копия");
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "{ испорчен");
+        let saved = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.unknown_category, "Разное");
+        assert!(!path.with_extension("json.tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     pub fn touch(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
@@ -624,6 +674,51 @@ mod tests {
             ]
         );
         assert_eq!(plan.ignored, 2);
+    }
+
+    #[test]
+    fn rules_by_age_and_size() {
+        use mh_files_core::sorting::config::Rule;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        touch(&root.join("old.pdf"), "");
+        touch(&root.join("new.pdf"), "");
+        touch(&root.join("big.mp4"), &"x".repeat(3 << 20));
+        touch(&root.join("small.mp4"), "x");
+        let year_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(400 * 86_400);
+        fs::File::options()
+            .write(true)
+            .open(root.join("old.pdf"))
+            .unwrap()
+            .set_modified(year_ago)
+            .unwrap();
+        // Разложенное правилом в прошлый раз — не трогается.
+        touch(&root.join("Архив/Документы/PDF/done.pdf"), "");
+        let config = Config {
+            rules: vec![
+                Rule { folder: "Архив".into(), older_than_days: Some(365), ..Rule::default() },
+                Rule {
+                    folder: "Большие".into(),
+                    larger_than_mb: Some(2),
+                    categories: vec!["Видео".into()],
+                    ..Rule::default()
+                },
+            ],
+            ..Config::default()
+        };
+        let classifier = Classifier::new(&config);
+        let mut opts = options(root);
+        opts.recursive = true;
+        let plan = scan(&opts, &classifier, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert_eq!(
+            rel_dst(&plan),
+            [
+                "Архив/Документы/PDF/old.pdf",
+                "Большие/Видео/MP4/big.mp4",
+                "Видео/MP4/small.mp4",
+                "Документы/PDF/new.pdf",
+            ]
+        );
     }
 
     #[test]

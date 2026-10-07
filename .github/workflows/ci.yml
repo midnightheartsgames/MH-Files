@@ -98,7 +98,18 @@ jobs:
           }
 
       - name: "Сборка: exe, установщик, переносная версия"
-        run: .\tools\build-release.ps1
+        # Подпись кода — только если в секретах репозитория есть сертификат (.pfx в base64
+        # и пароль); без них сборка неподписанная. Секреты не видны запросам из форков.
+        env:
+          MH_SIGN_PFX_BASE64: ${{ secrets.MH_SIGN_PFX_BASE64 }}
+          MH_SIGN_PASSWORD: ${{ secrets.MH_SIGN_PASSWORD }}
+        run: |
+          if ($env:MH_SIGN_PFX_BASE64) {
+            $env:MH_SIGN_PFX = Join-Path $env:RUNNER_TEMP 'mh-sign.pfx'
+            [IO.File]::WriteAllBytes($env:MH_SIGN_PFX, [Convert]::FromBase64String($env:MH_SIGN_PFX_BASE64))
+          }
+          try { .\tools\build-release.ps1 }
+          finally { if ($env:MH_SIGN_PFX) { Remove-Item -Force $env:MH_SIGN_PFX -ErrorAction SilentlyContinue } }
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

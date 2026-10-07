@@ -94,7 +94,8 @@ pub fn execute(
                 operation
                     .DeleteItems(&items)
                     .map_err(|error| describe("удаление не подготовлено", &error))?;
-                top = Vec::new();
+                // PostDeleteItem сообщает, где объект лёг в корзине: по этим парам — «Отменить».
+                top = paths.clone();
             }
             FileOp::Delete { paths, permanent: true } => {
                 // Точный список путей пользователь уже подтвердил в нашем окне.
@@ -131,6 +132,23 @@ pub fn execute(
                 top = Vec::new();
                 fallback_created.push(parent.join(name));
             }
+            FileOp::Restore { items } => {
+                // Занятое имя — системный диалог конфликта, как при обычном перемещении.
+                set_flags(&operation, FOF_ALLOWUNDO | FOF_NOCONFIRMMKDIR | FOF_SILENT)?;
+                for (bin, original) in items {
+                    let (Some(parent), Some(name)) = (original.parent(), original.file_name())
+                    else {
+                        return Err(format!("некуда вернуть {}", original.display()));
+                    };
+                    let name = wide(name);
+                    operation
+                        .MoveItem(&item(bin)?, &item(parent)?, PCWSTR(name.as_ptr()), None)
+                        .map_err(|error| {
+                            describe(&format!("{} нет в корзине", original.display()), &error)
+                        })?;
+                }
+                top = items.iter().map(|(bin, _)| bin.clone()).collect();
+            }
         }
     }
 
@@ -152,7 +170,19 @@ pub fn execute(
         return Ok(OpOutcome::Aborted);
     }
 
-    let done = sink.state.take();
+    let mut done = sink.state.take();
+    match op {
+        // Объект в корзине — не новый объект: перечитывать и выделять там нечего.
+        FileOp::Delete { .. } => done.created.clear(),
+        FileOp::Restore { .. } => {
+            for (bin, _) in &done.pairs {
+                if let Some(info) = crate::ops::recycle_info_file(bin) {
+                    let _ = std::fs::remove_file(info);
+                }
+            }
+        }
+        _ => {}
+    }
     if done.created.is_empty() && done.pairs.is_empty() {
         return Ok(OpOutcome::done(fallback_created, fallback_pairs));
     }
@@ -426,10 +456,12 @@ impl IFileOperationProgressSink_Impl for Sink_Impl {
     fn PostDeleteItem(
         &self,
         _flags: u32,
-        _item: Ref<IShellItem>,
-        _result: HRESULT,
-        _created: Ref<IShellItem>,
+        item: Ref<IShellItem>,
+        result: HRESULT,
+        created: Ref<IShellItem>,
     ) -> windows::core::Result<()> {
+        // При удалении в корзину `created` — объект в `$Recycle.Bin`; насовсем — пусто.
+        self.finished(item, result, created);
         Ok(())
     }
 

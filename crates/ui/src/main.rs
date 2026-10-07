@@ -7,6 +7,7 @@ mod actions;
 mod app;
 mod archives;
 mod batch;
+mod categories_editor;
 mod columns;
 mod commands;
 mod crash;

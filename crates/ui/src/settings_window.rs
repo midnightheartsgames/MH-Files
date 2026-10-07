@@ -67,15 +67,18 @@ pub struct State {
     /// Сочетания как текст: «Ctrl+C, Ctrl+Insert».
     keys: BTreeMap<CommandId, String>,
     status: Option<(String, bool)>,
+    /// Правка категорий сортировщика.
+    categories: crate::categories_editor::Editor,
     /// Поля «добавить папку» на странице индекса.
     new_root: String,
     new_exclude: String,
 }
 
 impl State {
-    pub fn open(&mut self, settings: &Settings) {
+    pub fn open(&mut self, settings: &Settings, categories: &mh_files_core::sorting::Config) {
         if !self.open {
             self.draft = settings.clone();
+            self.categories = crate::categories_editor::Editor::new(categories);
             let (keymap, _) = Keymap::new(&settings.keys);
             self.keys = CommandId::ALL.iter().map(|&c| (c, keymap.text(c))).collect();
             self.status = None;
@@ -84,14 +87,30 @@ impl State {
         self.focus = true;
     }
 
-    /// Черновик с разобранными сочетаниями. Ошибка — текст.
-    fn result(&self) -> Result<Settings, String> {
+    /// Открыть сразу на странице сортировщика (кнопка во вкладке «Разложить»).
+    pub fn open_sorting(
+        &mut self,
+        settings: &Settings,
+        categories: &mh_files_core::sorting::Config,
+    ) {
+        self.open(settings, categories);
+        self.page = Page::Sorting;
+    }
+
+    /// Черновик с разобранными сочетаниями и изменённые категории (если менялись).
+    /// Ошибка — текст.
+    fn result(&self) -> Result<(Settings, Option<mh_files_core::sorting::Config>), String> {
+        let categories = self.categories.result()?;
+        Ok((self.settings()?, categories))
+    }
+
+    fn settings(&self) -> Result<Settings, String> {
         let mut settings = self.draft.clone().sanitized();
         let mut keys = BTreeMap::new();
         let mut seen: BTreeMap<String, CommandId> = BTreeMap::new();
         for (&command, text) in &self.keys {
             let mut parsed = Vec::new();
-            for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            for part in crate::commands::split_chords(text) {
                 let chord = parse_chord(part).ok_or_else(|| {
                     format!("«{part}» у команды «{}» не разобрано", command.name())
                 })?;
@@ -127,7 +146,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         .with_title("MH Files — настройки")
         .with_inner_size([900.0, 620.0])
         .with_min_inner_size([760.0, 480.0]);
-    let mut applied: Option<Settings> = None;
+    let mut applied: Option<(Settings, Option<mh_files_core::sorting::Config>)> = None;
     let mut close = false;
     let index_status = app.indexer.status();
     let elevated = app.indexer.elevated();
@@ -136,7 +155,6 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         path: app.sorter.path.clone(),
         history: app.sorter.history.clone(),
         error: app.sorter.error.clone(),
-        warnings: app.sorter.classifier.warnings.clone(),
         categories: app.sorter.classifier.category_count(),
         extensions: app.sorter.classifier.extension_count,
     };
@@ -146,7 +164,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         config: dirs.config.clone(),
         index: dirs.index.clone(),
         portable: dirs.portable,
-        explorer_menu: app.explorer_menu,
+        integration: app.integration,
         crashed: app.previous.crashed,
         report: app.previous.report.clone(),
         first_frame: app.diag.first_frame,
@@ -154,6 +172,8 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         text: app.diag.report(),
     };
     let mut system_action = None;
+    let update_info = (app.update.checking, app.update.result.clone());
+    let mut about_action = None;
     ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ui, class| {
         let state = &mut app.settings_window;
         if class == ViewportClass::EmbeddedWindow {
@@ -241,24 +261,32 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             let info = IndexInfo { status: &index_status, elevated };
                             rescan |= index(ui, state, &info);
                         }
-                        Page::Sorting => sort_action = sorting(ui, &mut state.draft, &sort_info),
+                        Page::Sorting => {
+                            sort_action =
+                                sorting(ui, &mut state.draft, &mut state.categories, &sort_info)
+                        }
                         Page::System => system_action = system(ui, &mut state.draft, &system_info),
                         Page::Keys => keys(ui, &mut state.keys),
-                        Page::About => about(ui),
+                        Page::About => about_action = about(ui, &update_info),
                     }
                 });
             });
     });
-    if let Some(settings) = applied {
+    if let Some((settings, categories)) = applied {
         app.apply_settings(ctx, settings);
+        if let Some(config) = categories {
+            app.settings_window.categories.saved(&config);
+            app.sorter.set_config(config.clone());
+            app.workers.save_categories(config, app.sorter.path.clone());
+        }
     }
     if rescan {
         app.indexer.rescan();
     }
     match system_action {
-        Some(SystemAction::ExplorerMenu(install)) => {
-            app.explorer_menu = None;
-            app.workers.explorer_menu(Some(install));
+        Some(SystemAction::Integration(feature, on)) => {
+            app.integration = None;
+            app.workers.integration(Some((feature, on)));
         }
         Some(SystemAction::Open(path)) => {
             let _ = std::fs::create_dir_all(&path);
@@ -274,10 +302,19 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         }
         None => {}
     }
+    match about_action {
+        Some(AboutAction::Check) => app.check_updates(),
+        Some(AboutAction::Open(url)) => {
+            app.workers.shell(mh_files_fs::ShellJob::Open(std::path::PathBuf::from(url)))
+        }
+        None => {}
+    }
     match sort_action {
         Some(SortAction::Reload) => {
             app.sorter.reload();
-            app.settings_window.status = Some(("категории перечитаны".into(), false));
+            app.settings_window.categories =
+                crate::categories_editor::Editor::new(&app.sorter.config);
+            app.settings_window.status = Some(("категории перечитаны из файла".into(), false));
         }
         Some(SortAction::OpenFile) => {
             app.workers.shell(mh_files_fs::ShellJob::Open(sort_info.path.clone()));
@@ -456,6 +493,16 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
             &mut s.preview.handlers,
         );
     });
+    card(ui, "Видео и звук", |ui| {
+        switch_row(
+            ui,
+            "Играть в быстром просмотре",
+            Some(
+                "Пробел на видео или музыке — сразу воспроизведение: Enter — пауза, Shift+стрелки — перемотка. Кодеки — те же, что у Windows (HEVC и AV1 ставятся из Microsoft Store).",
+            ),
+            &mut s.preview.media,
+        );
+    });
     card(ui, "Инспектор и быстрый просмотр", |ui| {
         row(ui, "Читать текста, КБ", |ui| {
             ui.add(egui::DragValue::new(&mut s.preview.text_limit_kb).range(4..=4096));
@@ -470,7 +517,7 @@ struct SystemInfo {
     config: std::path::PathBuf,
     index: std::path::PathBuf,
     portable: bool,
-    explorer_menu: Option<bool>,
+    integration: Option<mh_files_platform::integration::Status>,
     crashed: bool,
     report: Option<std::path::PathBuf>,
     first_frame: Option<std::time::Duration>,
@@ -479,7 +526,7 @@ struct SystemInfo {
 }
 
 enum SystemAction {
-    ExplorerMenu(bool),
+    Integration(mh_files_platform::integration::Feature, bool),
     Open(std::path::PathBuf),
     OpenFile(std::path::PathBuf),
     Copy,
@@ -499,39 +546,44 @@ fn system(ui: &mut Ui, s: &mut Settings, info: &SystemInfo) -> Option<SystemActi
         );
     });
     card(ui, "Проводник", |ui| {
-        let (text, color) = match info.explorer_menu {
-            None => ("Проверяется…", theme::TEXT_DISABLED),
-            Some(true) => (
-                "Пункт «Открыть в MH Files» есть в меню папок, дисков и пустого места",
-                theme::TEXT_SECONDARY,
-            ),
-            Some(false) => {
-                ("Пункта «Открыть в MH Files» в меню Проводника нет", theme::TEXT_SECONDARY)
-            }
-        };
-        ui.label(RichText::new(text).color(color));
-        widgets::hint(
-            ui,
-            "Только для текущего пользователя, права администратора не нужны. В Windows 11 пункт — в «Показать дополнительные параметры».",
-        );
-        ui.horizontal(|ui| {
-            let busy = info.explorer_menu.is_none();
-            if ui
-                .add_enabled(
-                    !busy && info.explorer_menu != Some(true),
-                    egui::Button::new("Добавить"),
-                )
-                .clicked()
-            {
-                action = Some(SystemAction::ExplorerMenu(true));
-            }
-            if ui
-                .add_enabled(!busy && info.explorer_menu == Some(true), egui::Button::new("Убрать"))
-                .clicked()
-            {
-                action = Some(SystemAction::ExplorerMenu(false));
+        use mh_files_platform::integration::Feature;
+        let busy = info.integration.is_none();
+        let status = info.integration.unwrap_or_default();
+        ui.add_enabled_ui(!busy, |ui| {
+            let mut rows = [
+                (
+                    Feature::ExplorerMenu,
+                    "Пункт «Открыть в MH Files»",
+                    "В меню папок, дисков и пустого места окна. В Windows 11 — в «Показать дополнительные параметры».",
+                    status.explorer_menu,
+                ),
+                (
+                    Feature::DefaultFolders,
+                    "Открывать папки в MH Files",
+                    "Двойной щелчок по папке или диску на рабочем столе и в других программах открывает MH Files вместо Проводника. Win+E, «Этот компьютер» и «Панель управления» остаются за Проводником; «Показать в Проводнике» по-прежнему открывает Проводник.",
+                    status.default_folders,
+                ),
+                (
+                    Feature::Archives,
+                    "Архивы zip, 7z, rar",
+                    "MH Files появится в «Открыть с помощью» для архивов: архив откроется как папка. Сделать его программой по умолчанию Windows разрешает только вам — «Открыть с помощью › Выбрать другое приложение › Всегда».",
+                    status.archives,
+                ),
+            ];
+            for (feature, label, help, on) in &mut rows {
+                let before = *on;
+                switch_row(ui, label, Some(help), on);
+                if *on != before {
+                    action = Some(SystemAction::Integration(*feature, *on));
+                }
             }
         });
+        let text = if busy {
+            "Проверяется…"
+        } else {
+            "Только для текущего пользователя, права администратора не нужны. Удаление программы убирает всё это."
+        };
+        widgets::hint(ui, text);
     });
     card(ui, "Данные программы", |ui| {
         let mode = if info.portable {
@@ -625,7 +677,6 @@ struct SortInfo {
     path: std::path::PathBuf,
     history: std::path::PathBuf,
     error: Option<String>,
-    warnings: Vec<String>,
     categories: usize,
     extensions: usize,
 }
@@ -637,7 +688,12 @@ enum SortAction {
 }
 
 /// Страница сортировщика: галочки по умолчанию и файл категорий.
-fn sorting(ui: &mut Ui, s: &mut Settings, info: &SortInfo) -> Option<SortAction> {
+fn sorting(
+    ui: &mut Ui,
+    s: &mut Settings,
+    editor: &mut crate::categories_editor::Editor,
+    info: &SortInfo,
+) -> Option<SortAction> {
     let mut action = None;
     widgets::hint(
         ui,
@@ -668,13 +724,48 @@ fn sorting(ui: &mut Ui, s: &mut Settings, info: &SortInfo) -> Option<SortAction>
         );
         widgets::hint(ui, "Галочки, изменённые во вкладке сортировщика, запоминаются сами.");
     });
-    card(ui, "Категории", |ui| {
+    card(ui, "По расписанию", |ui| {
+        if s.sort_schedules.is_empty() {
+            widgets::hint(
+                ui,
+                "Папки можно раскладывать сами по себе: «Разложить» › «Параметры» › «По расписанию». Работает, пока MH Files открыт; пропущенное — при следующем запуске.",
+            );
+        }
+        let mut remove = None;
+        for (index, schedule) in s.sort_schedules.iter().enumerate() {
+            // Путь бывает длинным: обрезается по ширине карточки, целиком — в подсказке.
+            let path = schedule.folder.display().to_string();
+            ui.add(egui::Label::new(RichText::new(&path).color(theme::TEXT_PRIMARY)).truncate())
+                .on_hover_text(path);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(schedule.period_label()).color(theme::TEXT_SECONDARY));
+                if schedule.last_run > 0 {
+                    let when = chrono::DateTime::from_timestamp(schedule.last_run, 0)
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local).format("%d.%m.%Y %H:%M").to_string()
+                        })
+                        .unwrap_or_default();
+                    ui.label(RichText::new(format!("отсчёт с {when}")).color(theme::TEXT_DISABLED));
+                }
+                if ui.small_button("Убрать").clicked() {
+                    remove = Some(index);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some(index) = remove {
+            s.sort_schedules.remove(index);
+        }
+    });
+    crate::categories_editor::show(ui, editor, s.sorting.type_folders);
+    card(ui, "Файл categories.json", |ui| {
         ui.label(format!("Категорий: {}, расширений: {}", info.categories, info.extensions));
         if let Some(error) = &info.error {
             ui.label(RichText::new(error).color(theme::CRITICAL));
-        }
-        for warning in &info.warnings {
-            ui.label(RichText::new(warning).color(theme::WARN));
+            widgets::hint(
+                ui,
+                "Если сохранить категории отсюда, файл с ошибкой останется рядом как categories.json.broken.",
+            );
         }
         widgets::hint(ui, &info.path.display().to_string());
         widgets::hint(
@@ -685,7 +776,13 @@ fn sorting(ui: &mut Ui, s: &mut Settings, info: &SortInfo) -> Option<SortAction>
             if ui.button("Открыть categories.json").clicked() {
                 action = Some(SortAction::OpenFile);
             }
-            if ui.button("Перечитать").clicked() {
+            if ui
+                .button("Перечитать")
+                .on_hover_text(
+                    "Взять категории из файла, если его правили в редакторе; правка здесь пропадёт",
+                )
+                .clicked()
+            {
                 action = Some(SortAction::Reload);
             }
         });
@@ -771,8 +868,26 @@ fn index(ui: &mut Ui, state: &mut State, info: &IndexInfo) -> bool {
         }
     });
     card(ui, "Что индексировать", |ui| {
-        widgets::hint(ui, "Пусто — все локальные диски.");
+        widgets::hint(ui, "Пусто — все локальные диски, а по выбору ещё съёмные и сетевые.");
         path_list(ui, &mut s.index.roots, &mut state.new_root, "D:\\ или папка");
+        ui.add_enabled_ui(s.index.roots.is_empty(), |ui| {
+            switch_row(
+                ui,
+                "Съёмные диски",
+                Some(
+                    "Флешки и внешние диски — пока подключены. Отключённый диск пропадает из поиска, а его индекс остаётся до следующего раза.",
+                ),
+                &mut s.index.removable,
+            );
+            switch_row(
+                ui,
+                "Сетевые диски",
+                Some(
+                    "Подключённые сетевые диски с буквой. Первый обход по сети долгий; изменения видны, если их сообщает сервер, иначе — при просмотре папок.",
+                ),
+                &mut s.index.network,
+            );
+        });
     });
     card(ui, "Исключения", |ui| {
         widgets::hint(ui, "Эти папки пропускаются вместе со всем содержимым.");
@@ -833,7 +948,18 @@ fn keys(ui: &mut Ui, keys: &mut BTreeMap<CommandId, String>) {
     }
 }
 
-fn about(ui: &mut Ui) {
+enum AboutAction {
+    Check,
+    Open(String),
+}
+
+/// Версия, обновления, сторонние компоненты.
+fn about(
+    ui: &mut Ui,
+    (checking, result): &(bool, Option<Result<mh_files_core::update::Check, String>>),
+) -> Option<AboutAction> {
+    use mh_files_core::update::Check;
+    let mut action = None;
     card(ui, "MH Files", |ui| {
         ui.label(format!("Версия {}", env!("CARGO_PKG_VERSION")));
         ui.label(
@@ -850,6 +976,43 @@ fn about(ui: &mut Ui) {
                 .color(theme::TEXT_DISABLED),
         );
     });
+    card(ui, "Обновления", |ui| {
+        let (text, color) = match (checking, result) {
+            (true, _) => ("Проверяю…".to_string(), theme::TEXT_DISABLED),
+            (false, None) => (
+                "Программа не проверяет обновления сама: только по этой кнопке.".to_string(),
+                theme::TEXT_SECONDARY,
+            ),
+            (false, Some(Ok(Check::UpToDate))) => (
+                format!("Установлена последняя версия — {}.", env!("CARGO_PKG_VERSION")),
+                theme::TEXT_SECONDARY,
+            ),
+            (false, Some(Ok(Check::Available(release)))) => {
+                let date =
+                    release.published.as_deref().map(|d| format!(" от {d}")).unwrap_or_default();
+                (format!("Доступна {}{date}.", release.name), theme::accent())
+            }
+            (false, Some(Err(error))) => {
+                (format!("Не удалось проверить: {error}"), theme::CRITICAL)
+            }
+        };
+        ui.label(RichText::new(text).color(color));
+        ui.horizontal(|ui| {
+            if ui.add_enabled(!checking, egui::Button::new("Проверить обновления")).clicked()
+            {
+                action = Some(AboutAction::Check);
+            }
+            if let Some(Ok(Check::Available(release))) = result
+                && ui.button("Открыть страницу выпуска").clicked()
+            {
+                action = Some(AboutAction::Open(release.url.clone()));
+            }
+        });
+        widgets::hint(
+            ui,
+            "Один запрос к GitHub Releases. Пред-выпуски (rc) предлагаются, только если установлен пред-выпуск. Установщик новой версии сохраняет настройки и вкладки.",
+        );
+    });
     card(ui, "Сторонние компоненты", |ui| {
         ui.label(
             RichText::new(
@@ -859,4 +1022,5 @@ fn about(ui: &mut Ui) {
         );
     });
     let _ = Color32::TRANSPARENT;
+    action
 }

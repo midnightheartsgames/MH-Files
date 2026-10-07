@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-use mh_files_core::duplicates::{Group, Member, sort_groups};
+use mh_files_core::duplicates::{Group, Member, excluded, sort_groups};
 
 use crate::{CancelToken, read};
 
@@ -16,16 +16,18 @@ use crate::{CancelToken, read};
 const HEAD: u64 = 64 * 1024;
 const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DuplicateOptions {
     /// Файлы меньше — не сравниваются (пустые не сравниваются никогда).
     pub min_size: u64,
     pub include_hidden: bool,
+    /// Правила пропуска: `duplicates::excluded`.
+    pub exclude: Vec<String>,
 }
 
 impl Default for DuplicateOptions {
     fn default() -> DuplicateOptions {
-        DuplicateOptions { min_size: 1, include_hidden: false }
+        DuplicateOptions { min_size: 1, include_hidden: false, exclude: Vec::new() }
     }
 }
 
@@ -52,7 +54,7 @@ pub fn find(
     cancel: &CancelToken,
     mut progress: impl FnMut(DuplicateProgress),
 ) -> Result<Vec<Group>, String> {
-    let files = scan(roots, options, cancel, &mut progress)?;
+    let files = scan(roots, &options, cancel, &mut progress)?;
     let mut by_size: HashMap<u64, Vec<usize>> = HashMap::new();
     for (i, file) in files.iter().enumerate() {
         by_size.entry(file.size).or_default().push(i);
@@ -109,6 +111,22 @@ pub fn find(
         groups.extend(by_hash.into_values().filter(|g| g.len() > 1));
     }
     report(total, total, true);
+    // Жёсткие ссылки на один файл — не копии: места они не занимают. В группе остаётся по
+    // одному пути на физический файл.
+    let groups: Vec<Vec<usize>> = groups
+        .into_iter()
+        .map(|members| {
+            let mut seen = HashSet::new();
+            members
+                .into_iter()
+                .filter(|&i| match mh_files_platform::files::identity(&files[i].path) {
+                    Some(id) => seen.insert(id),
+                    None => true,
+                })
+                .collect::<Vec<usize>>()
+        })
+        .filter(|members| members.len() > 1)
+        .collect();
     let mut groups: Vec<Group> = groups
         .into_iter()
         .map(|members| Group {
@@ -123,10 +141,71 @@ pub fn find(
     Ok(groups)
 }
 
+/// Чем кончилась замена копий жёсткими ссылками.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkReport {
+    pub linked: usize,
+    pub freed: u64,
+    /// Что не вышло — по строке на файл.
+    pub failed: Vec<String>,
+}
+
+/// Заменить каждую лишнюю копию жёсткой ссылкой на оставляемую: `(оставляемая, лишняя,
+/// размер)`. Лишняя заменяется, только если она и оставляемая всё ещё того же размера, а
+/// лишняя не менялась с поиска; ссылка сначала создаётся рядом под временным именем и
+/// только потом встаёт на место копии — сбой посередине копию не теряет. Ссылки возможны
+/// только в пределах одного тома NTFS.
+pub fn replace_with_links(pairs: &[(PathBuf, Member, u64)], cancel: &CancelToken) -> LinkReport {
+    let mut report = LinkReport::default();
+    for (keeper, extra, size) in pairs {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let path = &extra.path;
+        let fail = |report: &mut LinkReport, why: String| {
+            report.failed.push(format!("{}: {why}", path.display()));
+        };
+        let (Ok(keeper_meta), Ok(extra_meta)) =
+            (std::fs::metadata(keeper), std::fs::metadata(path))
+        else {
+            fail(&mut report, "файла уже нет".into());
+            continue;
+        };
+        if keeper_meta.len() != *size
+            || extra_meta.len() != *size
+            || extra.modified.is_some_and(|m| extra_meta.modified().ok() != Some(m))
+        {
+            fail(&mut report, "изменился после поиска — пропущен".into());
+            continue;
+        }
+        let same = mh_files_platform::files::identity(keeper);
+        if same.is_some() && same == mh_files_platform::files::identity(path) {
+            continue; // Уже ссылка на тот же файл.
+        }
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let temp = path.with_file_name(format!(".{name}.mh-link"));
+        if let Err(error) = std::fs::hard_link(keeper, &temp) {
+            fail(&mut report, format!("ссылка не создана ({error}) — другой диск или не NTFS?"));
+            continue;
+        }
+        match std::fs::rename(&temp, path) {
+            Ok(()) => {
+                report.linked += 1;
+                report.freed += size;
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                fail(&mut report, format!("не заменён: {error}"));
+            }
+        }
+    }
+    report
+}
+
 /// Обход в ширину без ссылок и junction. Пересекающиеся корни не дают файл дважды.
 fn scan(
     roots: &[PathBuf],
-    options: DuplicateOptions,
+    options: &DuplicateOptions,
     cancel: &CancelToken,
     progress: &mut impl FnMut(DuplicateProgress),
 ) -> Result<Vec<Candidate>, String> {
@@ -152,7 +231,7 @@ fn scan(
             }
             let link =
                 entry.file_type().is_ok_and(|t| t.is_symlink()) || record.attributes.reparse();
-            if link {
+            if link || excluded(&record.path(), &options.exclude) {
                 continue;
             }
             if record.is_dir() {
@@ -235,6 +314,41 @@ mod tests {
         let cancel = CancelToken::default();
         cancel.cancel();
         assert!(find(&roots, DuplicateOptions::default(), &cancel, |_| {}).is_err());
+
+        // Исключения и порог размера.
+        let options = DuplicateOptions {
+            exclude: vec!["b".into(), "*.txt".into()],
+            min_size: 10,
+            ..DuplicateOptions::default()
+        };
+        let groups = find(&roots, options, &CancelToken::default(), |_| {}).unwrap();
+        assert_eq!(groups.len(), 1, "txt пропущены по маске");
+        assert_eq!(groups[0].size, 200_000);
+        let options = DuplicateOptions { min_size: 1 << 20, ..DuplicateOptions::default() };
+        assert!(find(&roots, options, &CancelToken::default(), |_| {}).unwrap().is_empty());
+
+        // Лишняя копия становится жёсткой ссылкой — и больше не дубликат.
+        let groups =
+            find(&roots, DuplicateOptions::default(), &CancelToken::default(), |_| {}).unwrap();
+        let group = &groups[0];
+        let pairs: Vec<(PathBuf, Member, u64)> = group
+            .link_plan(mh_files_core::duplicates::Keep::ShortestPath)
+            .into_iter()
+            .map(|(keeper, extra)| (keeper, extra, group.size))
+            .collect();
+        let report = replace_with_links(&pairs, &CancelToken::default());
+        assert_eq!(report, LinkReport { linked: 1, freed: 200_000, failed: Vec::new() });
+        assert_eq!(std::fs::read(dir.join("a/big2.bin")).unwrap(), big);
+        let groups =
+            find(&roots, DuplicateOptions::default(), &CancelToken::default(), |_| {}).unwrap();
+        assert_eq!(groups.len(), 1, "ссылки на один файл — не дубликаты");
+        // Повторно — уже ссылка, ничего не делается; изменённый файл не трогается.
+        assert_eq!(replace_with_links(&pairs, &CancelToken::default()).linked, 0);
+        std::fs::write(dir.join("a/y.txt"), "changed!").unwrap();
+        let stale = [(dir.join("x.txt"), Member { path: dir.join("a/y.txt"), modified: None }, 4)];
+        let report = replace_with_links(&stale, &CancelToken::default());
+        assert_eq!(report.linked, 0);
+        assert_eq!(report.failed.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

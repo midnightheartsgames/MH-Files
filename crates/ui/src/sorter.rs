@@ -28,6 +28,10 @@ use crate::{theme, widgets};
 
 /// Владелец событий отмены, запущенной Ctrl+Z, — не вкладка.
 pub const OWNER_SORT: u64 = u64::MAX - 8;
+/// Владелец сортировок по расписанию.
+pub const OWNER_SCHEDULE: u64 = u64::MAX - 9;
+/// Как часто проверять расписание.
+const SCHEDULE_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 egui_phosphor::subset! {
     /// В exe попадают только значки категорий, а не весь шрифт.
@@ -90,7 +94,7 @@ const SPARE_COLORS: [[u8; 3]; 6] = [
 const UNKNOWN: Look = Look { icon: ph::fill::QUESTION, color: Color32::from_rgb(0x84, 0x90, 0xAB) };
 
 /// Значок и цвет по расширениям категории: переименованная категория выглядит так же.
-fn look_for(name: &str, extensions: &[String]) -> Look {
+pub fn look_for(name: &str, extensions: &[String]) -> Look {
     let mut best: Option<(usize, &str, [u8; 3])> = None;
     for &(icon, rgb, known) in KINDS {
         let hits = extensions
@@ -149,6 +153,15 @@ impl Shared {
         };
         shared.rebuild();
         shared
+    }
+
+    /// Категории из настроек: в памяти сразу, файл пишется в фоне.
+    pub fn set_config(&mut self, config: Config) {
+        self.classifier = Arc::new(Classifier::new(&config));
+        self.config = config;
+        self.error = None;
+        self.revision += 1;
+        self.rebuild();
     }
 
     pub fn reload(&mut self) {
@@ -376,6 +389,84 @@ impl FilesApp {
         }
     }
 
+    /// Раз в полминуты: разложить папки, которым по расписанию пора. Только пока программа
+    /// открыта — фоновой службы нет; пропущенное за время простоя делается при запуске.
+    pub fn run_schedules(&mut self, ctx: &egui::Context) {
+        if self.settings.sort_schedules.is_empty() {
+            return;
+        }
+        ctx.request_repaint_after(SCHEDULE_EVERY);
+        if self.schedule_checked.is_some_and(|at| at.elapsed() < SCHEDULE_EVERY) {
+            return;
+        }
+        self.schedule_checked = Some(std::time::Instant::now());
+        let now = mh_files_core::index::unix(std::time::SystemTime::now());
+        let protected = vec![self.sorter.path.clone(), self.sorter.history.clone()];
+        let mut started = false;
+        for (index, schedule) in self.settings.sort_schedules.iter_mut().enumerate() {
+            if !schedule.due(now) {
+                continue;
+            }
+            schedule.last_run = now;
+            started = true;
+            let o = &schedule.options;
+            let options = ScanOptions {
+                root: schedule.folder.clone(),
+                output: schedule.folder.clone(),
+                recursive: o.recursive,
+                type_folders: o.type_folders,
+                skip_sorted: o.skip_sorted,
+                skip_hidden: o.skip_hidden,
+                detect_content: o.detect_content,
+                copy: o.mode == Mode::Copy,
+                excluded: o.excluded.clone(),
+                protected: protected.clone(),
+            };
+            let ticket = Ticket { owner: OWNER_SCHEDULE, generation: index as u64 };
+            self.workers.sort_scheduled(
+                ticket,
+                options,
+                o.mode,
+                o.remove_empty,
+                self.sorter.classifier.clone(),
+                self.sorter.history.clone(),
+            );
+        }
+        if started {
+            self.save_settings();
+        }
+    }
+
+    /// Расписание для папки: `Some(часы)` — включить с галочками `options`, `None` — убрать.
+    pub fn set_schedule(
+        &mut self,
+        folder: &Path,
+        every_hours: Option<u32>,
+        options: &SortSettings,
+    ) {
+        let schedules = &mut self.settings.sort_schedules;
+        let key = sorting_key(folder);
+        let existing = schedules.iter().position(|s| sorting_key(&s.folder) == key);
+        match (existing, every_hours) {
+            (Some(index), None) => {
+                schedules.remove(index);
+            }
+            (Some(index), Some(hours)) => {
+                schedules[index].every_hours = hours;
+                schedules[index].options = options.clone();
+            }
+            (None, Some(hours)) => schedules.push(mh_files_core::settings::SortSchedule {
+                folder: folder.to_path_buf(),
+                every_hours: hours,
+                // Первый раз — через период, а не сразу: план можно сначала посмотреть.
+                last_run: mh_files_core::index::unix(std::time::SystemTime::now()),
+                options: options.clone(),
+            }),
+            (None, None) => return,
+        }
+        self.save_settings();
+    }
+
     fn sort_view(&mut self, ticket: Ticket) -> Option<&mut SortView> {
         let tab = self.tab_by_id(ticket.owner)?;
         tab.sort.as_deref_mut().filter(|view| view.generation == ticket.generation)
@@ -440,7 +531,23 @@ impl FilesApp {
         if let Some(note) = &report.note {
             text.push_str(&format!(" — {note}"));
         }
-        self.set_status(text, level);
+        if ticket.owner == OWNER_SCHEDULE {
+            let folder = self
+                .settings
+                .sort_schedules
+                .get(ticket.generation as usize)
+                .map(|s| path_label(&s.folder))
+                .unwrap_or_default();
+            text = format!("по расписанию «{folder}»: {text}");
+        }
+        // Расписанию нечего было делать — молчать.
+        if ticket.owner != OWNER_SCHEDULE
+            || report.done > 0
+            || report.failed > 0
+            || report.note.is_some()
+        {
+            self.set_status(text, level);
+        }
         if let SortAction::Sort(mode) = report.action
             && report.done > 0
         {
@@ -451,6 +558,15 @@ impl FilesApp {
         }
         let history = self.sorter.history.clone();
         let workers = self.workers.clone();
+        if ticket.owner == OWNER_SCHEDULE {
+            // По расписанию: открытые сортировщики этой папки строят план заново.
+            for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+                if let Some(view) = tab.sort.as_deref_mut() {
+                    view.rescan();
+                }
+            }
+            return;
+        }
         if ticket.owner == OWNER_SORT {
             // Отмена из Ctrl+Z: открытые сортировщики перестраивают план и кнопку отмены.
             for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
@@ -544,7 +660,14 @@ pub fn show(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
             .layout(Layout::top_down(Align::Min)),
     );
     let ui = &mut child;
-    header(ui, view, &root, &mut actions);
+    let key = sorting_key(&root);
+    let schedule = app
+        .settings
+        .sort_schedules
+        .iter()
+        .find(|s| sorting_key(&s.folder) == key)
+        .map(|s| s.every_hours);
+    header(ui, view, &root, schedule, &mut actions);
     ui.add_space(8.0);
     banner(ui, view, &mut actions);
     summary(ui, view, app);
@@ -612,6 +735,21 @@ pub fn show(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     if actions.reload_categories {
         app.sorter.reload();
     }
+    if actions.edit_categories {
+        app.settings_window.open_sorting(&app.settings, &app.sorter.config);
+    }
+    if let Some(every_hours) = actions.schedule
+        && let Some(view) = tab.sort.as_deref()
+    {
+        app.set_schedule(&root, every_hours, &view.options);
+        let text = match every_hours {
+            Some(_) => {
+                format!("«{}» будет раскладываться сама, пока MH Files открыт", path_label(&root))
+            }
+            None => format!("расписание для «{}» выключено", path_label(&root)),
+        };
+        app.set_status(text, Level::Info);
+    }
 }
 
 #[derive(Default)]
@@ -620,7 +758,10 @@ struct Actions {
     undo: bool,
     rescan: bool,
     reload_categories: bool,
+    edit_categories: bool,
     open: Option<PathBuf>,
+    /// Расписание: `Some(Some(часы))` — включить, `Some(None)` — выключить.
+    schedule: Option<Option<u32>>,
 }
 
 fn note(ui: &mut Ui, text: &str, color: Color32) {
@@ -635,7 +776,13 @@ fn note(ui: &mut Ui, text: &str, color: Color32) {
 }
 
 /// Шапка: что разбираем, «С подпапками», параметры, обновить, отменить последнюю.
-fn header(ui: &mut Ui, view: &mut SortView, root: &Path, actions: &mut Actions) {
+fn header(
+    ui: &mut Ui,
+    view: &mut SortView,
+    root: &Path,
+    schedule: Option<u32>,
+    actions: &mut Actions,
+) {
     let enabled = !view.busy();
     ui.horizontal(|ui| {
         ui.label(RichText::new("Разложить").font(theme::bold(18.0)).color(theme::TEXT_PRIMARY));
@@ -682,12 +829,12 @@ fn header(ui: &mut Ui, view: &mut SortView, root: &Path, actions: &mut Actions) 
             .inner_margin(egui::Margin::symmetric(14, 10))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.add_enabled_ui(enabled, |ui| options_panel(ui, view, actions));
+                ui.add_enabled_ui(enabled, |ui| options_panel(ui, view, schedule, actions));
             });
     }
 }
 
-fn options_panel(ui: &mut Ui, view: &mut SortView, actions: &mut Actions) {
+fn options_panel(ui: &mut Ui, view: &mut SortView, schedule: Option<u32>, actions: &mut Actions) {
     ui.columns(2, |columns| {
         let o = &mut view.options;
         widgets::switch_row(
@@ -745,13 +892,47 @@ fn options_panel(ui: &mut Ui, view: &mut SortView, actions: &mut Actions) {
                 .collect();
         }
         ui.add_space(4.0);
-        if ui
-            .button("Перечитать categories.json")
-            .on_hover_text("Настройки, раздел «Сортировка»")
-            .clicked()
-        {
-            actions.reload_categories = true;
-        }
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("По расписанию").color(theme::TEXT_PRIMARY));
+            let label = |hours: Option<u32>| match hours {
+                None => "выключено".to_string(),
+                Some(hours) => mh_files_core::settings::SortSchedule::PERIODS
+                    .iter()
+                    .find(|(h, _)| *h == hours)
+                    .map_or_else(|| format!("каждые {hours} ч"), |(_, l)| l.to_string()),
+            };
+            egui::ComboBox::from_id_salt("sort-schedule")
+                .selected_text(label(schedule))
+                .show_ui(ui, |ui| {
+                    let choices = std::iter::once(None).chain(
+                        mh_files_core::settings::SortSchedule::PERIODS.iter().map(|(h, _)| Some(*h)),
+                    );
+                    for choice in choices {
+                        if ui.selectable_label(choice == schedule, label(choice)).clicked()
+                            && choice != schedule
+                        {
+                            actions.schedule = Some(choice);
+                        }
+                    }
+                });
+        })
+        .response
+        .on_hover_text(
+            "Раскладывать эту папку самой с этими галочками, пока MH Files открыт. Каждая такая сортировка пишется в журнал и отменяется, как обычная.",
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            if ui.button("Изменить категории…").clicked() {
+                actions.edit_categories = true;
+            }
+            if ui
+                .button("Перечитать categories.json")
+                .on_hover_text("Если файл правили в редакторе")
+                .clicked()
+            {
+                actions.reload_categories = true;
+            }
+        });
     });
 }
 
@@ -959,8 +1140,31 @@ fn preview(ui: &mut Ui, view: &mut SortView, app: &FilesApp) {
     table(&mut right_ui, view, app);
 }
 
+/// Строку плана тащат на категорию.
+struct SortRowDrag(usize);
+
 fn categories(ui: &mut Ui, view: &mut SortView, app: &FilesApp) {
     let total: usize = view.stats.iter().map(|s| s.files).sum();
+    let dragging = egui::DragAndDrop::has_payload_of_type::<SortRowDrag>(ui.ctx());
+    let mut dropped: Option<(usize, String)> = None;
+    if let Some(pos) = ui.ctx().pointer_hover_pos()
+        && let Some(payload) = egui::DragAndDrop::payload::<SortRowDrag>(ui.ctx())
+        && let Some(planned) = view.plan.as_ref().and_then(|p| p.moves.get(payload.0))
+    {
+        let name = planned.src.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        egui::Area::new(Id::new("sort-drag-label"))
+            .order(egui::Order::Tooltip)
+            .fixed_pos(pos + vec2(14.0, 10.0))
+            .interactable(false)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::new()
+                    .fill(theme::CARD)
+                    .stroke(Stroke::new(1.0, theme::CARD_STROKE))
+                    .corner_radius(CornerRadius::same(4))
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| ui.label(format!("{name} — в категорию…")));
+            });
+    }
     ScrollArea::vertical().id_salt("sort-categories").auto_shrink([false, false]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 2.0;
         let all = category_row(ui, None, "Все файлы", total, view.filter.is_none(), None);
@@ -999,13 +1203,57 @@ fn categories(ui: &mut Ui, view: &mut SortView, app: &FilesApp) {
                 view.filter = if selected { None } else { Some(stat.name.clone()) };
                 view.dirty = true;
             }
+            if let Some(payload) = response.row.dnd_release_payload::<SortRowDrag>() {
+                dropped = Some((payload.0, stat.name.clone()));
+            }
+            drop_highlight(ui, &response.row, dragging);
             response.row.on_hover_text(format!(
                 "{} · {}",
                 files(stat.files),
                 format::size(stat.bytes)
             ));
         }
+        // Пока тащат — и те категории, в которые в плане пока ничего не идёт.
+        if dragging {
+            ui.add_space(6.0);
+            let shown: Vec<String> = view.stats.iter().map(|s| s.name.clone()).collect();
+            let others = app
+                .sorter
+                .classifier
+                .categories()
+                .iter()
+                .chain(std::iter::once(&app.sorter.classifier.unknown().to_string()))
+                .filter(|name| !shown.contains(name))
+                .cloned()
+                .collect::<Vec<String>>();
+            for name in others {
+                let response =
+                    category_row(ui, Some(app.sorter.look(&name)), &name, 0, false, None);
+                if let Some(payload) = response.row.dnd_release_payload::<SortRowDrag>() {
+                    dropped = Some((payload.0, name.clone()));
+                }
+                drop_highlight(ui, &response.row, true);
+            }
+        }
     });
+    if let Some((index, category)) = dropped
+        && let Some(plan) = &mut view.plan
+        && plan.reassign(index, &category)
+    {
+        view.dirty = true;
+    }
+}
+
+/// Рамка вокруг категории, на которую сейчас бросят строку.
+fn drop_highlight(ui: &Ui, row: &egui::Response, dragging: bool) {
+    if dragging && row.contains_pointer() {
+        ui.painter().rect_stroke(
+            row.rect,
+            CornerRadius::same(5),
+            Stroke::new(1.5, theme::accent()),
+            egui::StrokeKind::Inside,
+        );
+    }
 }
 
 struct RowResponse {
@@ -1105,7 +1353,7 @@ fn paint_check(ui: &Ui, rect: Rect, state: Option<bool>, hovered: bool) {
 }
 
 /// Цветной значок категории.
-fn paint_chip(ui: &Ui, rect: Rect, look: Option<Look>) {
+pub fn paint_chip(ui: &Ui, rect: Rect, look: Option<Look>) {
     let painter = ui.painter();
     match look {
         Some(look) => {
@@ -1176,8 +1424,14 @@ fn table(ui: &mut Ui, view: &mut SortView, app: &FilesApp) {
             for row in rows {
                 let index = view.view[row];
                 let planned = &mut plan.moves[index];
-                let (rect, response) =
-                    ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
+                let (rect, response) = ui.allocate_exact_size(
+                    vec2(ui.available_width(), row_height),
+                    Sense::click_and_drag(),
+                );
+                // Строку можно бросить на категорию слева — поправить план руками.
+                if response.drag_started() {
+                    egui::DragAndDrop::set_payload(ui.ctx(), SortRowDrag(index));
+                }
                 if row % 2 == 1 {
                     ui.painter().rect_filled(
                         rect,
@@ -1384,4 +1638,9 @@ fn footer(ui: &mut Ui, view: &mut SortView, app: &FilesApp, actions: &mut Action
 
 fn files(n: usize) -> String {
     format!("{} {}", format::count(n), format::plural(n, "файл", "файла", "файлов"))
+}
+
+/// Ключ сравнения папок: в Windows регистр не важен.
+fn sorting_key(path: &Path) -> String {
+    mh_files_core::sorting::names::path_key(path)
 }
