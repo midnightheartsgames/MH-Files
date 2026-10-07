@@ -82,6 +82,7 @@ fn fonts() -> FontDefinitions {
     bold.extend(fallback);
     fonts.families.insert(FontFamily::Proportional, regular);
     fonts.families.insert(FontFamily::Name(BOLD.into()), bold);
+    crate::sorter::add_fonts(&mut fonts);
     fonts
 }
 

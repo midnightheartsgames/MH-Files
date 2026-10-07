@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/fs", "crates/platform", "crates/ui"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 # Крейты не публикуются: дистрибутив — один exe.
@@ -26,6 +26,12 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 encoding_rs = "0.8"
 memchr = "2"
 lru = "0.18"
+# Сортировщик (из MH Sort): порядок категорий в categories.json, обход папок, тип по содержимому.
+indexmap = { version = "2", features = ["serde"] }
+walkdir = "2"
+infer = "0.22"
+egui-phosphor = { version = "0.14", default-features = false, features = ["subset"] }
+tempfile = "3"
 # Архивы как папки: только чтение, всё на чистом Rust (без C-библиотек).
 zip = { version = "8", default-features = false, features = ["deflate-flate2-zlib-rs", "deflate64"] }
 sevenz-rust2 = { version = "0.23", default-features = false, features = ["util", "bzip2", "deflate", "ppmd"] }

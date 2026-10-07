@@ -19,6 +19,9 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             Location::Computer => {
                 ui.label(secondary(format!("Дисков: {}", app.drives.len())));
             }
+            Location::Sort { .. } => {
+                ui.label(secondary("Сортировщик: проверьте план и нажмите «Разложить»".into()));
+            }
             _ => {
                 let totals = tab.listing.totals();
                 ui.label(secondary(format::items(totals.dirs + totals.files)));

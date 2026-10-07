@@ -24,17 +24,19 @@ enum Page {
     Files,
     Preview,
     Index,
+    Sorting,
     Keys,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 7] = [
+    const ALL: [Page; 8] = [
         Page::General,
         Page::Appearance,
         Page::Files,
         Page::Preview,
         Page::Index,
+        Page::Sorting,
         Page::Keys,
         Page::About,
     ];
@@ -46,6 +48,7 @@ impl Page {
             Page::Files => "Файлы и папки",
             Page::Preview => "Предпросмотр",
             Page::Index => "Поиск по дискам",
+            Page::Sorting => "Сортировка",
             Page::Keys => "Горячие клавиши",
             Page::About => "О программе",
         }
@@ -126,6 +129,15 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     let index_status = app.indexer.status();
     let elevated = app.indexer.elevated();
     let mut rescan = false;
+    let sort_info = SortInfo {
+        path: app.sorter.path.clone(),
+        history: app.sorter.history.clone(),
+        error: app.sorter.error.clone(),
+        warnings: app.sorter.classifier.warnings.clone(),
+        categories: app.sorter.classifier.category_count(),
+        extensions: app.sorter.classifier.extension_count,
+    };
+    let mut sort_action = None;
     ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ui, class| {
         let state = &mut app.settings_window;
         if class == ViewportClass::EmbeddedWindow {
@@ -213,6 +225,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             let info = IndexInfo { status: &index_status, elevated };
                             rescan |= index(ui, state, &info);
                         }
+                        Page::Sorting => sort_action = sorting(ui, &mut state.draft, &sort_info),
                         Page::Keys => keys(ui, &mut state.keys),
                         Page::About => about(ui),
                     }
@@ -224,6 +237,23 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     }
     if rescan {
         app.indexer.rescan();
+    }
+    match sort_action {
+        Some(SortAction::Reload) => {
+            app.sorter.reload();
+            app.settings_window.status = Some(("категории перечитаны".into(), false));
+        }
+        Some(SortAction::OpenFile) => {
+            app.workers.shell(mh_files_fs::ShellJob::Open(sort_info.path.clone()));
+        }
+        Some(SortAction::OpenHistory) => {
+            let _ = std::fs::create_dir_all(&sort_info.history);
+            app.actions.push(crate::app::Action::Open {
+                location: mh_files_core::location::Location::Dir(sort_info.history.clone()),
+                target: crate::app::Target::NewTab,
+            });
+        }
+        None => {}
     }
     if app.settings_window.open && index_status.busy() {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
@@ -400,6 +430,87 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
     });
 }
 
+struct SortInfo {
+    path: std::path::PathBuf,
+    history: std::path::PathBuf,
+    error: Option<String>,
+    warnings: Vec<String>,
+    categories: usize,
+    extensions: usize,
+}
+
+enum SortAction {
+    Reload,
+    OpenFile,
+    OpenHistory,
+}
+
+/// Страница сортировщика: галочки по умолчанию и файл категорий.
+fn sorting(ui: &mut Ui, s: &mut Settings, info: &SortInfo) -> Option<SortAction> {
+    let mut action = None;
+    widgets::hint(
+        ui,
+        "Сортировщик из MH Sort раскладывает папку по категориям: Изображения, Видео, Документы… (Ctrl+Shift+O или «Разложить по папкам» в меню папки).",
+    );
+    ui.add_space(6.0);
+    card(ui, "По умолчанию", |ui| {
+        let o = &mut s.sorting;
+        switch_row(
+            ui,
+            "Папки по типам внутри категорий",
+            Some("Видео\\MP4, Видео\\MKV."),
+            &mut o.type_folders,
+        );
+        switch_row(
+            ui,
+            "Узнавать тип по содержимому",
+            Some("Для файлов без расширения или с незнакомым."),
+            &mut o.detect_content,
+        );
+        switch_row(ui, "Пропускать скрытые и системные", None, &mut o.skip_hidden);
+        switch_row(ui, "Пропускать уже разложенные папки", None, &mut o.skip_sorted);
+        switch_row(
+            ui,
+            "Удалять опустевшие папки",
+            Some("После перемещения с подпапками."),
+            &mut o.remove_empty,
+        );
+        widgets::hint(ui, "Галочки, изменённые во вкладке сортировщика, запоминаются сами.");
+    });
+    card(ui, "Категории", |ui| {
+        ui.label(format!("Категорий: {}, расширений: {}", info.categories, info.extensions));
+        if let Some(error) = &info.error {
+            ui.label(RichText::new(error).color(theme::CRITICAL));
+        }
+        for warning in &info.warnings {
+            ui.label(RichText::new(warning).color(theme::WARN));
+        }
+        widgets::hint(ui, &info.path.display().to_string());
+        widgets::hint(
+            ui,
+            "Тот же формат, что у MH Sort: файл можно перенести. При первом запуске категории берутся у установленного MH Sort.",
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Открыть categories.json").clicked() {
+                action = Some(SortAction::OpenFile);
+            }
+            if ui.button("Перечитать").clicked() {
+                action = Some(SortAction::Reload);
+            }
+        });
+    });
+    card(ui, "Журналы", |ui| {
+        widgets::hint(
+            ui,
+            "Каждая сортировка пишется в журнал — по нему работает отмена. Хранятся последние 100.",
+        );
+        if ui.button("Открыть папку журналов").clicked() {
+            action = Some(SortAction::OpenHistory);
+        }
+    });
+    action
+}
+
 struct IndexInfo<'a> {
     status: &'a mh_files_fs::IndexStatus,
     elevated: bool,
@@ -551,7 +662,7 @@ fn about(ui: &mut Ui) {
     card(ui, "Сторонние компоненты", |ui| {
         ui.label(
             RichText::new(
-                "Шрифт Cuprum — SIL Open Font License 1.1. Интерфейс — egui (MIT/Apache-2.0). Нечёткий поиск — nucleo-matcher (MPL-2.0). Архивы — zip (MIT) и sevenz-rust2 (Apache-2.0), хэш дубликатов — BLAKE3 (Apache-2.0).",
+                "Шрифт Cuprum — SIL Open Font License 1.1. Интерфейс — egui (MIT/Apache-2.0). Нечёткий поиск — nucleo-matcher (MPL-2.0). Архивы — zip (MIT) и sevenz-rust2 (Apache-2.0), хэш дубликатов — BLAKE3 (Apache-2.0). Сортировщик — из MH Sort (MIT): значки Phosphor (MIT), walkdir и infer (MIT).",
             )
             .color(theme::TEXT_SECONDARY),
         );

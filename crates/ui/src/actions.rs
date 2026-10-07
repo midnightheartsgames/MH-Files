@@ -308,6 +308,7 @@ impl FilesApp {
             Extract => in_archive || archive_selected,
             ExtractHere => archive_selected && !in_archive,
             FindDuplicates => has_dir || has_targets && !in_archive,
+            SortFolder => has_dir || tab.targets().len() == 1 && !in_archive,
             SelectExtraCopies => tab.duplicates.as_ref().is_some_and(|d| !d.groups.is_empty()),
             _ if command.needs_targets() && !has_targets => false,
             GoBack => tab.history.can_back(),
@@ -403,6 +404,7 @@ impl FilesApp {
                 self.request_folder_sizes(dirs);
             }
             Refresh => {
+                // Сортировщик: построить план заново (reload ниже так и делает).
                 self.tab_mut().reload(&workers, true);
                 if matches!(self.tab().location, Location::Computer) {
                     workers.drives();
@@ -432,6 +434,7 @@ impl FilesApp {
             Extract => self.extract_command(false),
             ExtractHere => self.extract_command(true),
             FindDuplicates => self.find_duplicates(),
+            SortFolder => self.open_sorter(),
             SelectExtraCopies => {
                 let keep = self.tab().duplicates.as_ref().map(|d| d.keep).unwrap_or_default();
                 self.select_extra_copies(keep);

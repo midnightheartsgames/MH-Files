@@ -38,6 +38,8 @@ pub enum UndoEntry {
     Ops(Vec<FileOp>),
     /// Пакетное переименование отменяется обратным планом.
     Rename(Plan),
+    /// Сортировщик отменяется по своему журналу.
+    Sort(std::path::PathBuf),
 }
 
 /// Сколько шагов помнит «Отменить».
@@ -64,6 +66,10 @@ impl Operations {
     /// Подпись следующего шага «Отменить».
     pub fn undo_label(&self) -> Option<&str> {
         self.journal.last().map(|(label, _)| label.as_str())
+    }
+
+    pub fn record_sort(&mut self, label: String, journal: std::path::PathBuf) {
+        self.record(label, UndoEntry::Sort(journal));
     }
 
     fn record(&mut self, label: String, entry: UndoEntry) {
@@ -250,6 +256,11 @@ impl FilesApp {
             UndoEntry::Rename(plan) => {
                 // Обратный план не записывается в журнал: batch остаётся пустым.
                 self.workers.batch_rename(Ticket { owner: OWNER_BATCH, generation: 1 }, plan);
+            }
+            UndoEntry::Sort(journal) => {
+                // Итог сообщит сам сортировщик, когда вернёт файлы.
+                self.undo_sort(journal);
+                return;
             }
         }
         self.set_status(format!("отменено: {label}"), Level::Info);

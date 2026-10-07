@@ -117,6 +117,14 @@ pub fn archive(painter: &Painter, rect: Rect, color: Color32) {
     painter.rect_stroke(lock, CornerRadius::same(1), stroke(rect, color), egui_inside());
 }
 
+/// Сортировщик: три полки разной длины, как разложенные по папкам файлы.
+pub fn sort(painter: &Painter, rect: Rect, color: Color32) {
+    for (y, end) in [(0.25, 0.9), (0.5, 0.7), (0.75, 0.5)] {
+        polyline(painter, rect, color, &[(0.1, y), (end, y)]);
+    }
+    polyline(painter, rect, color, &[(0.72, 0.62), (0.86, 0.76), (0.72, 0.9)]);
+}
+
 /// Дубликаты: два листа со сдвигом.
 pub fn duplicates(painter: &Painter, rect: Rect, color: Color32) {
     let back = Rect::from_min_max(p(rect, 0.3, 0.08), p(rect, 0.9, 0.7));

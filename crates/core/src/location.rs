@@ -27,6 +27,10 @@ pub enum Location {
     Duplicates {
         roots: Vec<PathBuf>,
     },
+    /// Сортировщик: разложить содержимое `root` по папкам категорий.
+    Sort {
+        root: PathBuf,
+    },
 }
 
 /// Звено строки пути.
@@ -39,6 +43,7 @@ pub struct Crumb {
 pub const COMPUTER_TITLE: &str = "Этот компьютер";
 pub const INDEX_TITLE: &str = "Поиск по дискам";
 pub const DUPLICATES_TITLE: &str = "Дубликаты";
+pub const SORT_TITLE: &str = "Разложить";
 
 impl Location {
     /// Папка, в которую можно вставлять и создавать. У поиска, архива и «Этого компьютера»
@@ -110,6 +115,7 @@ impl Location {
                 [root] => format!("{DUPLICATES_TITLE}: {}", path_label(root)),
                 _ => DUPLICATES_TITLE.to_string(),
             },
+            Location::Sort { root } => format!("{SORT_TITLE}: {}", path_label(root)),
         }
     }
 
@@ -138,6 +144,7 @@ impl Location {
                 [root] => Some(Location::Dir(root.clone())),
                 _ => Some(Location::Computer),
             },
+            Location::Sort { root } => Some(Location::Dir(root.clone())),
         }
     }
 
@@ -149,6 +156,7 @@ impl Location {
             Location::Dir(path) => path,
             Location::Search { root, .. } => root,
             Location::Archive { archive, .. } => archive.parent().unwrap_or(archive),
+            Location::Sort { root } => root,
             Location::Duplicates { roots } => match roots.as_slice() {
                 [root] => root,
                 _ => {
@@ -182,6 +190,9 @@ impl Location {
             }
             Location::Duplicates { .. } => {
                 crumbs.push(Crumb { label: DUPLICATES_TITLE.into(), location: self.clone() });
+            }
+            Location::Sort { .. } => {
+                crumbs.push(Crumb { label: SORT_TITLE.into(), location: self.clone() });
             }
             Location::Archive { archive, inner } => {
                 let root = Location::Archive { archive: archive.clone(), inner: String::new() };

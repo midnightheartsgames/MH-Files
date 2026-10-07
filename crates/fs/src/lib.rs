@@ -30,6 +30,7 @@ pub mod rename;
 pub mod search;
 pub mod shell;
 pub mod sizes;
+pub mod sorting;
 pub mod transfer;
 pub mod watch;
 
@@ -61,6 +62,11 @@ impl CancelToken {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
+    }
+
+    /// Сам флаг — для кода, который принимает `&AtomicBool` (сортировщик).
+    pub fn flag(&self) -> &AtomicBool {
+        &self.0
     }
 }
 
@@ -174,6 +180,34 @@ pub enum Event {
     Missing {
         owner: u64,
         paths: Vec<PathBuf>,
+    },
+    /// Сортировщик: сколько файлов просмотрено при построении плана.
+    SortScanProgress {
+        ticket: Ticket,
+        files: usize,
+    },
+    /// План готов (или папка не прочиталась — ошибки внутри плана).
+    SortScanned {
+        ticket: Ticket,
+        plan: mh_files_core::sorting::Plan,
+    },
+    /// Ход сортировки или отмены: сделано, всего, текущий файл.
+    SortProgress {
+        ticket: Ticket,
+        done: usize,
+        total: usize,
+        current: String,
+    },
+    /// Сортировка или отмена закончена. `journal` — журнал этой операции (для отмены).
+    SortDone {
+        ticket: Ticket,
+        report: mh_files_core::sorting::Report,
+        journal: PathBuf,
+    },
+    /// Последняя операция сортировщика, которую ещё можно отменить.
+    SortLast {
+        ticket: Ticket,
+        last: Option<(PathBuf, mh_files_core::sorting::Journal)>,
     },
 }
 
@@ -373,6 +407,109 @@ impl Workers {
             if !paths.is_empty() {
                 workers.send(Event::Missing { owner, paths });
             }
+        });
+    }
+
+    /// Построить план сортировки.
+    pub fn sort_scan(
+        &self,
+        ticket: Ticket,
+        options: mh_files_core::sorting::ScanOptions,
+        classifier: Arc<mh_files_core::sorting::Classifier>,
+    ) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("sort-scan", move |workers| {
+            let mut last = std::time::Instant::now();
+            let plan = sorting::scan(&options, &classifier, token.flag(), &mut |files| {
+                if last.elapsed() >= std::time::Duration::from_millis(100) {
+                    last = std::time::Instant::now();
+                    workers.send(Event::SortScanProgress { ticket, files });
+                }
+            });
+            if let Some(plan) = plan {
+                workers.send(Event::SortScanned { ticket, plan });
+            }
+        });
+        cancel
+    }
+
+    /// Разложить по плану; журнал — новый файл в папке журналов `history`.
+    pub fn sort_run(
+        &self,
+        ticket: Ticket,
+        mut job: sorting::SortJob,
+        history: PathBuf,
+    ) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("sort-run", move |workers| {
+            job.journal_path = sorting::new_journal_path(&history);
+            let journal = job.journal_path.clone();
+            let history = Some(history);
+            let mut last = std::time::Instant::now();
+            let report = sorting::run_sort(job, token.flag(), &mut |done, total, current| {
+                if last.elapsed() >= std::time::Duration::from_millis(80) || done == total {
+                    last = std::time::Instant::now();
+                    let current = current.to_string();
+                    workers.send(Event::SortProgress { ticket, done, total, current });
+                }
+            });
+            if let Some(history) = history {
+                sorting::prune(&history, sorting::JOURNAL_KEEP);
+            }
+            workers.send(Event::SortDone { ticket, report, journal });
+        });
+        cancel
+    }
+
+    /// Отменить операцию сортировщика по её журналу.
+    pub fn sort_undo(&self, ticket: Ticket, journal: PathBuf) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("sort-undo", move |workers| {
+            let report = match sorting::load_journal(&journal) {
+                Ok(loaded) if loaded.undone => {
+                    let action = mh_files_core::sorting::Action::Undo(loaded.mode);
+                    let mut report = mh_files_core::sorting::Report::new(action, 0);
+                    report.note = Some("эта операция уже отменена".into());
+                    report
+                }
+                Ok(loaded) => {
+                    let mut last = std::time::Instant::now();
+                    sorting::run_undo(
+                        &journal,
+                        loaded,
+                        token.flag(),
+                        &mut |done, total, current| {
+                            if last.elapsed() >= std::time::Duration::from_millis(80) {
+                                last = std::time::Instant::now();
+                                let current = current.to_string();
+                                workers.send(Event::SortProgress { ticket, done, total, current });
+                            }
+                        },
+                    )
+                }
+                Err(error) => {
+                    let mode = mh_files_core::sorting::Mode::Move;
+                    let mut report = mh_files_core::sorting::Report::new(
+                        mh_files_core::sorting::Action::Undo(mode),
+                        0,
+                    );
+                    report.note = Some(format!("журнал не прочитан: {error}"));
+                    report
+                }
+            };
+            workers.send(Event::SortDone { ticket, report, journal });
+        });
+        cancel
+    }
+
+    /// Найти последнюю операцию сортировщика, которую можно отменить.
+    pub fn sort_last(&self, ticket: Ticket, history: PathBuf) {
+        self.spawn("sort-last", move |workers| {
+            let last = sorting::last_active(&history);
+            workers.send(Event::SortLast { ticket, last });
         });
     }
 

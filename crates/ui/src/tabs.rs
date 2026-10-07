@@ -115,6 +115,8 @@ pub struct Tab {
     pub search: Option<SearchProgress>,
     pub index: Option<IndexView>,
     pub duplicates: Option<DuplicatesView>,
+    /// Сортировщик во вкладке.
+    pub sort: Option<Box<crate::sorter::SortView>>,
     /// Вид «Колонки»: какое место было в каждой колонке в прошлом кадре — чтобы прокрутить
     /// колонку к дороге сюда только при смене места.
     pub columns_shown: Vec<Option<Location>>,
@@ -177,6 +179,7 @@ impl Tab {
             search: None,
             index: None,
             duplicates: None,
+            sort: None,
             columns_shown: Vec::new(),
             select_first: false,
             rename: None,
@@ -321,6 +324,17 @@ impl Tab {
                 };
                 self.cancel = Some(workers.duplicates(ticket, roots, options));
             }
+            Location::Sort { .. } => {
+                // План строит окно в конце кадра: категории и галочки — у него.
+                self.watch = None;
+                self.staging = None;
+                self.listing.reset();
+                self.listing.finish(Ok(()));
+                match &mut self.sort {
+                    Some(view) => view.rescan(),
+                    None => self.sort = Some(Box::new(crate::sorter::SortView::new())),
+                }
+            }
             Location::Index { query } => {
                 // Сам поиск запускает окно в конце кадра: у вкладки нет доступа к индексу.
                 self.watch = None;
@@ -343,6 +357,9 @@ impl Tab {
         }
         if !matches!(self.location, Location::Duplicates { .. }) {
             self.duplicates = None;
+        }
+        if !matches!(self.location, Location::Sort { .. }) {
+            self.sort = None;
         }
     }
 

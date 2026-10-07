@@ -32,6 +32,42 @@ pub struct Settings {
     pub index: IndexSettings,
     /// Сохранённые поиски по дискам, показываются в боковой панели.
     pub saved_searches: Vec<SavedSearch>,
+    pub sorting: SortSettings,
+}
+
+/// Сортировщик (из MH Sort): галочки, с которыми открывается вкладка «Разложить».
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SortSettings {
+    pub mode: crate::sorting::Mode,
+    /// Разбирать и вложенные папки.
+    pub recursive: bool,
+    /// Внутри категории — папки типов: `Видео\MP4`.
+    pub type_folders: bool,
+    /// Не заходить в уже разложенные папки категорий.
+    pub skip_sorted: bool,
+    /// Удалять папки, опустевшие после перемещения.
+    pub remove_empty: bool,
+    pub skip_hidden: bool,
+    /// Узнавать тип файла без расширения по его содержимому.
+    pub detect_content: bool,
+    /// Имена папок, в которые сортировщик не заходит.
+    pub excluded: Vec<String>,
+}
+
+impl Default for SortSettings {
+    fn default() -> SortSettings {
+        SortSettings {
+            mode: crate::sorting::Mode::Move,
+            recursive: false,
+            type_folders: true,
+            skip_sorted: true,
+            remove_empty: false,
+            skip_hidden: true,
+            detect_content: true,
+            excluded: Vec::new(),
+        }
+    }
 }
 
 /// Индекс дисков для поиска «везде».
@@ -159,6 +195,7 @@ impl Default for Settings {
             terminal: String::new(),
             index: IndexSettings::default(),
             saved_searches: Vec::new(),
+            sorting: SortSettings::default(),
         }
     }
 }
