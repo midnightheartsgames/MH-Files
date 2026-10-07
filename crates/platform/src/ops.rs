@@ -64,6 +64,11 @@ pub enum FileOp {
         parent: PathBuf,
         name: String,
     },
+    /// Вернуть из корзины: `(где лежит в корзине, откуда удалили)`. Так отменяется удаление
+    /// в корзину: путь в `$Recycle.Bin` сообщает `IFileOperation` при удалении.
+    Restore {
+        items: Vec<(PathBuf, PathBuf)>,
+    },
 }
 
 impl FileOp {
@@ -92,6 +97,7 @@ impl FileOp {
             }
             FileOp::Rename { new_name, .. } => format!("Переименование в «{new_name}»"),
             FileOp::NewFolder { name, .. } => format!("Новая папка «{name}»"),
+            FileOp::Restore { items } => format!("Из корзины: {}", count(items.len())),
         }
     }
 
@@ -110,14 +116,18 @@ impl FileOp {
             FileOp::Delete { paths, .. } => parents(paths),
             FileOp::Rename { path, .. } => parents(std::slice::from_ref(path)),
             FileOp::NewFolder { parent, .. } => vec![parent.clone()],
+            FileOp::Restore { items } => items
+                .iter()
+                .filter_map(|(_, original)| original.parent().map(PathBuf::from))
+                .collect(),
         };
         dirs.sort();
         dirs.dedup();
         dirs
     }
 
-    /// Обратные операции для «Отменить» по итогу этой. `None` — отменить нельзя (корзину
-    /// возвращает Проводник, удаление насовсем не вернуть).
+    /// Обратные операции для «Отменить» по итогу этой. `None` — отменить нельзя (удаление
+    /// насовсем не вернуть; удаление в корзину — только если Windows сказала, куда положила).
     pub fn inverse(&self, outcome: &OpOutcome) -> Option<Vec<FileOp>> {
         let OpOutcome::Done { created, pairs } = outcome else { return None };
         // Заменённые файлы не вернуть: отмена удалила бы и новые — без отмены надёжнее.
@@ -131,6 +141,11 @@ impl FileOp {
                 let (from, to) = pairs.first()?;
                 let name = from.file_name()?.to_string_lossy().into_owned();
                 Some(vec![FileOp::Rename { path: to.clone(), new_name: name }])
+            }
+            // Пары удаления — «откуда → где в корзине».
+            FileOp::Delete { permanent: false, .. } if !pairs.is_empty() => {
+                let items = pairs.iter().map(|(from, to)| (to.clone(), from.clone())).collect();
+                Some(vec![FileOp::Restore { items }])
             }
             FileOp::NewFolder { .. } | FileOp::Copy { .. } if !created.is_empty() => {
                 Some(vec![FileOp::Delete { paths: created.clone(), permanent: false }])
@@ -180,6 +195,9 @@ impl FileOp {
             FileOp::Delete { paths, .. } => paths.clone(),
             FileOp::Rename { path, new_name } => vec![path.clone(), path.with_file_name(new_name)],
             FileOp::NewFolder { parent, name } => vec![parent.join(name)],
+            FileOp::Restore { items } => {
+                items.iter().flat_map(|(bin, original)| [bin.clone(), original.clone()]).collect()
+            }
         }
     }
 
@@ -187,6 +205,14 @@ impl FileOp {
     pub fn has_long_paths(&self) -> bool {
         self.paths().iter().any(|path| path_units(path) > LEGACY_MAX_PATH)
     }
+}
+
+/// Файл сведений корзины для объекта в ней: `$RXXXXXX.ext` ↔ `$IXXXXXX.ext` (там исходный
+/// путь и время удаления). Без своего объекта он оставил бы в корзине пустую строку.
+pub(crate) fn recycle_info_file(bin: &Path) -> Option<PathBuf> {
+    let name = bin.file_name()?.to_str()?;
+    let rest = name.strip_prefix("$R")?;
+    Some(bin.with_file_name(format!("$I{rest}")))
 }
 
 /// Предел пути для Shell.
@@ -523,6 +549,30 @@ mod portable {
                 fs::create_dir(&target).map_err(|e| describe(&target, e))?;
                 Ok(OpOutcome::done(vec![target], Vec::new()))
             }
+            FileOp::Restore { items } => {
+                let mut meter = Meter { done: 0, total: items.len() as u64, report };
+                let mut pairs = Vec::new();
+                for (bin, original) in items {
+                    if !control.checkpoint() {
+                        return Err(Stop::Cancelled);
+                    }
+                    // Занятое имя не перезаписывается: вернуть на место можно и руками.
+                    if original.exists() {
+                        return Err(Stop::Failed(format!(
+                            "на месте восстанавливаемого уже есть {}",
+                            original.display()
+                        )));
+                    }
+                    fs::rename(bin, original).map_err(|e| describe(bin, e))?;
+                    if let Some(info) = super::recycle_info_file(bin) {
+                        let _ = fs::remove_file(info);
+                    }
+                    meter.add(1, original);
+                    pairs.push((bin.clone(), original.clone()));
+                }
+                let created = pairs.iter().map(|(_, to)| to.clone()).collect();
+                Ok(OpOutcome::done(created, pairs))
+            }
         }
     }
 
@@ -807,6 +857,46 @@ mod tests {
         let delete = FileOp::Delete { paths: vec![p("/a")], permanent: false };
         assert_eq!(delete.inverse(&OpOutcome::done(vec![], vec![])), None);
         assert_eq!(rename.inverse(&OpOutcome::Aborted), None);
+        // Корзина сообщила, куда положила объект, — отмена возвращает его.
+        let bin = p("/$Recycle.Bin/S-1/$RAB12CD.txt");
+        let done = OpOutcome::done(vec![], vec![(p("/a"), bin.clone())]);
+        assert_eq!(
+            delete.inverse(&done),
+            Some(vec![FileOp::Restore { items: vec![(bin, p("/a"))] }])
+        );
+        let permanent = FileOp::Delete { paths: vec![p("/a")], permanent: true };
+        assert_eq!(permanent.inverse(&done), None, "удалённое насовсем не вернуть");
+    }
+
+    #[test]
+    fn restore_moves_back_and_drops_info_file() {
+        let dir = temp_dir("restore");
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        std::fs::write(bin.join("$RAB12CD.txt"), "x").unwrap();
+        std::fs::write(bin.join("$IAB12CD.txt"), "info").unwrap();
+        std::fs::write(dir.join("home/taken.txt"), "busy").unwrap();
+        std::fs::write(bin.join("$RZZ.txt"), "y").unwrap();
+        let back = dir.join("home/a.txt");
+        let op = FileOp::Restore { items: vec![(bin.join("$RAB12CD.txt"), back.clone())] };
+        let outcome = exec(&op).unwrap();
+        assert_eq!(
+            outcome,
+            OpOutcome::done(vec![back.clone()], vec![(bin.join("$RAB12CD.txt"), back.clone())])
+        );
+        assert_eq!(std::fs::read_to_string(&back).unwrap(), "x");
+        assert!(!bin.join("$IAB12CD.txt").exists(), "сведения корзины убраны");
+        let op =
+            FileOp::Restore { items: vec![(bin.join("$RZZ.txt"), dir.join("home/taken.txt"))] };
+        assert!(exec(&op).is_err(), "занятое имя не перезаписывается");
+        assert_eq!(std::fs::read_to_string(dir.join("home/taken.txt")).unwrap(), "busy");
+        assert_eq!(
+            recycle_info_file(Path::new("C:/x/$R1.png")),
+            Some(PathBuf::from("C:/x/$I1.png"))
+        );
+        assert_eq!(recycle_info_file(Path::new("C:/x/a.png")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

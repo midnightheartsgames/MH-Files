@@ -77,6 +77,16 @@ pub struct DragFiles {
     pub paths: Vec<PathBuf>,
     /// Тащат из архива: бросок извлекает, а не копирует.
     pub archive: Option<PathBuf>,
+    /// Тащат правой кнопкой: при отпускании — меню «Копировать / Переместить / Ярлыки».
+    pub right: bool,
+}
+
+/// Меню после броска правой кнопкой, как в Проводнике.
+pub struct DropMenu {
+    pub paths: Vec<PathBuf>,
+    pub dest: PathBuf,
+    pub archive: Option<PathBuf>,
+    pub at: egui::Pos2,
 }
 
 /// Куда можно бросить файлы: папка-строка, вкладка, пункт боковой панели.
@@ -253,6 +263,7 @@ pub struct FilesApp {
     /// Куда бросят, если отпустить сейчас (по прошлому кадру) — для подсветки.
     pub drop_hover: Option<PathBuf>,
     pub crumb_menu: Option<CrumbMenu>,
+    pub drop_menu: Option<DropMenu>,
     pub columns: Columns,
     /// Первый шаг последовательности клавиш и когда он нажат.
     pub pending_chord: Option<(egui::KeyboardShortcut, Instant)>,
@@ -333,6 +344,7 @@ impl FilesApp {
             drop_zones: Vec::new(),
             drop_hover: None,
             crumb_menu: None,
+            drop_menu: None,
             columns: Columns::default(),
             pending_chord: None,
             folder_sizes: HashMap::new(),
@@ -948,6 +960,7 @@ impl FilesApp {
             });
 
         pane_view::crumb_menu(&ctx, self);
+        self.show_drop_menu(&ctx);
         if let Some(mut palette) = self.palette.take()
             && palette::show(&ctx, self, &mut palette)
         {
@@ -1126,6 +1139,15 @@ impl FilesApp {
             if let (Some(payload), Some(pos)) = (payload, pointer)
                 && let Some(zone) = self.zone_at(pos).cloned()
             {
+                if payload.right && zone.favorite_group.is_none() {
+                    self.drop_menu = Some(DropMenu {
+                        paths: payload.paths.clone(),
+                        dest: zone.dir,
+                        archive: payload.archive.clone(),
+                        at: pos,
+                    });
+                    return;
+                }
                 match &payload.archive {
                     Some(archive) if zone.favorite_group.is_none() => {
                         self.extract_drop(archive.clone(), payload.paths.clone(), zone.dir)
@@ -1166,7 +1188,10 @@ impl FilesApp {
                 Some(pos) => !window.contains(pos),
                 None => true,
             };
-            (left || i.pointer.hover_pos().is_none(), i.pointer.primary_down())
+            (
+                left || i.pointer.hover_pos().is_none(),
+                i.pointer.primary_down() || i.pointer.secondary_down(),
+            )
         });
         if !(outside && down) {
             return false;
@@ -1176,7 +1201,7 @@ impl FilesApp {
             return false;
         }
         let Some(payload) = egui::DragAndDrop::take_payload::<DragFiles>(ctx) else { return false };
-        match mh_files_platform::dnd::drag_out(&payload.paths) {
+        match mh_files_platform::dnd::drag_out(&payload.paths, payload.right) {
             Ok(mh_files_platform::dnd::DropEffect::Move) => {
                 let dirs: Vec<PathBuf> =
                     payload.paths.iter().filter_map(|p| p.parent().map(PathBuf::from)).collect();
@@ -1186,6 +1211,62 @@ impl FilesApp {
             Err(error) => self.set_status(error, Level::Error),
         }
         true
+    }
+
+    /// Меню броска правой кнопкой: «Копировать сюда», «Переместить сюда», «Создать ярлыки»;
+    /// для файлов из архива — «Извлечь сюда».
+    fn show_drop_menu(&mut self, ctx: &egui::Context) {
+        let Some(menu) = &self.drop_menu else { return };
+        let mut choice = None;
+        let in_archive = menu.archive.is_some();
+        let area = egui::Area::new(Id::new("drop-menu"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(menu.at)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.set_min_width(190.0);
+                    let mut item = |ui: &mut egui::Ui, text: &str, value: u8| {
+                        if ui.add(egui::Button::new(text).frame(false)).clicked() {
+                            choice = Some(value);
+                        }
+                    };
+                    if in_archive {
+                        item(ui, "Извлечь сюда", 1);
+                    } else {
+                        item(ui, "Копировать сюда", 1);
+                        item(ui, "Переместить сюда", 2);
+                        item(ui, "Создать ярлыки", 3);
+                    }
+                    ui.separator();
+                    item(ui, "Отмена", 0);
+                });
+            });
+        let pressed_outside = ctx.input(|i| i.pointer.any_pressed())
+            && !area.response.contains_pointer()
+            && area.response.rect.width() > 0.0;
+        let escape = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if choice.is_none() && !pressed_outside && !escape {
+            return;
+        }
+        let Some(menu) = self.drop_menu.take() else { return };
+        match (choice, menu.archive) {
+            (Some(1), Some(archive)) => self.extract_drop(archive, menu.paths, menu.dest),
+            (Some(1), None) => self.actions.push(Action::Drop {
+                paths: menu.paths,
+                dest: menu.dest,
+                copy: Some(true),
+            }),
+            (Some(2), None) => self.actions.push(Action::Drop {
+                paths: menu.paths,
+                dest: menu.dest,
+                copy: Some(false),
+            }),
+            (Some(3), None) => self.workers.shell(mh_files_fs::ShellJob::CreateShortcuts {
+                targets: menu.paths,
+                dest: menu.dest,
+            }),
+            _ => {}
+        }
     }
 
     /// Куда встанет перетаскиваемая вкладка, если отпустить в `pos`.

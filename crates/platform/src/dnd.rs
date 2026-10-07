@@ -17,15 +17,17 @@ pub enum DropEffect {
     Link,
 }
 
-/// Начать перетаскивание файлов наружу. Кнопка мыши должна быть нажата.
-pub fn drag_out(paths: &[PathBuf]) -> Result<DropEffect, String> {
+/// Начать перетаскивание файлов наружу. Кнопка мыши должна быть нажата. `right` — тащат
+/// правой кнопкой: получатель (Проводник, рабочий стол) при отпускании сам спросит
+/// «Копировать / Переместить / Создать ярлыки».
+pub fn drag_out(paths: &[PathBuf], right: bool) -> Result<DropEffect, String> {
     #[cfg(windows)]
     {
-        crate::win::dnd::drag_out(paths)
+        crate::win::dnd::drag_out(paths, right)
     }
     #[cfg(not(windows))]
     {
-        let _ = paths;
+        let _ = (paths, right);
         Err("перетаскивание в другие программы есть только в Windows".into())
     }
 }

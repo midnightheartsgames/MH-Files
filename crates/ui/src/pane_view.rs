@@ -1349,7 +1349,11 @@ pub(crate) fn item(
             Location::Archive { archive, .. } => Some(archive.clone()),
             _ => None,
         };
-        egui::DragAndDrop::set_payload(ui.ctx(), DragFiles { paths: tab.targets(), archive });
+        let right = response.drag_started_by(egui::PointerButton::Secondary);
+        egui::DragAndDrop::set_payload(
+            ui.ctx(),
+            DragFiles { paths: tab.targets(), archive, right },
+        );
     }
     if entry.is_dir() {
         app.drop_zones.push(DropZone {

@@ -5,16 +5,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use windows::Win32::Foundation::ERROR_CANCELLED;
-use windows::Win32::System::Com::IDataObject;
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, CoCreateInstance, IDataObject, IPersistFile,
+};
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    BHID_DataObject, ILCreateFromPathW, ILFree, IShellItemArray, OAIF_ALLOW_REGISTRATION,
-    OAIF_EXEC, OAIF_REGISTER_EXT, OPENASINFO, SEE_MASK_INVOKEIDLIST, SEE_MASK_NOASYNC,
-    SHCreateShellItemArrayFromIDLists, SHELLEXECUTEINFOW, SHMultiFileProperties,
-    SHOpenFolderAndSelectItems, SHOpenWithDialog, ShellExecuteExW,
+    BHID_DataObject, ILCreateFromPathW, ILFree, IShellItemArray, IShellLinkW,
+    OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OAIF_REGISTER_EXT, OPENASINFO, SEE_MASK_INVOKEIDLIST,
+    SEE_MASK_NOASYNC, SHCreateShellItemArrayFromIDLists, SHELLEXECUTEINFOW, SHMultiFileProperties,
+    SHOpenFolderAndSelectItems, SHOpenWithDialog, ShellExecuteExW, ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HRESULT, PCWSTR, w};
+use windows::core::{HRESULT, Interface, PCWSTR, w};
 
 use super::com::{Apartment, describe, owner_hwnd, wide};
 
@@ -141,6 +143,28 @@ pub fn reveal_in_explorer(path: &Path) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("Проводник не запущен: {error}"))
+}
+
+/// Ярлык `.lnk` на `target` по пути `link`.
+pub fn create_shortcut(target: &Path, link: &Path) -> Result<(), String> {
+    let _com = Apartment::sta();
+    let target_w = wide(target);
+    let link_w = wide(link);
+    let failed = |error: &windows::core::Error| {
+        describe(&format!("ярлык {} не создан", link.display()), error)
+    };
+    // SAFETY: строки живут до конца вызовов; COM-объекты освобождаются при выходе.
+    unsafe {
+        let shell_link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).map_err(|e| failed(&e))?;
+        shell_link.SetPath(PCWSTR(target_w.as_ptr())).map_err(|e| failed(&e))?;
+        if let Some(dir) = target.parent() {
+            let dir_w = wide(dir);
+            let _ = shell_link.SetWorkingDirectory(PCWSTR(dir_w.as_ptr()));
+        }
+        let file: IPersistFile = shell_link.cast().map_err(|e| failed(&e))?;
+        file.Save(PCWSTR(link_w.as_ptr()), true).map_err(|e| failed(&e))
+    }
 }
 
 /// Отмена пользователем — не ошибка.

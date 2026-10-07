@@ -152,6 +152,7 @@ pub fn sync_host(ctx: &egui::Context, app: &mut FilesApp) {
         || app.batch.is_some()
         || app.quick.is_some()
         || app.crumb_menu.is_some()
+        || app.drop_menu.is_some()
         || egui::Popup::is_any_open(ctx)
         || egui::DragAndDrop::has_any_payload(ctx);
     let state = &mut app.inspector;
