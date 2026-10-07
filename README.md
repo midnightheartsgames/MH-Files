@@ -90,7 +90,8 @@ Electron/WebView и фоновых служб.
 
 ## Установка
 
-Из артефакта CI (`release`) или `tools\build-release.ps1`:
+Со страницы [Releases](https://github.com/midnightheartsgames/MH-Files/releases), из артефакта CI
+(`release`) или `tools\build-release.ps1`:
 
 * `MH-Files-<версия>-setup.exe` — установка в `%LOCALAPPDATA%\Programs\MH Files`, без UAC;
 * `MH-Files-<версия>-portable.zip` — распаковать куда угодно, хоть на флешку.

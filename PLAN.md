@@ -633,6 +633,10 @@ cargo build --release                                     # на Windows: MH-Fil
 стоит Inno Setup 6), переносной `MH-Files-<версия>-portable.zip` и exe с PDB. CI (job
 `release`) делает то же и выкладывает артефактом.
 
+Выпуск: поднять `version` в `Cargo.toml`, написать `docs/releases/<версия>.md` и влить в
+`main`. Job `publish` публикует GitHub Release `v<версия>` (тег — на этот коммит) с
+установщиком, zip и `SHA256SUMS.txt`, если такого выпуска ещё нет; версия с `-` — пред-выпуск.
+
 Под Linux программа запускается для проверки интерфейса (нужны `libxkbcommon-x11`, X11 или
 Wayland). Настройки: `%APPDATA%\MH Files\settings.json` и `session.json`
 (`~/.config/mh-files` вне Windows); в переносном режиме — `data` рядом с exe. Там же
