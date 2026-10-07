@@ -157,7 +157,7 @@ pub fn render_svg(data: &[u8], max_side: u32) -> Result<(Bitmap, (u32, u32)), St
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     // tiny-skia отдаёт premultiplied alpha, а картинки здесь — с обычной.
     let mut rgba = pixmap.take();
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         let alpha = u16::from(pixel[3]);
         if alpha != 0 && alpha != 255 {
             for channel in &mut pixel[..3] {
