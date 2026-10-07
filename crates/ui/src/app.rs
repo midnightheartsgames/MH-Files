@@ -269,6 +269,8 @@ pub struct FilesApp {
     pub columns: Columns,
     /// Первый шаг последовательности клавиш и когда он нажат.
     pub pending_chord: Option<(egui::KeyboardShortcut, Instant)>,
+    /// Ctrl+прокрутка, не дотянувшая до шага масштаба, и время последней (`input.time`).
+    pub zoom_rest: (f32, f64),
     /// Посчитанные размеры папок (целиком) и те, что ещё считаются.
     pub folder_sizes: HashMap<PathBuf, DirSize>,
     pub sizes_pending: HashSet<PathBuf>,
@@ -350,6 +352,7 @@ impl FilesApp {
             drop_menu: None,
             columns: Columns::default(),
             pending_chord: None,
+            zoom_rest: (0.0, 0.0),
             folder_sizes: HashMap::new(),
             sizes_pending: HashSet::new(),
             sizes_cancel: None,
@@ -1549,7 +1552,7 @@ fn apply_sizes(tab: &mut Tab, sizes: &HashMap<PathBuf, DirSize>) {
     }
 }
 
-/// Корни дисков без опроса: показать сразу, пока идёт опрос.
+/// Подпись диска: «C: Локальный диск», «D: Фото».
 pub fn drive_title(drive: &DriveInfo) -> String {
     let root = mh_files_core::location::path_label(&drive.root);
     let kind = match drive.kind {
@@ -1559,7 +1562,8 @@ pub fn drive_title(drive: &DriveInfo) -> String {
         _ => "Локальный диск",
     };
     let label = if drive.label.is_empty() { kind } else { drive.label.as_str() };
-    format!("{label} ({root})")
+    // Буква первой: диски в списке выравниваются по ней и ищутся с первого символа.
+    format!("{root} {label}")
 }
 
 /// Корень диска для пути: по нему решается «переместить или копировать» при перетаскивании.

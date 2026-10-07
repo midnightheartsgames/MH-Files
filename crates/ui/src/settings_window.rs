@@ -144,6 +144,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     }
     let builder = ViewportBuilder::default()
         .with_title("MH Files — настройки")
+        .with_icon(crate::settings_icon())
         .with_inner_size([900.0, 620.0])
         .with_min_inner_size([760.0, 480.0]);
     let mut applied: Option<(Settings, Option<mh_files_core::sorting::Config>)> = None;
