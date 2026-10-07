@@ -4,9 +4,7 @@
 
 use std::path::PathBuf;
 
-use eframe::egui::{
-    self, Align2, Color32, CornerRadius, Id, Key, RichText, Stroke, TextureHandle, vec2,
-};
+use eframe::egui::{self, Color32, CornerRadius, Id, Key, RichText, Stroke, TextureHandle, vec2};
 use mh_files_core::Entry;
 use mh_files_core::format;
 use mh_files_core::selection::Modifiers;
@@ -143,82 +141,74 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     let mut turn = None;
     let screen = ctx.content_rect();
     let mut keep = true;
-    egui::Area::new(Id::new("quick-backdrop"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(screen.min)
-        .show(ctx, |ui| {
-            let response = ui.allocate_rect(screen, egui::Sense::click());
-            ui.painter().rect_filled(screen, CornerRadius::ZERO, Color32::from_black_alpha(190));
-            if response.clicked() {
-                keep = false;
-            }
-        });
     let size = vec2(screen.width() * 0.86, screen.height() * 0.86);
-    egui::Area::new(Id::new("quick-view"))
-        .order(egui::Order::Foreground)
-        .anchor(Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .show(ctx, |ui| {
+    // Затемнение и карточка — один слой (Modal). Двумя Area порядок слоёв в памяти egui
+    // переворачивался после щелчка по затемнению, и при следующем открытии затемнение
+    // ложилось поверх карточки: всё темнело, любой щелчок закрывал просмотр.
+    let modal = egui::Modal::new(Id::new("quick-view"))
+        .backdrop_color(Color32::from_black_alpha(190))
+        .frame(
             egui::Frame::new()
                 .fill(theme::PANEL)
                 .stroke(Stroke::new(1.0, theme::CARD_STROKE))
                 .corner_radius(CornerRadius::same(8))
-                .inner_margin(egui::Margin::same(14))
-                .show(ui, |ui| {
-                    ui.set_width(size.x);
-                    ui.set_height(size.y);
-                    let tab = app.tab();
-                    let name = quick
-                        .path
-                        .as_ref()
-                        .map(|p| mh_files_core::location::path_label(p))
-                        .unwrap_or_default();
-                    let index = tab.selection.cursor_row(&tab.listing).map_or(0, |r| r + 1);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(name).font(theme::bold(18.0)));
-                        if let Some(entry) = quick.path.as_ref().and_then(|p| tab.entry(p))
-                            && !entry.is_dir()
-                        {
-                            ui.label(
-                                RichText::new(format::size(entry.size))
-                                    .color(theme::TEXT_SECONDARY),
-                            );
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{index} / {}   стрелки — листать, {}пробел — закрыть",
-                                    tab.listing.len(),
-                                    if quick.player.is_some() {
-                                        "Enter — пауза, Shift+стрелки — перемотка, "
-                                    } else {
-                                        ""
-                                    }
-                                ))
-                                .color(theme::TEXT_DISABLED),
-                            );
-                        });
-                    });
-                    ui.add_space(10.0);
-                    let height = ui.available_height() - 10.0;
-                    let playing =
-                        quick.player.as_ref().is_some_and(|player| player.state().error.is_none());
-                    if playing {
-                        media(ui, &mut quick, height);
-                    } else {
-                        if let Some(error) = quick.player.as_ref().and_then(|p| p.state().error) {
-                            ui.label(RichText::new(error).color(theme::TEXT_DISABLED));
-                            ui.add_space(6.0);
-                        }
-                        turn = preview_ui::show(
-                            ui,
-                            quick.preview.as_ref(),
-                            quick.texture.as_ref(),
-                            height,
-                            "quick-text",
-                        );
-                    }
+                .inner_margin(egui::Margin::same(14)),
+        )
+        .show(ctx, |ui| {
+            ui.set_width(size.x);
+            ui.set_height(size.y);
+            let tab = app.tab();
+            let name = quick
+                .path
+                .as_ref()
+                .map(|p| mh_files_core::location::path_label(p))
+                .unwrap_or_default();
+            let index = tab.selection.cursor_row(&tab.listing).map_or(0, |r| r + 1);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).font(theme::bold(18.0)));
+                if let Some(entry) = quick.path.as_ref().and_then(|p| tab.entry(p))
+                    && !entry.is_dir()
+                {
+                    ui.label(RichText::new(format::size(entry.size)).color(theme::TEXT_SECONDARY));
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "{index} / {}   стрелки — листать, {}пробел — закрыть",
+                            tab.listing.len(),
+                            if quick.player.is_some() {
+                                "Enter — пауза, Shift+стрелки — перемотка, "
+                            } else {
+                                ""
+                            }
+                        ))
+                        .color(theme::TEXT_DISABLED),
+                    );
                 });
+            });
+            ui.add_space(10.0);
+            let height = ui.available_height() - 10.0;
+            let playing =
+                quick.player.as_ref().is_some_and(|player| player.state().error.is_none());
+            if playing {
+                media(ui, &mut quick, height);
+            } else {
+                if let Some(error) = quick.player.as_ref().and_then(|p| p.state().error) {
+                    ui.label(RichText::new(error).color(theme::TEXT_DISABLED));
+                    ui.add_space(6.0);
+                }
+                turn = preview_ui::show(
+                    ui,
+                    quick.preview.as_ref(),
+                    quick.texture.as_ref(),
+                    height,
+                    "quick-text",
+                );
+            }
         });
+    if modal.backdrop_response.clicked() {
+        keep = false;
+    }
     // PageUp/PageDown листают страницы PDF.
     if let Some(Preview::Image { pages: Some((page, count)), .. }) = &quick.preview {
         let (page, count) = (*page, *count);
