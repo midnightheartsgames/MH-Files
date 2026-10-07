@@ -105,3 +105,56 @@ jobs:
           name: MH-Files-${{ github.sha }}
           path: target/dist/
           if-no-files-found: error
+
+  publish:
+    # Выпуск на GitHub Releases: на main, когда для версии из Cargo.toml ещё нет выпуска
+    # v<версия>. Тег ставится на этот коммит; версия с `-` (rc, beta) — пред-выпуск.
+    # Заметки — docs/releases/<версия>.md: без них выпуск не публикуется.
+    needs: release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Версия
+        id: version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          test -n "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh release view "v$version" > /dev/null 2>&1; then
+            echo "Выпуск v$version уже есть — пропуск"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            test -f "docs/releases/$version.md" || { echo "::error::нет docs/releases/$version.md"; exit 1; }
+          fi
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        if: steps.version.outputs.exists != 'true'
+        with:
+          name: MH-Files-${{ github.sha }}
+          path: dist
+
+      - name: Выпуск
+        if: steps.version.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          cd dist
+          files=("MH-Files-$VERSION-setup.exe" "MH-Files-$VERSION-portable.zip")
+          ls -l "${files[@]}"
+          sha256sum "${files[@]}" > SHA256SUMS.txt
+          prerelease=()
+          [[ "$VERSION" == *-* ]] && prerelease=(--prerelease)
+          gh release create "v$VERSION" "${files[@]}" SHA256SUMS.txt \
+            --target "$GITHUB_SHA" \
+            --title "MH Files $VERSION" \
+            --notes-file "../docs/releases/$VERSION.md" \
+            "${prerelease[@]}"
