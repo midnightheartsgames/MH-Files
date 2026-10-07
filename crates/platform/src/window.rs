@@ -14,6 +14,18 @@ pub fn owner_window() -> isize {
     OWNER.load(Ordering::Relaxed)
 }
 
+/// Время двойного щелчка из настроек Windows (по умолчанию 500 мс).
+pub fn double_click_time() -> std::time::Duration {
+    #[cfg(windows)]
+    {
+        crate::win::window::double_click_time()
+    }
+    #[cfg(not(windows))]
+    {
+        std::time::Duration::from_millis(500)
+    }
+}
+
 /// Видна ли точка экрана хоть на одном мониторе: сохранённое положение окна могло остаться на
 /// отключённом мониторе.
 pub fn point_on_screen(x: i32, y: i32) -> bool {

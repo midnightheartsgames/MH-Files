@@ -303,6 +303,9 @@ impl FilesApp {
         let _ = startup.repaint.set(cc.egui_ctx.clone());
         theme::set_accent(settings.appearance.accent);
         theme::install(&cc.egui_ctx);
+        // Двойной щелчок — по настройке Windows, как и переименование вторым щелчком.
+        let double_click = crate::pane_view::double_click_time().as_secs_f64();
+        cc.egui_ctx.options_mut(|o| o.input_options.max_double_click_delay = double_click);
         cc.egui_ctx.set_zoom_factor(settings.appearance.font_scale);
         set_owner_window(cc);
 

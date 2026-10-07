@@ -50,10 +50,58 @@ pub fn show(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
     let rect = ui.available_rect_before_wrap();
     let mut content =
         ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::top_down(Align::Min)));
+    // Любое нажатие или клавиша отменяет ждущее переименование; новое взводится ниже, в строке.
+    if ui.input(|i| {
+        i.pointer.any_pressed()
+            || i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)))
+    }) {
+        tab.slow_click = None;
+    }
     match &tab.location {
         Location::Computer => computer_view(&mut content, app),
         Location::Sort { .. } => crate::sorter::show(&mut content, tab, app),
         _ => list_view(&mut content, pane_id, tab, app, focused),
+    }
+    slow_click_rename(ui, pane_id, tab, app);
+}
+
+/// Время двойного щелчка Windows: дольше — второй щелчок по имени начинает переименование.
+pub fn double_click_time() -> std::time::Duration {
+    static TIME: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *TIME.get_or_init(mh_files_platform::window::double_click_time)
+}
+
+/// Второй щелчок по имени выделенного объекта (как в Проводнике): прошло время двойного
+/// щелчка, ничего другого не случилось — переименовать.
+fn slow_click_rename(ui: &Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app: &FilesApp) {
+    let Some(crate::tabs::SlowClick { path, due: Some(due) }) = tab.slow_click.clone() else {
+        return;
+    };
+    let still = app.focused == pane
+        && tab.rename.is_none()
+        && tab.band.is_none()
+        && tab.selection.len() == 1
+        && tab.selection.is_selected(&path)
+        && tab.selection.cursor() == Some(&path)
+        && tab.entry(&path).is_some()
+        && app.quick.is_none()
+        && app.palette.is_none()
+        && app.dialog.is_none()
+        && app.batch.is_none()
+        && !egui::Popup::is_any_open(ui.ctx())
+        && !egui::DragAndDrop::has_any_payload(ui.ctx())
+        && ui.input(|i| i.focused);
+    let now = std::time::Instant::now();
+    if !still {
+        tab.slow_click = None;
+    } else if now >= due {
+        tab.start_rename(path);
+        // Поле ввода появится в следующем кадре — сам он без событий не наступит.
+        ui.ctx().request_repaint();
+    } else {
+        ui.ctx().request_repaint_after(due - now);
     }
 }
 
@@ -1292,6 +1340,8 @@ pub(crate) fn item(
     let shown_name = display_name(&entry, app.settings.files.show_extensions);
     let renaming = tab.rename.as_ref().is_some_and(|r| r.path == path);
 
+    // Где на экране имя: второй щелчок по нему начинает переименование.
+    let mut name_hit = Rect::NOTHING;
     match look {
         Look::Row { search } => {
             let layout = column_layout(app, rect.left(), rect.width() - 12.0, search);
@@ -1310,11 +1360,9 @@ pub(crate) fn item(
             } else {
                 let galley =
                     elided(ui, &shown_name, row_font(app, 14.0), text_color, name_rect.width());
-                painter.galley(
-                    pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0),
-                    galley,
-                    text_color,
-                );
+                let at = pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0);
+                name_hit = Rect::from_min_size(at, galley.size());
+                painter.galley(at, galley, text_color);
             }
             let secondary = theme::TEXT_SECONDARY;
             let font = row_font(app, 13.0);
@@ -1380,11 +1428,9 @@ pub(crate) fn item(
             } else {
                 let galley =
                     elided(ui, &shown_name, row_font(app, 14.0), text_color, name_rect.width());
-                painter.galley(
-                    pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0),
-                    galley,
-                    text_color,
-                );
+                let at = pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0);
+                name_hit = Rect::from_min_size(at, galley.size());
+                painter.galley(at, galley, text_color);
             }
             if entry.is_dir() {
                 let chevron = Rect::from_center_size(
@@ -1424,6 +1470,11 @@ pub(crate) fn item(
                     label_rect.width(),
                     2,
                 );
+                let size = galley.size();
+                name_hit = Rect::from_min_size(
+                    pos2(label_rect.center().x - size.x / 2.0, label_rect.top() + 1.0),
+                    size,
+                );
                 painter.galley(
                     pos2(label_rect.center().x, label_rect.top() + 1.0),
                     galley,
@@ -1436,11 +1487,46 @@ pub(crate) fn item(
     // Взаимодействия.
     let modifiers = ui.input(|i| i.modifiers);
     let mods = Modifiers { ctrl: modifiers.ctrl || modifiers.command, shift: modifiers.shift };
+    // Нажатие на имя единственного выделенного объекта в уже активной панели — может быть
+    // началом переименования (решится при отпускании и по времени).
+    if !renaming
+        && tab.rename.is_none()
+        && response.hovered()
+        && ui.input(|i| i.pointer.primary_pressed())
+        // Нажатие и отпускание в одном кадре (быстрый щелчок): точки нажатия уже нет.
+        && ui.input(|i| i.pointer.press_origin().or(i.pointer.interact_pos()))
+            .is_some_and(|p| name_hit.expand(2.0).contains(p))
+        && !modifiers.ctrl
+        && !modifiers.shift
+        && !modifiers.alt
+        && !modifiers.command
+        && app.focused == pane
+        && selected
+        && cursor
+        && tab.selection.len() == 1
+        && app.available_cached(CommandId::Rename)
+    {
+        tab.slow_click = Some(crate::tabs::SlowClick { path: path.clone(), due: None });
+    }
     if response.clicked() && !renaming {
         if tab.rename.is_some() {
             commit_inline_rename(tab, app);
         }
         tab.selection.click(&tab.listing, row, mods);
+    }
+    if response.double_clicked()
+        || response.triple_clicked()
+        || response.drag_started()
+        || response.secondary_clicked()
+    {
+        tab.slow_click = None;
+    } else if response.clicked()
+        && let Some(slow) = &mut tab.slow_click
+        && slow.path == path
+        && slow.due.is_none()
+    {
+        slow.due = Some(std::time::Instant::now() + double_click_time());
+        ui.ctx().request_repaint_after(double_click_time());
     }
     if response.double_clicked() && !renaming {
         tab.selection.select_only(path.clone());
@@ -1621,6 +1707,7 @@ fn start_band(ui: &Ui, tab: &mut Tab, pos: egui::Pos2) {
     let ctrl = ui.input(|i| i.modifiers.ctrl || i.modifiers.command);
     let base = if ctrl { tab.selection.snapshot() } else { Default::default() };
     tab.rename = None;
+    tab.slow_click = None;
     tab.band = Some(Band { origin: to_content(tab, pos), base });
 }
 
