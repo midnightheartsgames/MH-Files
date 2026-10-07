@@ -5,6 +5,8 @@ pub mod com;
 pub mod dnd;
 pub mod drives;
 pub mod folders;
+pub mod instance;
+pub mod integration;
 pub mod media;
 pub mod menu;
 pub mod ops;

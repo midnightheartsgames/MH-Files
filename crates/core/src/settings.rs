@@ -33,6 +33,21 @@ pub struct Settings {
     /// Сохранённые поиски по дискам, показываются в боковой панели.
     pub saved_searches: Vec<SavedSearch>,
     pub sorting: SortSettings,
+    pub system: SystemSettings,
+}
+
+/// Как программа живёт в системе.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SystemSettings {
+    /// Одна копия: повторный запуск открывает пути в уже открытом окне.
+    pub single_instance: bool,
+}
+
+impl Default for SystemSettings {
+    fn default() -> SystemSettings {
+        SystemSettings { single_instance: true }
+    }
 }
 
 /// Сортировщик (из MH Sort): галочки, с которыми открывается вкладка «Разложить».
@@ -196,6 +211,7 @@ impl Default for Settings {
             index: IndexSettings::default(),
             saved_searches: Vec::new(),
             sorting: SortSettings::default(),
+            system: SystemSettings::default(),
         }
     }
 }
@@ -323,5 +339,56 @@ mod tests {
         assert_eq!(settings.panes.sidebar_width, MIN_SIDE_WIDTH);
         let (_, notice) = Settings::parse(r#"{"version":99}"#);
         assert!(notice.is_some());
+    }
+
+    /// Файлы настроек всех прошлых версий читаются без потерь: чего в них нет — по
+    /// умолчанию, что есть — как было.
+    #[test]
+    fn files_of_older_versions() {
+        // 0.1: ещё нет индекса, сортировщика, своего заголовка окна.
+        let v01 = r#"{
+          "version": 1,
+          "appearance": {"font_scale": 1.25, "compact": true, "grid_size": 128.0,
+                         "accent": [255, 0, 0], "animations": false, "system_icons": false},
+          "files": {"show_hidden": true, "show_system": false, "show_extensions": false,
+                    "folders_first": false, "confirm_recycle": true, "relative_dates": false},
+          "panes": {"show_sidebar": false, "sidebar_width": 300.0, "show_inspector": true,
+                    "inspector_width": 320.0, "restore_session": false, "new_tab": "Home"},
+          "preview": {"thumbnails": false, "text_limit_kb": 64, "image_limit_mb": 8},
+          "groups": [{"name": "Проекты", "collapsed": true,
+                      "items": [{"name": "MH", "path": "D:\\MH"}]}],
+          "keys": {"Rename": ["Ctrl+R"]},
+          "terminal": "wt.exe -d \"{dir}\""
+        }"#;
+        let (s, notice) = Settings::parse(v01);
+        assert!(notice.is_none());
+        assert_eq!(s.appearance.font_scale, 1.25);
+        assert!(s.appearance.compact && !s.appearance.animations);
+        assert!(s.appearance.custom_title_bar, "новое — по умолчанию");
+        assert!(s.files.show_hidden && s.files.confirm_recycle);
+        assert_eq!(s.panes.new_tab, NewTabLocation::Home);
+        assert_eq!(s.groups[0].items[0].path, PathBuf::from("D:\\MH"));
+        assert_eq!(s.keys["Rename"], ["Ctrl+R"]);
+        assert!(s.index.enabled && s.saved_searches.is_empty());
+        assert!(s.preview.handlers);
+        assert_eq!(s.sorting, SortSettings::default());
+        assert!(s.system.single_instance);
+
+        // 0.3–0.5: индекс, поиски, сортировщик.
+        let v05 = r#"{
+          "version": 1,
+          "index": {"enabled": false, "roots": ["D:\\"], "exclude": [], "rescan_on_start": false},
+          "saved_searches": [{"name": "Видео", "query": "ext:mp4"}],
+          "sorting": {"mode": "copy", "recursive": true, "excluded": ["node_modules"]},
+          "preview": {"handlers": false}
+        }"#;
+        let (s, _) = Settings::parse(v05);
+        assert!(!s.index.enabled && !s.index.rescan_on_start);
+        assert_eq!(s.saved_searches[0].query, "ext:mp4");
+        assert_eq!(s.sorting.mode, crate::sorting::Mode::Copy);
+        assert!(s.sorting.recursive && s.sorting.type_folders);
+        assert_eq!(s.sorting.excluded, ["node_modules"]);
+        assert!(!s.preview.handlers);
+        assert_eq!(Settings::parse(&s.to_json()).0, s, "запись и чтение без потерь");
     }
 }

@@ -40,3 +40,19 @@ pub fn message_hook(msg: *const std::ffi::c_void) -> bool {
     }
     false
 }
+
+pub fn bring_to_front() {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,
+    };
+
+    let Some(hwnd) = super::com::owner_hwnd() else { return };
+    // SAFETY: HWND главного окна; если окно уже закрыто, функции просто вернут ошибку.
+    // ShowWindowAsync только ставит команду в очередь окна и не ждёт его поток.
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}

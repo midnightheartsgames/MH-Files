@@ -82,8 +82,28 @@ impl Session {
         }
     }
 
+    /// Разбор сеанса. Вкладка, которую эта версия не понимает (место из более новой
+    /// версии), выбрасывается одна — остальной сеанс сохраняется.
     pub fn parse(json: &str) -> Option<Session> {
-        let session: Session = serde_json::from_str(json).ok()?;
+        if let Ok(session) = serde_json::from_str::<Session>(json) {
+            return session.sanitized();
+        }
+        let mut value: serde_json::Value = serde_json::from_str(json).ok()?;
+        for pane in value.get_mut("panes")?.as_array_mut()? {
+            if let Some(tabs) = pane.get_mut("tabs").and_then(|t| t.as_array_mut()) {
+                tabs.retain(|tab| serde_json::from_value::<TabSession>(tab.clone()).is_ok());
+                // Панель без понятных вкладок не теряется — в ней «Этот компьютер».
+                if tabs.is_empty() {
+                    let computer = TabSession {
+                        location: Location::Computer,
+                        view: ViewMode::default(),
+                        sort: SortOrder::default(),
+                    };
+                    tabs.push(serde_json::to_value(computer).ok()?);
+                }
+            }
+        }
+        let session: Session = serde_json::from_value(value).ok()?;
         session.sanitized()
     }
 
@@ -144,6 +164,23 @@ mod tests {
         let parsed = Session::parse(&session.to_json()).unwrap();
         assert_eq!(parsed.panes[1].active, 0, "активная вкладка в границах");
         assert_eq!(parsed.layout.panes(), [PaneId(1), PaneId(2)]);
+    }
+
+    #[test]
+    fn unknown_tabs_are_dropped_alone() {
+        let mut session = Session::single(Location::Dir(PathBuf::from("/a")));
+        session.panes[0].tabs.push(TabSession {
+            location: Location::Sort { root: PathBuf::from("/b") },
+            view: ViewMode::Columns,
+            sort: Default::default(),
+        });
+        let json = session.to_json();
+        assert_eq!(Session::parse(&json), Some(session.clone()), "все места 1.0 читаются");
+        // Место из будущей версии: вкладка уходит, остальное остаётся.
+        let future = json.replace("\"Sort\"", "\"Teleport\"");
+        let parsed = Session::parse(&future).unwrap();
+        assert_eq!(parsed.panes[0].tabs.len(), 1);
+        assert_eq!(parsed.panes[0].tabs[0].location, Location::Dir(PathBuf::from("/a")));
     }
 
     #[test]

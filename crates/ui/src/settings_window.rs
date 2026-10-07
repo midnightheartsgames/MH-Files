@@ -25,18 +25,20 @@ enum Page {
     Preview,
     Index,
     Sorting,
+    System,
     Keys,
     About,
 }
 
 impl Page {
-    const ALL: [Page; 8] = [
+    const ALL: [Page; 9] = [
         Page::General,
         Page::Appearance,
         Page::Files,
         Page::Preview,
         Page::Index,
         Page::Sorting,
+        Page::System,
         Page::Keys,
         Page::About,
     ];
@@ -49,6 +51,7 @@ impl Page {
             Page::Preview => "Предпросмотр",
             Page::Index => "Поиск по дискам",
             Page::Sorting => "Сортировка",
+            Page::System => "Система",
             Page::Keys => "Горячие клавиши",
             Page::About => "О программе",
         }
@@ -138,6 +141,19 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         extensions: app.sorter.classifier.extension_count,
     };
     let mut sort_action = None;
+    let dirs = storage::dirs();
+    let system_info = SystemInfo {
+        config: dirs.config.clone(),
+        index: dirs.index.clone(),
+        portable: dirs.portable,
+        explorer_menu: app.explorer_menu,
+        crashed: app.previous.crashed,
+        report: app.previous.report.clone(),
+        first_frame: app.diag.first_frame,
+        listings: app.diag.listings.iter().take(12).cloned().collect(),
+        text: app.diag.report(),
+    };
+    let mut system_action = None;
     ctx.show_viewport_immediate(ViewportId::from_hash_of("settings"), builder, |ui, class| {
         let state = &mut app.settings_window;
         if class == ViewportClass::EmbeddedWindow {
@@ -226,6 +242,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             rescan |= index(ui, state, &info);
                         }
                         Page::Sorting => sort_action = sorting(ui, &mut state.draft, &sort_info),
+                        Page::System => system_action = system(ui, &mut state.draft, &system_info),
                         Page::Keys => keys(ui, &mut state.keys),
                         Page::About => about(ui),
                     }
@@ -237,6 +254,25 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     }
     if rescan {
         app.indexer.rescan();
+    }
+    match system_action {
+        Some(SystemAction::ExplorerMenu(install)) => {
+            app.explorer_menu = None;
+            app.workers.explorer_menu(Some(install));
+        }
+        Some(SystemAction::Open(path)) => {
+            let _ = std::fs::create_dir_all(&path);
+            app.actions.push(crate::app::Action::Open {
+                location: mh_files_core::location::Location::Dir(path),
+                target: crate::app::Target::NewTab,
+            });
+        }
+        Some(SystemAction::OpenFile(path)) => app.workers.shell(mh_files_fs::ShellJob::Open(path)),
+        Some(SystemAction::Copy) => {
+            ctx.copy_text(system_info.text.clone());
+            app.settings_window.status = Some(("отчёт скопирован".into(), false));
+        }
+        None => {}
     }
     match sort_action {
         Some(SortAction::Reload) => {
@@ -428,6 +464,161 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
             ui.add(egui::DragValue::new(&mut s.preview.image_limit_mb).range(1..=1024));
         });
     });
+}
+
+struct SystemInfo {
+    config: std::path::PathBuf,
+    index: std::path::PathBuf,
+    portable: bool,
+    explorer_menu: Option<bool>,
+    crashed: bool,
+    report: Option<std::path::PathBuf>,
+    first_frame: Option<std::time::Duration>,
+    listings: Vec<(std::path::PathBuf, usize, std::time::Duration)>,
+    text: String,
+}
+
+enum SystemAction {
+    ExplorerMenu(bool),
+    Open(std::path::PathBuf),
+    OpenFile(std::path::PathBuf),
+    Copy,
+}
+
+/// Запуск, Проводник, где данные, сбои и замеры.
+fn system(ui: &mut Ui, s: &mut Settings, info: &SystemInfo) -> Option<SystemAction> {
+    let mut action = None;
+    card(ui, "Запуск", |ui| {
+        switch_row(
+            ui,
+            "Одна копия программы",
+            Some(
+                "Повторный запуск (ярлык, «Открыть в MH Files», путь в командной строке) открывает папку в уже открытом окне. Действует со следующего запуска; отдельное окно — ключ --new-window.",
+            ),
+            &mut s.system.single_instance,
+        );
+    });
+    card(ui, "Проводник", |ui| {
+        let (text, color) = match info.explorer_menu {
+            None => ("Проверяется…", theme::TEXT_DISABLED),
+            Some(true) => (
+                "Пункт «Открыть в MH Files» есть в меню папок, дисков и пустого места",
+                theme::TEXT_SECONDARY,
+            ),
+            Some(false) => {
+                ("Пункта «Открыть в MH Files» в меню Проводника нет", theme::TEXT_SECONDARY)
+            }
+        };
+        ui.label(RichText::new(text).color(color));
+        widgets::hint(
+            ui,
+            "Только для текущего пользователя, права администратора не нужны. В Windows 11 пункт — в «Показать дополнительные параметры».",
+        );
+        ui.horizontal(|ui| {
+            let busy = info.explorer_menu.is_none();
+            if ui
+                .add_enabled(
+                    !busy && info.explorer_menu != Some(true),
+                    egui::Button::new("Добавить"),
+                )
+                .clicked()
+            {
+                action = Some(SystemAction::ExplorerMenu(true));
+            }
+            if ui
+                .add_enabled(!busy && info.explorer_menu == Some(true), egui::Button::new("Убрать"))
+                .clicked()
+            {
+                action = Some(SystemAction::ExplorerMenu(false));
+            }
+        });
+    });
+    card(ui, "Данные программы", |ui| {
+        let mode = if info.portable {
+            "Переносной режим: всё хранится рядом с программой (папка data)."
+        } else {
+            "Настройки — в профиле пользователя. Переносной режим: положите рядом с MH-Files.exe пустой файл portable."
+        };
+        widgets::hint(ui, mode);
+        widgets::hint(
+            ui,
+            &format!("Настройки, сеанс, категории, журналы: {}", info.config.display()),
+        );
+        widgets::hint(ui, &format!("Индекс дисков: {}", info.index.display()));
+        if ui.button("Открыть папку данных").clicked() {
+            action = Some(SystemAction::Open(info.config.clone()));
+        }
+    });
+    card(ui, "Сбои", |ui| {
+        let (text, color) = match (info.crashed, &info.report) {
+            (true, Some(_)) => (
+                "Прошлый запуск закончился сбоем программы. Вкладки восстановлены из сеанса.",
+                theme::WARN,
+            ),
+            (true, None) => (
+                "Прошлый запуск не закрылся как обычно (выключение компьютера, снятие процесса). Вкладки восстановлены из сеанса.",
+                theme::TEXT_SECONDARY,
+            ),
+            (false, _) => ("Прошлый запуск закончился как обычно.", theme::TEXT_SECONDARY),
+        };
+        ui.label(RichText::new(text).color(color));
+        ui.horizontal(|ui| {
+            if let Some(report) = &info.report
+                && ui.button("Открыть отчёт о сбое").clicked()
+            {
+                action = Some(SystemAction::OpenFile(report.clone()));
+            }
+            if ui.button("Папка отчётов").clicked() {
+                action = Some(SystemAction::Open(crate::crash::crashes_dir(&info.config)));
+            }
+        });
+        widgets::hint(
+            ui,
+            "Отчёт пишется при внутренней ошибке программы: версия, место, стек вызовов. Его можно приложить к сообщению об ошибке.",
+        );
+    });
+    card(ui, "Замеры", |ui| {
+        let first = info.first_frame.map_or("—".into(), |d| format!("{} мс", d.as_millis()));
+        ui.label(format!("От запуска до первого кадра: {first}"));
+        if info.listings.is_empty() {
+            widgets::hint(
+                ui,
+                "Откройте несколько папок — здесь появится, сколько читалась каждая.",
+            );
+        }
+        // Длинные пути обрезаются по ширине карточки, целиком — в подсказке.
+        let cell = |ui: &mut egui::Ui, width: f32, text: RichText| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 18.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_width(width);
+                    ui.label(text);
+                },
+            );
+        };
+        for (dir, entries, took) in &info.listings {
+            ui.horizontal(|ui| {
+                let took = format!("{} мс", took.as_millis());
+                cell(ui, 64.0, RichText::new(took).color(theme::TEXT_PRIMARY));
+                let entries = mh_files_core::format::items(*entries);
+                cell(ui, 96.0, RichText::new(entries).color(theme::TEXT_SECONDARY));
+                let path = dir.display().to_string();
+                ui.add(
+                    egui::Label::new(RichText::new(&path).color(theme::TEXT_DISABLED)).truncate(),
+                )
+                .on_hover_text(path);
+            });
+        }
+        widgets::hint(
+            ui,
+            "Для PLAN.md §10: откройте папку на уснувшем HDD, в сети и на 100 000 файлов, затем скопируйте отчёт.",
+        );
+        if ui.button("Скопировать отчёт").clicked() {
+            action = Some(SystemAction::Copy);
+        }
+    });
+    action
 }
 
 struct SortInfo {

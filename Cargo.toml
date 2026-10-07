@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/fs", "crates/platform", "crates/ui"]
 
 [workspace.package]
-version = "0.5.0"
+version = "1.0.0-rc.1"
 edition = "2024"
 license = "MIT"
 # Крейты не публикуются: дистрибутив — один exe.
