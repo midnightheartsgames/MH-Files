@@ -343,8 +343,8 @@ fn menu_bitmap(bitmap: HBITMAP) -> Option<MenuIcon> {
         return None;
     }
     // Картинка без прозрачности (24 бита или нулевой альфа-канал) — непрозрачная.
-    let opaque = header.bmBitsPixel < 32 || pixels.chunks_exact(4).all(|px| px[3] == 0);
-    for px in pixels.chunks_exact_mut(4) {
+    let opaque = header.bmBitsPixel < 32 || pixels.as_chunks::<4>().0.iter().all(|px| px[3] == 0);
+    for px in pixels.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
         if opaque {
             px[3] = 255;
