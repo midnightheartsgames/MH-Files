@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-core"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-fs"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 dependencies = [
  "blake3",
  "chrono",
@@ -1475,7 +1475,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-platform"
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 dependencies = [
  "crossbeam-channel",
  "windows",
