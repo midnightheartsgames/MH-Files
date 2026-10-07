@@ -21,7 +21,7 @@ use mh_files_platform::window::Intercepted;
 use crate::app::{Action, FilesApp, Level, TabTarget, Target, root_of};
 use crate::commands::{CommandId, Lookup};
 use crate::operations::Followup;
-use crate::tabs::{InlineRename, Pane};
+use crate::tabs::Pane;
 use crate::{batch, dialogs, palette, quick, sidebar};
 
 /// Команды, которые работают и тогда, когда фокус в текстовом поле.
@@ -584,12 +584,7 @@ impl FilesApp {
                     self.execute(ctx, BatchRename);
                 } else {
                     let path = targets[0].clone();
-                    let tab = self.tab_mut();
-                    if let Some(row) = tab.listing.row_of(&path) {
-                        let name = tab.listing.get(row).map(|e| e.name.clone()).unwrap_or_default();
-                        tab.scroll_to = Some(row);
-                        tab.rename = Some(InlineRename { path, text: name, fresh: true });
-                    }
+                    self.tab_mut().start_rename(path);
                 }
             }
             BatchRename => {

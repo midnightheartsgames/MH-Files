@@ -39,6 +39,8 @@ pub enum ShellJob {
     LiveMenu {
         generation: u64,
         target: MenuTarget,
+        /// Shift при щелчке: расширенные команды.
+        extended: bool,
     },
     /// Ярлыки на объекты в папке `dest`.
     CreateShortcuts {
@@ -78,11 +80,12 @@ pub(crate) fn run(workers: &Workers, job: ShellJob) {
             }
             return;
         }
-        ShellJob::LiveMenu { generation, target } => {
+        ShellJob::LiveMenu { generation, target, extended } => {
             // Отправитель уходит в UI вместе с пунктами: закрыл меню — канал закрылся.
             let (commands, chosen) = crossbeam_channel::bounded(1);
-            let choice = shell::live_menu(&target, &chosen, |items| {
-                workers.send(Event::ShellMenu { generation, items, commands });
+            let choice = shell::live_menu(&target, extended, &chosen, |items, complete| {
+                let commands = commands.clone();
+                workers.send(Event::ShellMenu { generation, items, complete, commands });
             });
             if choice != Ok(MenuChoice::Dismissed) {
                 workers.send(Event::Menu { paths: target.paths(), choice });

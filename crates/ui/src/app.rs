@@ -273,7 +273,12 @@ pub struct FilesApp {
     pub zoom_rest: (f32, f64),
     /// Пункты меню Windows для открытого сейчас контекстного меню.
     pub shell_menu: Option<crate::shell_menu::ShellMenu>,
+    /// Меню Windows, заказанное при нажатии правой кнопки, — до отпускания.
+    pub shell_prefetch: Option<crate::shell_menu::ShellMenu>,
     pub shell_menu_generation: u64,
+    pub shell_menu_heights: crate::shell_menu::Heights,
+    /// Расширения меню Windows уже загружены пробным меню после запуска.
+    pub shell_warmed: bool,
     /// Посчитанные размеры папок (целиком) и те, что ещё считаются.
     pub folder_sizes: HashMap<PathBuf, DirSize>,
     pub sizes_pending: HashSet<PathBuf>,
@@ -298,6 +303,9 @@ impl FilesApp {
         let _ = startup.repaint.set(cc.egui_ctx.clone());
         theme::set_accent(settings.appearance.accent);
         theme::install(&cc.egui_ctx);
+        // Двойной щелчок — по настройке Windows, как и переименование вторым щелчком.
+        let double_click = crate::pane_view::double_click_time().as_secs_f64();
+        cc.egui_ctx.options_mut(|o| o.input_options.max_double_click_delay = double_click);
         cc.egui_ctx.set_zoom_factor(settings.appearance.font_scale);
         set_owner_window(cc);
 
@@ -357,7 +365,10 @@ impl FilesApp {
             pending_chord: None,
             zoom_rest: (0.0, 0.0),
             shell_menu: None,
+            shell_prefetch: None,
             shell_menu_generation: 0,
+            shell_menu_heights: Default::default(),
+            shell_warmed: false,
             folder_sizes: HashMap::new(),
             sizes_pending: HashSet::new(),
             sizes_cancel: None,
@@ -372,7 +383,7 @@ impl FilesApp {
         let restored = session.filter(|_| app.settings.panes.restore_session);
         let fresh = restored.is_none();
         app.restore(restored.unwrap_or_else(|| Session::single(app.home_location())));
-        app.workers.drives();
+        app.workers.watch_drives();
         app.workers.known_folders();
         app.workers.integration(None);
         // Пути из командной строки: без восстановленного сеанса первый — в домашнюю вкладку.
@@ -721,6 +732,14 @@ impl FilesApp {
             },
             Event::DriveRoots(roots) => {
                 let old = std::mem::take(&mut self.drives);
+                // Диск подключили или отключили (не первый список при запуске) — и индекс
+                // поиска пересобирает тома сразу, а не при своём опросе.
+                let changed = !old.is_empty()
+                    && (old.len() != roots.len()
+                        || old.iter().zip(&roots).any(|(a, (root, _))| &a.root != root));
+                if changed {
+                    self.indexer.drives_changed();
+                }
                 self.drives = roots
                     .into_iter()
                     .map(|(root, kind)| {
@@ -759,8 +778,8 @@ impl FilesApp {
             Event::Preflight { transfer, conflicts } => self.on_preflight(transfer, conflicts),
             Event::FolderSize { ticket, path, size } => self.on_folder_size(ticket, path, size),
             Event::Menu { paths, choice } => self.on_menu(paths, choice),
-            Event::ShellMenu { generation, items, commands } => {
-                crate::shell_menu::on_ready(self, ctx, generation, items, commands);
+            Event::ShellMenu { generation, items, complete, commands } => {
+                crate::shell_menu::on_ready(self, ctx, generation, items, complete, commands);
             }
             Event::IndexResults { ticket, result } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
@@ -1018,6 +1037,7 @@ impl FilesApp {
         }
         settings_window::show(&ctx, self);
         crate::shell_menu::end_frame(self);
+        crate::shell_menu::warm_up(&ctx, self);
 
         self.handle_drops(&ctx);
         self.run_actions(&ctx);

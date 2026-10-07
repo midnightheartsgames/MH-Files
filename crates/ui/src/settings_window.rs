@@ -98,6 +98,17 @@ impl State {
         self.page = Page::Sorting;
     }
 
+    /// Набранный, но не добавленный кнопкой путь индекса тоже идёт в список: иначе
+    /// «Применить» молча его теряет.
+    fn commit_pending_paths(&mut self) {
+        for (list, text) in [
+            (&mut self.draft.index.roots, &mut self.new_root),
+            (&mut self.draft.index.exclude, &mut self.new_exclude),
+        ] {
+            add_path(list, text);
+        }
+    }
+
     /// Черновик с разобранными сочетаниями и изменённые категории (если менялись).
     /// Ошибка — текст.
     fn result(&self) -> Result<(Settings, Option<mh_files_core::sorting::Config>), String> {
@@ -204,6 +215,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             close = true;
                         }
                         if ok || apply {
+                            state.commit_pending_paths();
                             match state.result() {
                                 Ok(settings) => {
                                     applied = Some(settings);
@@ -931,16 +943,30 @@ fn path_list(ui: &mut Ui, paths: &mut Vec<std::path::PathBuf>, new: &mut String,
         paths.remove(i);
     }
     ui.horizontal(|ui| {
-        ui.add(egui::TextEdit::singleline(new).hint_text(hint).desired_width(320.0));
-        let path = std::path::PathBuf::from(new.trim());
-        if ui.add_enabled(path.is_absolute(), egui::Button::new("Добавить")).clicked() {
-            let path = mh_files_core::location::normalize(&path);
-            if !paths.contains(&path) {
-                paths.push(path);
-            }
-            new.clear();
+        let edit = ui.add(egui::TextEdit::singleline(new).hint_text(hint).desired_width(320.0));
+        let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let valid = pending_path(new).is_some();
+        if ui.add_enabled(valid, egui::Button::new("Добавить")).clicked() || enter {
+            add_path(paths, new);
         }
     });
+}
+
+/// Путь из поля ввода: без пробелов по краям и кавычек «Копировать как путь» Проводника.
+/// `None` — не полный путь.
+fn pending_path(text: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(text.trim().trim_matches('"'));
+    path.is_absolute().then(|| mh_files_core::location::normalize(&path))
+}
+
+/// Добавить набранный путь в список (без повторов) и очистить поле.
+fn add_path(paths: &mut Vec<std::path::PathBuf>, text: &mut String) {
+    if let Some(path) = pending_path(text) {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+        text.clear();
+    }
 }
 
 fn keys(ui: &mut Ui, keys: &mut BTreeMap<CommandId, String>) {

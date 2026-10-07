@@ -158,7 +158,7 @@ fn bucket(pixels: f32) -> u32 {
 
 /// Типы, у которых бывает эскиз. В Windows эскизы видео и документов даёт Shell.
 fn has_thumbnail(ext: &str) -> bool {
-    if mh_files_fs::images::decodable(ext) {
+    if mh_files_fs::images::decodable(ext) || mh_files_fs::images::vector(ext) {
         return true;
     }
     cfg!(windows)
@@ -175,7 +175,6 @@ fn has_thumbnail(ext: &str) -> bool {
                 | "psd"
                 | "heic"
                 | "avif"
-                | "svg"
                 | "jxl"
                 | "raw"
                 | "cr2"

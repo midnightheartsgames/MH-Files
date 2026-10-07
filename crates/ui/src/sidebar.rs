@@ -335,6 +335,7 @@ fn location_menu(
     favorite: Option<(usize, usize)>,
 ) {
     let path: PathBuf = path.to_path_buf();
+    crate::shell_menu::prefetch_on_press(app, response, || MenuTarget::Items(vec![path.clone()]));
     response.context_menu(|ui| {
         ui.set_min_width(220.0);
         let location = Location::Dir(path.clone());

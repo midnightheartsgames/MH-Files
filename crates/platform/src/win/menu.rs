@@ -142,13 +142,15 @@ fn folder_menu(dir: &Path, hwnd: HWND) -> Result<IContextMenu, String> {
 /// См. [`crate::shell::live_menu`].
 pub fn live_menu(
     target: &MenuTarget,
+    extended: bool,
     commands: &Receiver<u32>,
-    ready: impl FnOnce(Result<Vec<ShellMenuItem>, String>),
+    mut ready: impl FnMut(Result<Vec<ShellMenuItem>, String>, bool),
 ) -> Result<MenuChoice, String> {
     let _com = Apartment::sta();
     let _ole = Ole::init();
-    // Shift в момент щелчка — как в Проводнике: расширенные команды.
-    let shift = key_down(VK_SHIFT);
+    // Shift при щелчке — как в Проводнике: расширенные команды. Меню собирают заранее, при
+    // нажатии кнопки, поэтому Shift передаёт UI, а не читается здесь.
+    let shift = extended;
     let built = (|| {
         let window = OwnerWindow::new()?;
         let (menu, pidls) = match target {
@@ -160,17 +162,22 @@ pub fn live_menu(
         };
         let popup = Popup::new()?;
         query(&menu, &popup, shift)?;
-        let items = read_menu(&menu, popup.0, 0);
-        Ok::<_, String>((window, menu, pidls, popup, items))
+        Ok::<_, String>((window, menu, pidls, popup))
     })();
-    let (window, menu, _pidls, _popup, items) = match built {
+    let (window, menu, _pidls, popup) = match built {
         Ok(built) => built,
         Err(error) => {
-            ready(Err(error));
+            ready(Err(error), true);
             return Ok(MenuChoice::Dismissed);
         }
     };
-    ready(Ok(items));
+    // Сначала — то, что расширения уже положили в меню: его можно показывать и выбирать.
+    // Подменю, которые заполняются при открытии («Отправить» перебирает диски, «Открыть с
+    // помощью» — программы), дочитываются вторым приёмом; номера команд те же.
+    ready(Ok(read_menu(&menu, popup.0, 0, false)), false);
+    ready(Ok(read_menu(&menu, popup.0, 0, true)), true);
+    // Отправитель команд мог остаться в `ready`: отпустить, иначе канал не закроется.
+    drop(ready);
     let Some(id) = wait_command(commands) else {
         return Ok(MenuChoice::Dismissed);
     };
@@ -214,9 +221,9 @@ fn wait_command(commands: &Receiver<u32>) -> Option<u32> {
 /// Сколько уровней подменю читать: «Отправить ▸» — второй, глубже почти не бывает.
 const MAX_DEPTH: usize = 3;
 
-/// Пункты меню Win32 одного уровня. Подменю сначала получают `WM_INITMENUPOPUP` — так их
-/// заполняют расширения («Отправить», «Создать», «Открыть с помощью»), как при показе.
-fn read_menu(menu: &IContextMenu, hmenu: HMENU, depth: usize) -> Vec<ShellMenuItem> {
+/// Пункты меню Win32 одного уровня. С `fill` подменю сначала получают `WM_INITMENUPOPUP` —
+/// так их заполняют расширения («Отправить», «Создать», «Открыть с помощью»), как при показе.
+fn read_menu(menu: &IContextMenu, hmenu: HMENU, depth: usize, fill: bool) -> Vec<ShellMenuItem> {
     // SAFETY: меню создано этим потоком и живо до конца функции.
     let count = unsafe { GetMenuItemCount(Some(hmenu)) }.max(0) as u32;
     let mut items = Vec::with_capacity(count as usize);
@@ -261,8 +268,10 @@ fn read_menu(menu: &IContextMenu, hmenu: HMENU, depth: usize) -> Vec<ShellMenuIt
             if depth + 1 >= MAX_DEPTH {
                 continue;
             }
-            init_popup(menu, info.hSubMenu, index);
-            let children = read_menu(menu, info.hSubMenu, depth + 1);
+            if fill {
+                init_popup(menu, info.hSubMenu, index);
+            }
+            let children = read_menu(menu, info.hSubMenu, depth + 1, fill);
             items.push(ShellMenuItem::Submenu { label, icon, enabled, items: children });
             continue;
         }

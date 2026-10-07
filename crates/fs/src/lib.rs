@@ -10,6 +10,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use mh_files_core::Entry;
@@ -145,10 +146,12 @@ pub enum Event {
         size: DirSize,
     },
     /// Пункты меню Windows для своего контекстного меню (поколение запроса — `generation`).
-    /// Номер выбранной команды — в `commands`; отпустить отправитель — меню закрыто.
+    /// Приходят дважды: без `complete` — подменю ещё заполняются. Номер выбранной команды —
+    /// в `commands`; отпустить все отправители — меню закрыто.
     ShellMenu {
         generation: u64,
         items: Result<Vec<ShellMenuItem>, String>,
+        complete: bool,
         commands: Sender<u32>,
     },
     /// Меню Windows закрыто; `paths` — для чего его открывали.
@@ -258,6 +261,9 @@ pub struct Extraction {
     pub then: AfterExtract,
 }
 
+/// Как часто сверять список букв дисков: флешка появляется в окне не позже чем через это.
+const DRIVES_POLL: Duration = Duration::from_secs(1);
+
 /// Точка постановки задач. Дешёвая в клонировании.
 #[derive(Clone)]
 pub struct Workers {
@@ -326,7 +332,8 @@ impl Workers {
         });
     }
 
-    /// Опрос дисков: сразу список корней, затем каждый диск отдельным потоком.
+    /// Опрос дисков: сразу список корней, затем каждый диск отдельным потоком (F5 на «Этом
+    /// компьютере» — свежее свободное место).
     pub fn drives(&self) {
         self.spawn("drives", |workers| {
             let roots = mh_files_platform::drives::drive_roots();
@@ -336,6 +343,32 @@ impl Workers {
                     let info = mh_files_platform::drives::drive_info(&root, kind);
                     workers.send(Event::Drive(info));
                 });
+            }
+        });
+    }
+
+    /// Следить за списком дисков всё время работы: раз в секунду сверяется маска букв
+    /// (мгновенно, к дискам не обращается). Изменилась — новый список корней и сведения о
+    /// новых дисках; прежние не опрашиваются — уснувший HDD не будится. Первый проход — сразу.
+    pub fn watch_drives(&self) {
+        self.spawn("drives-watch", |workers| {
+            let mut last = None;
+            let mut known: Vec<(PathBuf, mh_files_platform::drives::DriveKind)> = Vec::new();
+            loop {
+                let mask = mh_files_platform::drives::drive_mask();
+                if last != Some(mask) {
+                    last = Some(mask);
+                    let roots = mh_files_platform::drives::drive_roots();
+                    workers.send(Event::DriveRoots(roots.clone()));
+                    for (root, kind) in roots.iter().filter(|r| !known.contains(r)).cloned() {
+                        workers.spawn("drive", move |workers| {
+                            let info = mh_files_platform::drives::drive_info(&root, kind);
+                            workers.send(Event::Drive(info));
+                        });
+                    }
+                    known = roots;
+                }
+                std::thread::sleep(DRIVES_POLL);
             }
         });
     }

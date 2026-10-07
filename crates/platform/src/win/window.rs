@@ -41,6 +41,12 @@ pub fn message_hook(msg: *const std::ffi::c_void) -> bool {
     false
 }
 
+pub fn double_click_time() -> std::time::Duration {
+    // SAFETY: только читает системную настройку.
+    let ms = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };
+    std::time::Duration::from_millis(u64::from(ms.clamp(200, 2000)))
+}
+
 pub fn bring_to_front() {
     use windows::Win32::UI::WindowsAndMessaging::{
         IsIconic, SW_RESTORE, SetForegroundWindow, ShowWindowAsync,

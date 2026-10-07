@@ -113,6 +113,76 @@ pub fn decodable(ext: &str) -> bool {
     matches!(ext, "png" | "jpg" | "jpeg" | "jfif" | "gif" | "bmp" | "ico" | "webp" | "tif" | "tiff")
 }
 
+/// Векторные картинки, которые MH Files рисует сам.
+pub fn vector(ext: &str) -> bool {
+    ext == "svg"
+}
+
+/// Больше SVG не разбирается: дерево XML в памяти занимает во много раз больше файла.
+const SVG_LIMIT: u64 = 16 << 20;
+
+/// SVG-файл картинкой: длинная сторона — `max_side` (вектор и увеличивается, и уменьшается).
+/// Вторым — размер из самого файла. Файлы больше `limit` байт не читаются.
+pub fn render_svg_file(
+    path: &Path,
+    max_side: u32,
+    limit: u64,
+) -> Result<(Bitmap, (u32, u32)), String> {
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size > limit.min(SVG_LIMIT) {
+        return Err("слишком большой файл для предпросмотра".into());
+    }
+    render_svg(&std::fs::read(path).map_err(|e| e.to_string())?, max_side)
+}
+
+/// То же для SVG в памяти (из архива).
+pub fn render_svg(data: &[u8], max_side: u32) -> Result<(Bitmap, (u32, u32)), String> {
+    use resvg::{tiny_skia, usvg};
+    let mut options = usvg::Options { fontdb: svg_fonts(), ..Default::default() };
+    // Только встроенные (data:) картинки. Ссылка на файл, тем более на \\сервер\папку, не
+    // открывается: просмотр чужого SVG не должен читать диск и ходить в сеть.
+    options.image_href_resolver = usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_, _| None),
+    };
+    let tree = usvg::Tree::from_data(data, &options).map_err(|e| format!("SVG: {e}"))?;
+    let (width, height) = (tree.size().width(), tree.size().height());
+    let max_side = max_side.max(1);
+    let scale = max_side as f32 / width.max(height);
+    let pixels_w = ((width * scale).round() as u32).clamp(1, max_side);
+    let pixels_h = ((height * scale).round() as u32).clamp(1, max_side);
+    let mut pixmap = tiny_skia::Pixmap::new(pixels_w, pixels_h).ok_or("SVG: пустая картинка")?;
+    let transform =
+        tiny_skia::Transform::from_scale(pixels_w as f32 / width, pixels_h as f32 / height);
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    // tiny-skia отдаёт premultiplied alpha, а картинки здесь — с обычной.
+    let mut rgba = pixmap.take();
+    for pixel in rgba.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(pixel[3]);
+        if alpha != 0 && alpha != 255 {
+            for channel in &mut pixel[..3] {
+                *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+            }
+        }
+    }
+    let bitmap = Bitmap { width: pixels_w, height: pixels_h, rgba };
+    Ok((bitmap, (width.round() as u32, height.round() as u32)))
+}
+
+/// Системные шрифты для текста в SVG — один раз на процесс: поток предпросмотра каждый раз
+/// новый, а перечислить шрифты Windows — сотни миллисекунд.
+fn svg_fonts() -> Arc<resvg::usvg::fontdb::Database> {
+    static FONTS: std::sync::OnceLock<Arc<resvg::usvg::fontdb::Database>> =
+        std::sync::OnceLock::new();
+    FONTS
+        .get_or_init(|| {
+            let mut fonts = resvg::usvg::fontdb::Database::new();
+            fonts.load_system_fonts();
+            Arc::new(fonts)
+        })
+        .clone()
+}
+
 fn load(key: &ImageKey) -> Result<Bitmap, String> {
     match &key.kind {
         ImageKind::TypeIcon { ext, is_dir } => thumbs::type_icon(ext, *is_dir, key.size),
@@ -121,6 +191,11 @@ fn load(key: &ImageKey) -> Result<Bitmap, String> {
             let ext = mh_files_core::entry::extension_of(
                 &key.path.file_name().unwrap_or_default().to_string_lossy(),
             );
+            // SVG рисуем сами: у Windows эскизов SVG нет без PowerToys. Большие файлы держали
+            // бы пул эскизов — им значок типа.
+            if vector(&ext) {
+                return render_svg_file(&key.path, key.size, 2 << 20).map(|(bitmap, _)| bitmap);
+            }
             // Shell знает больше форматов (видео, PDF, PSD с кодеками) и держит кэш эскизов.
             thumbs::shell_image(&key.path, key.size, ImageMode::Thumbnail).or_else(|error| {
                 if decodable(&ext) {
@@ -167,4 +242,42 @@ pub fn decode_bytes(bytes: &[u8], max_side: u32) -> Result<Bitmap, String> {
 /// Размеры картинки по заголовку, без декодирования.
 pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn svg_renders_to_fit_and_keeps_its_size() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="20" height="10">
+            <rect width="20" height="10" fill="#ff0000" fill-opacity="0.5"/></svg>"##;
+        let (bitmap, size) = render_svg(svg, 256).unwrap();
+        assert_eq!(size, (20, 10));
+        assert_eq!((bitmap.width, bitmap.height), (256, 128));
+        // Полупрозрачный красный — с обычной альфой, не premultiplied.
+        let pixel = &bitmap.rgba[..4];
+        assert!(pixel[0] >= 250 && pixel[1] == 0 && (120..=135).contains(&pixel[3]), "{pixel:?}");
+    }
+
+    #[test]
+    fn broken_svg_is_an_error() {
+        assert!(render_svg(b"<svg", 64).is_err());
+        assert!(render_svg(b"plain text", 64).is_err());
+    }
+
+    #[test]
+    fn svg_does_not_open_linked_files() {
+        // Красная картинка рядом — по ссылке из SVG она не открывается.
+        let png = std::env::temp_dir().join(format!("mh-files-svg-{}.png", std::process::id()));
+        image::RgbaImage::from_pixel(10, 10, image::Rgba([255, 0, 0, 255])).save(&png).unwrap();
+        let svg = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">
+            <image width="10" height="10" href="{}"/></svg>"#,
+            png.display()
+        );
+        let (bitmap, _) = render_svg(svg.as_bytes(), 10).unwrap();
+        std::fs::remove_file(&png).unwrap();
+        assert!(bitmap.rgba.iter().all(|&b| b == 0));
+    }
 }

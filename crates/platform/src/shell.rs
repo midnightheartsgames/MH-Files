@@ -295,8 +295,13 @@ pub fn menu_label(raw: &str) -> String {
 /// Пункты Windows для вставки в своё меню: без команд, которые у MH Files уже есть (`hidden` —
 /// их имена для Shell), без повторов одной подписи (Windows 11 показывает пункт PowerToys и
 /// как современную команду, и как старое расширение), без пустых подменю и лишних
-/// разделителей.
-pub fn tidy_menu(items: Vec<ShellMenuItem>, hidden: &[&str]) -> Vec<ShellMenuItem> {
+/// разделителей. `keep_empty` — пустые подменю оставить: их ещё заполняют («Отправить»,
+/// «Создать» в первой, быстрой части меню).
+pub fn tidy_menu(
+    items: Vec<ShellMenuItem>,
+    hidden: &[&str],
+    keep_empty: bool,
+) -> Vec<ShellMenuItem> {
     let mut tidy: Vec<ShellMenuItem> = Vec::with_capacity(items.len());
     let mut labels = std::collections::HashSet::new();
     for item in items {
@@ -317,8 +322,11 @@ pub fn tidy_menu(items: Vec<ShellMenuItem>, hidden: &[&str]) -> Vec<ShellMenuIte
                 item
             }
             ShellMenuItem::Submenu { label, icon, enabled, items } => {
-                let items = tidy_menu(items, hidden);
-                if items.is_empty() || label.is_empty() || !labels.insert(label.to_lowercase()) {
+                let items = tidy_menu(items, hidden, keep_empty);
+                if (items.is_empty() && !keep_empty)
+                    || label.is_empty()
+                    || !labels.insert(label.to_lowercase())
+                {
                     continue;
                 }
                 ShellMenuItem::Submenu { label, icon, enabled, items }
@@ -333,25 +341,31 @@ pub fn tidy_menu(items: Vec<ShellMenuItem>, hidden: &[&str]) -> Vec<ShellMenuIte
 }
 
 /// Меню Windows для встраивания в своё меню. Собирает меню Shell для `target` (с пунктами
-/// сторонних расширений, подменю «Отправить», «Создать», «Открыть с помощью» заполняются
-/// сразу) и отдаёт пункты в `ready`; затем ждёт номер выбранной команды из `commands` и
-/// выполняет её. Канал закрыт — меню закрыли, ничего не выбрав.
+/// сторонних расширений) и отдаёт пункты в `ready` в два приёма: сначала сразу после
+/// расширений, с ещё пустыми «Отправить», «Создать», «Открыть с помощью» (`false`), затем
+/// с заполненными подменю (`true`). Номера команд в обоих одни и те же. Потом ждёт номер
+/// выбранной команды из `commands` и выполняет её. Канал закрыт — меню закрыли, ничего не
+/// выбрав. `extended` — Shift при щелчке: расширенные команды, как в Проводнике.
 ///
 /// Блокирует, пока ждёт; вызывать из фонового потока: объекты меню живут в нём (STA).
-/// Ошибка сборки меню уходит в `ready`, ошибка выполнения команды — в результат.
+/// Ошибка сборки меню уходит в `ready` (последним вызовом), ошибка выполнения команды — в
+/// результат. После последнего вызова `ready` отпускается до ожидания команды: держать в нём
+/// отправитель `commands` можно.
 pub fn live_menu(
     target: &MenuTarget,
+    extended: bool,
     commands: &crossbeam_channel::Receiver<u32>,
-    ready: impl FnOnce(Result<Vec<ShellMenuItem>, String>),
+    ready: impl FnMut(Result<Vec<ShellMenuItem>, String>, bool),
 ) -> Result<MenuChoice, String> {
     #[cfg(windows)]
     {
-        crate::win::menu::live_menu(target, commands, ready)
+        crate::win::menu::live_menu(target, extended, commands, ready)
     }
     #[cfg(not(windows))]
     {
-        let _ = (target, commands);
-        ready(Err("меню Windows есть только в Windows".into()));
+        let _ = (target, extended, commands);
+        let mut ready = ready;
+        ready(Err("меню Windows есть только в Windows".into()), true);
         Ok(MenuChoice::Dismissed)
     }
 }
@@ -415,7 +429,7 @@ mod tests {
             },
             ShellMenuItem::Separator,
         ];
-        let tidy = tidy_menu(items, &["open", "cut", "delete"]);
+        let tidy = tidy_menu(items, &["open", "cut", "delete"], false);
         assert_eq!(
             tidy,
             vec![

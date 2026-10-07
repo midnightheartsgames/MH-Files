@@ -32,6 +32,15 @@ pub struct InlineRename {
     pub fresh: bool,
 }
 
+/// Второй щелчок по имени уже выделенного объекта: через время двойного щелчка начнётся
+/// переименование, если это не окажется двойным щелчком, перетаскиванием или чем-то ещё.
+#[derive(Debug, Clone)]
+pub struct SlowClick {
+    pub path: PathBuf,
+    /// `None` — кнопка ещё нажата; иначе — когда начать переименование.
+    pub due: Option<Instant>,
+}
+
 /// Рамка выделения. Начало хранится в координатах содержимого списка (с учётом прокрутки),
 /// чтобы рамка тянулась и при прокрутке.
 #[derive(Debug, Clone)]
@@ -132,6 +141,7 @@ pub struct Tab {
     /// скрытое независимо от него (см. [`options_for`]).
     pub options: ViewOptions,
     pub rename: Option<InlineRename>,
+    pub slow_click: Option<SlowClick>,
     /// Прокрутить к строке в следующем кадре.
     pub scroll_to: Option<usize>,
     /// Колонок в режиме плиток в последнем кадре — для стрелок вверх/вниз.
@@ -191,6 +201,7 @@ impl Tab {
             select_first: false,
             load_started: Instant::now(),
             rename: None,
+            slow_click: None,
             scroll_to: None,
             grid_columns: 1,
             page_rows: 10,
@@ -238,6 +249,16 @@ impl Tab {
         self.listing.find(path)
     }
 
+    /// Начать переименование объекта прямо в строке списка.
+    pub fn start_rename(&mut self, path: PathBuf) {
+        self.slow_click = None;
+        if let Some(row) = self.listing.row_of(&path) {
+            let name = self.listing.get(row).map(|e| e.name.clone()).unwrap_or_default();
+            self.scroll_to = Some(row);
+            self.rename = Some(InlineRename { path, text: name, fresh: true });
+        }
+    }
+
     /// Перейти в другое место. `record` — запомнить текущее в истории.
     pub fn navigate(&mut self, location: Location, workers: &Workers, record: bool) {
         if location == self.location && record {
@@ -271,6 +292,7 @@ impl Tab {
         self.listing.set_filter("");
         self.address = None;
         self.rename = None;
+        self.slow_click = None;
         self.scroll_to = Some(0);
         self.reload(workers, false);
     }

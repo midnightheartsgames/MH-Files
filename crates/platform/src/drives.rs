@@ -65,6 +65,33 @@ pub fn drive_roots() -> Vec<(PathBuf, DriveKind)> {
     }
 }
 
+/// Буквы дисков битовой маской: меняется, когда диск подключили или отключили. Мгновенно —
+/// к дискам не обращается, можно опрашивать часто.
+pub fn drive_mask() -> u32 {
+    #[cfg(windows)]
+    {
+        crate::win::drives::drive_mask()
+    }
+    #[cfg(not(windows))]
+    {
+        1
+    }
+}
+
+/// Серийный номер тома (другая флешка на той же букве — другой номер). `None` — носителя нет
+/// или номер неизвестен. Обращается к диску — только из фонового потока.
+pub fn volume_serial(root: &Path) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        crate::win::drives::volume_serial(root)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        None
+    }
+}
+
 /// Сведения о диске. Может ждать секунды (сеть, раскрутка HDD) — только из фонового потока.
 pub fn drive_info(root: &Path, kind: DriveKind) -> DriveInfo {
     #[cfg(windows)]
