@@ -193,8 +193,10 @@ fn collect_records(raw: &[u8], records: &mut Vec<MftRecord>) {
             }
             let units: Vec<u16> = raw
                 .get(name_at..name_at + name_len)?
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
                 .collect();
             Some(MftRecord {
                 id,

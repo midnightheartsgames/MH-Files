@@ -253,7 +253,7 @@ impl Engine {
                     (mapped.pData as *const u8).add(row * mapped.RowPitch as usize),
                     width as usize * 4,
                 );
-                for pixel in line.chunks_exact(4) {
+                for pixel in line.as_chunks::<4>().0 {
                     rgba.extend_from_slice(&[pixel[2], pixel[1], pixel[0], 255]);
                 }
             }
