@@ -204,6 +204,10 @@ pub enum Event {
         report: mh_files_core::sorting::Report,
         journal: PathBuf,
     },
+    /// categories.json записан из настроек: ошибка или путь копии испорченного файла.
+    CategoriesSaved {
+        result: Result<Option<PathBuf>, String>,
+    },
     /// Есть ли пункт «Открыть в MH Files» в меню Проводника; ошибка — если менять не вышло.
     ExplorerMenu {
         installed: bool,
@@ -515,6 +519,14 @@ impl Workers {
         self.spawn("sort-last", move |workers| {
             let last = sorting::last_active(&history);
             workers.send(Event::SortLast { ticket, last });
+        });
+    }
+
+    /// Записать categories.json (правка категорий в настройках).
+    pub fn save_categories(&self, config: mh_files_core::sorting::Config, path: PathBuf) {
+        self.spawn("save-categories", move |workers| {
+            let result = sorting::replace_categories(&config, &path);
+            workers.send(Event::CategoriesSaved { result });
         });
     }
 

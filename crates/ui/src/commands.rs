@@ -142,6 +142,15 @@ impl CommandId {
 pub fn parse_shortcut(text: &str) -> Option<KeyboardShortcut> {
     let mut modifiers = Modifiers::NONE;
     let mut key = None;
+    // «Ctrl++» — клавиша «плюс»: так её пишет `format_shortcut`.
+    let text = text.trim();
+    let (text, plus) = match text.strip_suffix("++") {
+        Some(rest) => (rest, true),
+        None => (text, false),
+    };
+    if plus {
+        key = Some(Key::Plus);
+    }
     for part in text.split('+').map(str::trim) {
         match part.to_ascii_lowercase().as_str() {
             "ctrl" | "control" => modifiers.ctrl = true,
@@ -152,7 +161,9 @@ pub fn parse_shortcut(text: &str) -> Option<KeyboardShortcut> {
                 if key.is_some() {
                     return None;
                 }
-                key = Key::from_name(part).or_else(|| Key::from_name(&capitalize(part)));
+                key = symbol_key(part)
+                    .or_else(|| Key::from_name(part))
+                    .or_else(|| Key::from_name(&capitalize(part)));
                 key?;
             }
         }
@@ -160,6 +171,41 @@ pub fn parse_shortcut(text: &str) -> Option<KeyboardShortcut> {
     // На Windows Ctrl — это и есть «command» egui.
     modifiers.command = modifiers.ctrl;
     Some(KeyboardShortcut::new(modifiers, key?))
+}
+
+/// Клавиши, которые `format_shortcut` пишет знаком.
+fn symbol_key(text: &str) -> Option<Key> {
+    Some(match text {
+        "+" => Key::Plus,
+        "=" => Key::Equals,
+        "-" => Key::Minus,
+        "," => Key::Comma,
+        "\\" => Key::Backslash,
+        _ => return None,
+    })
+}
+
+/// Список сочетаний через запятую: «Ctrl+C, Ctrl+Insert». Запятая сразу после «+» — это
+/// клавиша («Ctrl+,»), а не разделитель; после «++» (клавиша «плюс») — снова разделитель.
+pub fn split_chords(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    // Сколько «+» подряд стоит перед текущим знаком (пробелы не считаются).
+    let mut pluses = 0;
+    for (index, c) in text.char_indices() {
+        if c == ',' && pluses % 2 == 0 {
+            parts.push(text[start..index].trim());
+            start = index + 1;
+        }
+        if c == '+' {
+            pluses += 1;
+        } else if !c.is_whitespace() {
+            pluses = 0;
+        }
+    }
+    parts.push(text[start..].trim());
+    parts.retain(|p| !p.is_empty());
+    parts
 }
 
 fn capitalize(text: &str) -> String {
@@ -320,6 +366,29 @@ mod tests {
             let first = format_shortcut(&chord[0]);
             assert!(!seen.contains(&first), "{first} у {command:?} — и команда, и начало");
         }
+    }
+
+    #[test]
+    fn shown_shortcuts_parse_back() {
+        // Окно настроек показывает сочетания текстом и разбирает его при «Применить»:
+        // всё показанное должно разбираться обратно в то же самое.
+        let (keymap, _) = Keymap::new(&BTreeMap::new());
+        for &command in CommandId::ALL {
+            let text = keymap.text(command);
+            let parsed: Vec<String> = split_chords(&text)
+                .into_iter()
+                .map(|part| {
+                    format_chord(
+                        &parse_chord(part).unwrap_or_else(|| panic!("{part} у {command:?}")),
+                    )
+                })
+                .collect();
+            assert_eq!(parsed.join(", "), text, "{command:?}");
+        }
+        assert_eq!(split_chords("Ctrl+,, Ctrl+C,Alt+-"), ["Ctrl+,", "Ctrl+C", "Alt+-"]);
+        assert_eq!(split_chords("Ctrl++, Ctrl+="), ["Ctrl++", "Ctrl+="]);
+        assert_eq!(format_shortcut(&parse_shortcut("Ctrl+Shift++").unwrap()), "Ctrl+Shift++");
+        assert!(parse_shortcut("Ctrl+").is_none());
     }
 
     #[test]

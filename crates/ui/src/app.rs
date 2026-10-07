@@ -694,6 +694,14 @@ impl FilesApp {
                 self.on_sort_done(ticket, report, journal)
             }
             Event::SortLast { ticket, last } => self.on_sort_last(ticket, last),
+            Event::CategoriesSaved { result } => match result {
+                Ok(None) => self.set_status("категории сохранены", Level::Info),
+                Ok(Some(copy)) => self.set_status(
+                    format!("категории сохранены; прежний файл с ошибкой — {}", copy.display()),
+                    Level::Info,
+                ),
+                Err(error) => self.set_status(error, Level::Error),
+            },
             Event::ExplorerMenu { installed, error } => {
                 self.explorer_menu = Some(installed);
                 if let Some(error) = error {

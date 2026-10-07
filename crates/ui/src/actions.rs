@@ -671,7 +671,7 @@ impl FilesApp {
             }
             ClosePane => self.close_pane(self.focused),
             NextPane => self.focused = self.layout.next_pane(self.focused, false),
-            Settings => self.settings_window.open(&self.settings),
+            Settings => self.settings_window.open(&self.settings, &self.sorter.config),
         }
     }
 

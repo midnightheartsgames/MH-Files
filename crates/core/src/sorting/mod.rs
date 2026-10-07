@@ -5,6 +5,7 @@
 
 pub mod classify;
 pub mod config;
+pub mod edit;
 pub mod names;
 pub mod plan;
 

@@ -67,15 +67,18 @@ pub struct State {
     /// Сочетания как текст: «Ctrl+C, Ctrl+Insert».
     keys: BTreeMap<CommandId, String>,
     status: Option<(String, bool)>,
+    /// Правка категорий сортировщика.
+    categories: crate::categories_editor::Editor,
     /// Поля «добавить папку» на странице индекса.
     new_root: String,
     new_exclude: String,
 }
 
 impl State {
-    pub fn open(&mut self, settings: &Settings) {
+    pub fn open(&mut self, settings: &Settings, categories: &mh_files_core::sorting::Config) {
         if !self.open {
             self.draft = settings.clone();
+            self.categories = crate::categories_editor::Editor::new(categories);
             let (keymap, _) = Keymap::new(&settings.keys);
             self.keys = CommandId::ALL.iter().map(|&c| (c, keymap.text(c))).collect();
             self.status = None;
@@ -84,14 +87,30 @@ impl State {
         self.focus = true;
     }
 
-    /// Черновик с разобранными сочетаниями. Ошибка — текст.
-    fn result(&self) -> Result<Settings, String> {
+    /// Открыть сразу на странице сортировщика (кнопка во вкладке «Разложить»).
+    pub fn open_sorting(
+        &mut self,
+        settings: &Settings,
+        categories: &mh_files_core::sorting::Config,
+    ) {
+        self.open(settings, categories);
+        self.page = Page::Sorting;
+    }
+
+    /// Черновик с разобранными сочетаниями и изменённые категории (если менялись).
+    /// Ошибка — текст.
+    fn result(&self) -> Result<(Settings, Option<mh_files_core::sorting::Config>), String> {
+        let categories = self.categories.result()?;
+        Ok((self.settings()?, categories))
+    }
+
+    fn settings(&self) -> Result<Settings, String> {
         let mut settings = self.draft.clone().sanitized();
         let mut keys = BTreeMap::new();
         let mut seen: BTreeMap<String, CommandId> = BTreeMap::new();
         for (&command, text) in &self.keys {
             let mut parsed = Vec::new();
-            for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            for part in crate::commands::split_chords(text) {
                 let chord = parse_chord(part).ok_or_else(|| {
                     format!("«{part}» у команды «{}» не разобрано", command.name())
                 })?;
@@ -127,7 +146,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         .with_title("MH Files — настройки")
         .with_inner_size([900.0, 620.0])
         .with_min_inner_size([760.0, 480.0]);
-    let mut applied: Option<Settings> = None;
+    let mut applied: Option<(Settings, Option<mh_files_core::sorting::Config>)> = None;
     let mut close = false;
     let index_status = app.indexer.status();
     let elevated = app.indexer.elevated();
@@ -136,7 +155,6 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         path: app.sorter.path.clone(),
         history: app.sorter.history.clone(),
         error: app.sorter.error.clone(),
-        warnings: app.sorter.classifier.warnings.clone(),
         categories: app.sorter.classifier.category_count(),
         extensions: app.sorter.classifier.extension_count,
     };
@@ -241,7 +259,10 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             let info = IndexInfo { status: &index_status, elevated };
                             rescan |= index(ui, state, &info);
                         }
-                        Page::Sorting => sort_action = sorting(ui, &mut state.draft, &sort_info),
+                        Page::Sorting => {
+                            sort_action =
+                                sorting(ui, &mut state.draft, &mut state.categories, &sort_info)
+                        }
                         Page::System => system_action = system(ui, &mut state.draft, &system_info),
                         Page::Keys => keys(ui, &mut state.keys),
                         Page::About => about(ui),
@@ -249,8 +270,13 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                 });
             });
     });
-    if let Some(settings) = applied {
+    if let Some((settings, categories)) = applied {
         app.apply_settings(ctx, settings);
+        if let Some(config) = categories {
+            app.settings_window.categories.saved(&config);
+            app.sorter.set_config(config.clone());
+            app.workers.save_categories(config, app.sorter.path.clone());
+        }
     }
     if rescan {
         app.indexer.rescan();
@@ -277,7 +303,9 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     match sort_action {
         Some(SortAction::Reload) => {
             app.sorter.reload();
-            app.settings_window.status = Some(("категории перечитаны".into(), false));
+            app.settings_window.categories =
+                crate::categories_editor::Editor::new(&app.sorter.config);
+            app.settings_window.status = Some(("категории перечитаны из файла".into(), false));
         }
         Some(SortAction::OpenFile) => {
             app.workers.shell(mh_files_fs::ShellJob::Open(sort_info.path.clone()));
@@ -625,7 +653,6 @@ struct SortInfo {
     path: std::path::PathBuf,
     history: std::path::PathBuf,
     error: Option<String>,
-    warnings: Vec<String>,
     categories: usize,
     extensions: usize,
 }
@@ -637,7 +664,12 @@ enum SortAction {
 }
 
 /// Страница сортировщика: галочки по умолчанию и файл категорий.
-fn sorting(ui: &mut Ui, s: &mut Settings, info: &SortInfo) -> Option<SortAction> {
+fn sorting(
+    ui: &mut Ui,
+    s: &mut Settings,
+    editor: &mut crate::categories_editor::Editor,
+    info: &SortInfo,
+) -> Option<SortAction> {
     let mut action = None;
     widgets::hint(
         ui,
@@ -668,13 +700,15 @@ fn sorting(ui: &mut Ui, s: &mut Settings, info: &SortInfo) -> Option<SortAction>
         );
         widgets::hint(ui, "Галочки, изменённые во вкладке сортировщика, запоминаются сами.");
     });
-    card(ui, "Категории", |ui| {
+    crate::categories_editor::show(ui, editor, s.sorting.type_folders);
+    card(ui, "Файл categories.json", |ui| {
         ui.label(format!("Категорий: {}, расширений: {}", info.categories, info.extensions));
         if let Some(error) = &info.error {
             ui.label(RichText::new(error).color(theme::CRITICAL));
-        }
-        for warning in &info.warnings {
-            ui.label(RichText::new(warning).color(theme::WARN));
+            widgets::hint(
+                ui,
+                "Если сохранить категории отсюда, файл с ошибкой останется рядом как categories.json.broken.",
+            );
         }
         widgets::hint(ui, &info.path.display().to_string());
         widgets::hint(
@@ -685,7 +719,13 @@ fn sorting(ui: &mut Ui, s: &mut Settings, info: &SortInfo) -> Option<SortAction>
             if ui.button("Открыть categories.json").clicked() {
                 action = Some(SortAction::OpenFile);
             }
-            if ui.button("Перечитать").clicked() {
+            if ui
+                .button("Перечитать")
+                .on_hover_text(
+                    "Взять категории из файла, если его правили в редакторе; правка здесь пропадёт",
+                )
+                .clicked()
+            {
                 action = Some(SortAction::Reload);
             }
         });

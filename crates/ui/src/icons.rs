@@ -33,6 +33,11 @@ pub fn arrow_up(painter: &Painter, rect: Rect, color: Color32) {
     polyline(painter, rect, color, &[(0.5, 0.2), (0.5, 0.9)]);
 }
 
+pub fn arrow_down(painter: &Painter, rect: Rect, color: Color32) {
+    polyline(painter, rect, color, &[(0.15, 0.45), (0.5, 0.8), (0.85, 0.45)]);
+    polyline(painter, rect, color, &[(0.5, 0.1), (0.5, 0.8)]);
+}
+
 pub fn chevron_right(painter: &Painter, rect: Rect, color: Color32) {
     polyline(painter, rect, color, &[(0.35, 0.2), (0.65, 0.5), (0.35, 0.8)]);
 }

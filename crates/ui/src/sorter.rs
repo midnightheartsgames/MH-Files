@@ -90,7 +90,7 @@ const SPARE_COLORS: [[u8; 3]; 6] = [
 const UNKNOWN: Look = Look { icon: ph::fill::QUESTION, color: Color32::from_rgb(0x84, 0x90, 0xAB) };
 
 /// Значок и цвет по расширениям категории: переименованная категория выглядит так же.
-fn look_for(name: &str, extensions: &[String]) -> Look {
+pub fn look_for(name: &str, extensions: &[String]) -> Look {
     let mut best: Option<(usize, &str, [u8; 3])> = None;
     for &(icon, rgb, known) in KINDS {
         let hits = extensions
@@ -149,6 +149,15 @@ impl Shared {
         };
         shared.rebuild();
         shared
+    }
+
+    /// Категории из настроек: в памяти сразу, файл пишется в фоне.
+    pub fn set_config(&mut self, config: Config) {
+        self.classifier = Arc::new(Classifier::new(&config));
+        self.config = config;
+        self.error = None;
+        self.revision += 1;
+        self.rebuild();
     }
 
     pub fn reload(&mut self) {
@@ -612,6 +621,9 @@ pub fn show(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     if actions.reload_categories {
         app.sorter.reload();
     }
+    if actions.edit_categories {
+        app.settings_window.open_sorting(&app.settings, &app.sorter.config);
+    }
 }
 
 #[derive(Default)]
@@ -620,6 +632,7 @@ struct Actions {
     undo: bool,
     rescan: bool,
     reload_categories: bool,
+    edit_categories: bool,
     open: Option<PathBuf>,
 }
 
@@ -745,13 +758,18 @@ fn options_panel(ui: &mut Ui, view: &mut SortView, actions: &mut Actions) {
                 .collect();
         }
         ui.add_space(4.0);
-        if ui
-            .button("Перечитать categories.json")
-            .on_hover_text("Настройки, раздел «Сортировка»")
-            .clicked()
-        {
-            actions.reload_categories = true;
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Изменить категории…").clicked() {
+                actions.edit_categories = true;
+            }
+            if ui
+                .button("Перечитать categories.json")
+                .on_hover_text("Если файл правили в редакторе")
+                .clicked()
+            {
+                actions.reload_categories = true;
+            }
+        });
     });
 }
 
@@ -1105,7 +1123,7 @@ fn paint_check(ui: &Ui, rect: Rect, state: Option<bool>, hovered: bool) {
 }
 
 /// Цветной значок категории.
-fn paint_chip(ui: &Ui, rect: Rect, look: Option<Look>) {
+pub fn paint_chip(ui: &Ui, rect: Rect, look: Option<Look>) {
     let painter = ui.painter();
     match look {
         Some(look) => {

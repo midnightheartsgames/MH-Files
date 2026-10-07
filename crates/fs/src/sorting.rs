@@ -84,7 +84,27 @@ pub fn save_categories(config: &Config, path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(path, config.to_json())
+    // Через временный файл: при сбое остаётся прежний файл целиком.
+    let temp = path.with_extension("json.tmp");
+    fs::write(&temp, config.to_json())?;
+    fs::rename(&temp, path)
+}
+
+/// Записать категории из настроек. Испорченный файл (его правили руками и ошиблись) не
+/// пропадает: сначала копируется в `categories.json.broken`. Возвращает путь копии.
+pub fn replace_categories(config: &Config, path: &Path) -> Result<Option<PathBuf>, String> {
+    let broken = match fs::read_to_string(path) {
+        Ok(text) if Config::parse(&text).is_err() => {
+            let copy = path.with_extension("json.broken");
+            fs::copy(path, &copy)
+                .map_err(|e| format!("Не удалось сохранить копию {}: {e}", copy.display()))?;
+            Some(copy)
+        }
+        _ => None,
+    };
+    save_categories(config, path)
+        .map_err(|e| format!("Не удалось записать {}: {e}", path.display()))?;
+    Ok(broken)
 }
 
 /// Почему эту папку сортировать нельзя (или `None`, если можно).
@@ -565,6 +585,25 @@ pub fn prune(dir: &Path, keep: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_keeps_broken_file() {
+        let dir = std::env::temp_dir().join(format!("mh-files-categories-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join(CONFIG_FILE);
+        // Файла нет — просто пишется.
+        assert_eq!(replace_categories(&Config::default(), &path), Ok(None));
+        assert!(Config::parse(&fs::read_to_string(&path).unwrap()).is_ok());
+        // Испорченный — копия рядом, затем новый.
+        touch(&path, "{ испорчен");
+        let config = Config { unknown_category: "Разное".into(), ..Config::default() };
+        let copy = replace_categories(&config, &path).unwrap().expect("копия");
+        assert_eq!(fs::read_to_string(&copy).unwrap(), "{ испорчен");
+        let saved = Config::parse(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.unknown_category, "Разное");
+        assert!(!path.with_extension("json.tmp").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     pub fn touch(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
