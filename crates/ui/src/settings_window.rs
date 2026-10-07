@@ -8,7 +8,8 @@ use eframe::egui::{
     ViewportBuilder, ViewportClass, ViewportCommand, ViewportId, vec2,
 };
 use mh_files_core::settings::{
-    MAX_FONT_SCALE, MAX_GRID, MIN_FONT_SCALE, MIN_GRID, NewTabLocation, Settings,
+    MAX_FONT_SCALE, MAX_GRID, MAX_LIST_SCALE, MIN_FONT_SCALE, MIN_GRID, MIN_LIST_SCALE,
+    NewTabLocation, Settings,
 };
 
 use crate::app::FilesApp;
@@ -415,6 +416,13 @@ fn appearance(ui: &mut Ui, s: &mut Settings) {
                 egui::Slider::new(&mut s.appearance.grid_size, MIN_GRID..=MAX_GRID)
                     .step_by(8.0)
                     .suffix(" точек"),
+            );
+        });
+        row(ui, "Размер строк", |ui| {
+            ui.add(
+                egui::Slider::new(&mut s.appearance.list_scale, MIN_LIST_SCALE..=MAX_LIST_SCALE)
+                    .step_by(0.1)
+                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0)),
             );
         });
     });

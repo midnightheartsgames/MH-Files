@@ -869,6 +869,9 @@ fn list_view(
         start_band(ui, tab, pos);
     }
     background.context_menu(|ui| background_menu(ui, app, tab));
+    if ui.rect_contains_pointer(area) {
+        app.wheel_resize(ui.ctx(), tab.view);
+    }
 
     if tab.view == ViewMode::Columns {
         crate::columns::show(ui, pane, tab, app, focused);
@@ -1042,7 +1045,18 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool, targets:
 }
 
 pub(crate) fn row_height(app: &FilesApp) -> f32 {
-    if app.settings.appearance.compact { 22.0 } else { 27.0 }
+    let base = if app.settings.appearance.compact { 22.0 } else { 27.0 };
+    (base * app.settings.appearance.list_scale).round()
+}
+
+/// Значок в строке высотой `height`: растёт вместе с размером строк.
+pub(crate) fn row_icon(app: &FilesApp, height: f32) -> f32 {
+    (height - 9.0).clamp(14.0, 20.0 * app.settings.appearance.list_scale)
+}
+
+/// Шрифт строки списка с учётом размера строк.
+pub(crate) fn row_font(app: &FilesApp, size: f32) -> egui::FontId {
+    theme::regular(size * app.settings.appearance.list_scale)
 }
 
 /// Прокрутка, при которой строка `top..top+height` видна.
@@ -1278,21 +1292,21 @@ pub(crate) fn item(
     match look {
         Look::Row { search } => {
             let layout = column_layout(app, rect.left(), rect.width() - 12.0, search);
-            let icon_size = (rect.height() - 9.0).clamp(14.0, 20.0);
+            let icon_size = row_icon(app, rect.height());
             let icon_rect = Rect::from_center_size(
-                pos2(layout.name.0 + 18.0, rect.center().y),
+                pos2(layout.name.0 + 8.0 + icon_size / 2.0, rect.center().y),
                 vec2(icon_size, icon_size),
             );
             paint_icon(ui, app, &entry, icon_rect, dim);
             let name_rect = Rect::from_x_y_ranges(
-                (layout.name.0 + 34.0)..=(layout.name.1 - 6.0),
+                (layout.name.0 + 14.0 + icon_size)..=(layout.name.1 - 6.0),
                 rect.y_range(),
             );
             if renaming {
                 rename_editor(ui, tab, app, name_rect.shrink2(vec2(0.0, 2.0)));
             } else {
                 let galley =
-                    elided(ui, &shown_name, theme::regular(14.0), text_color, name_rect.width());
+                    elided(ui, &shown_name, row_font(app, 14.0), text_color, name_rect.width());
                 painter.galley(
                     pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0),
                     galley,
@@ -1300,7 +1314,7 @@ pub(crate) fn item(
                 );
             }
             let secondary = theme::TEXT_SECONDARY;
-            let font = theme::regular(13.0);
+            let font = row_font(app, 13.0);
             if let (Some(modified), Some((x0, x1))) = (entry.modified, layout.modified) {
                 let text = if app.settings.files.relative_dates {
                     format::date(modified)
@@ -1349,19 +1363,20 @@ pub(crate) fn item(
             name_end = layout.name.1;
         }
         Look::Column => {
-            let icon_size = (rect.height() - 9.0).clamp(14.0, 20.0);
+            let icon_size = row_icon(app, rect.height());
             let icon_rect = Rect::from_center_size(
-                pos2(rect.left() + 16.0, rect.center().y),
+                pos2(rect.left() + 6.0 + icon_size / 2.0, rect.center().y),
                 vec2(icon_size, icon_size),
             );
             paint_icon(ui, app, &entry, icon_rect, dim);
             let right = if entry.is_dir() { rect.right() - 22.0 } else { rect.right() - 8.0 };
-            let name_rect = Rect::from_x_y_ranges((rect.left() + 30.0)..=right, rect.y_range());
+            let name_rect =
+                Rect::from_x_y_ranges((rect.left() + 10.0 + icon_size)..=right, rect.y_range());
             if renaming {
                 rename_editor(ui, tab, app, name_rect.shrink2(vec2(0.0, 2.0)));
             } else {
                 let galley =
-                    elided(ui, &shown_name, theme::regular(14.0), text_color, name_rect.width());
+                    elided(ui, &shown_name, row_font(app, 14.0), text_color, name_rect.width());
                 painter.galley(
                     pos2(name_rect.left(), rect.center().y - galley.size().y / 2.0),
                     galley,

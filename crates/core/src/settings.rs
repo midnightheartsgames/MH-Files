@@ -12,6 +12,8 @@ pub const MIN_FONT_SCALE: f32 = 0.8;
 pub const MAX_FONT_SCALE: f32 = 1.6;
 pub const MIN_GRID: f32 = 64.0;
 pub const MAX_GRID: f32 = 256.0;
+pub const MIN_LIST_SCALE: f32 = 0.8;
+pub const MAX_LIST_SCALE: f32 = 2.0;
 pub const MIN_SIDE_WIDTH: f32 = 150.0;
 pub const MAX_SIDE_WIDTH: f32 = 600.0;
 
@@ -184,6 +186,8 @@ pub struct Appearance {
     pub compact: bool,
     /// Сторона плитки в режиме «Плитки», точки.
     pub grid_size: f32,
+    /// Размер строк таблицы и колонок: высота, значки и шрифт вместе (1 — обычный).
+    pub list_scale: f32,
     pub accent: [u8; 3],
     pub animations: bool,
     /// Значки файлов из Windows; выключено — свои значки в стиле MH.
@@ -288,6 +292,7 @@ impl Default for Appearance {
             font_scale: 1.0,
             compact: false,
             grid_size: 112.0,
+            list_scale: 1.0,
             accent: ACCENT,
             animations: true,
             system_icons: true,
@@ -370,6 +375,7 @@ impl Settings {
         let a = &mut self.appearance;
         a.font_scale = clamp(a.font_scale, MIN_FONT_SCALE, MAX_FONT_SCALE, 1.0);
         a.grid_size = clamp(a.grid_size, MIN_GRID, MAX_GRID, 112.0);
+        a.list_scale = clamp(a.list_scale, MIN_LIST_SCALE, MAX_LIST_SCALE, 1.0);
         let p = &mut self.panes;
         p.sidebar_width = clamp(p.sidebar_width, MIN_SIDE_WIDTH, MAX_SIDE_WIDTH, 230.0);
         p.inspector_width = clamp(p.inspector_width, MIN_SIDE_WIDTH, MAX_SIDE_WIDTH, 300.0);
