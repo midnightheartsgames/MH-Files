@@ -6,6 +6,7 @@ use mh_files_core::location::Location;
 use mh_files_core::session::ViewMode;
 
 use crate::app::{Action, FilesApp, Level};
+use crate::commands::CommandId;
 use crate::{icons, theme, widgets};
 
 pub fn show(ui: &mut Ui, app: &mut FilesApp) {
@@ -66,6 +67,16 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
+            let settings = app.keymap.label(CommandId::Settings);
+            let tip = if settings.is_empty() {
+                "Настройки MH Files".to_string()
+            } else {
+                format!("Настройки MH Files ({settings})")
+            };
+            if widgets::icon_button(ui, true, &tip, icons::gear).clicked() {
+                app.actions.push(Action::Run(CommandId::Settings));
+            }
+            ui.add_space(6.0);
             let zoom = (app.settings.appearance.font_scale * 100.0).round();
             ui.label(
                 RichText::new(format!("{zoom}%"))

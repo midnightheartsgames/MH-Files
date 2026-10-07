@@ -203,6 +203,8 @@ pub struct Files {
     pub confirm_recycle: bool,
     /// Даты «Сегодня 12:30» вместо полной даты.
     pub relative_dates: bool,
+    /// Пункты меню Проводника (7-Zip, Git, «Отправить»…) прямо в своём контекстном меню.
+    pub windows_menu_items: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -303,6 +305,7 @@ impl Default for Files {
             folders_first: true,
             confirm_recycle: false,
             relative_dates: true,
+            windows_menu_items: true,
         }
     }
 }

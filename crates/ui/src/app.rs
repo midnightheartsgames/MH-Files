@@ -269,6 +269,11 @@ pub struct FilesApp {
     pub columns: Columns,
     /// Первый шаг последовательности клавиш и когда он нажат.
     pub pending_chord: Option<(egui::KeyboardShortcut, Instant)>,
+    /// Ctrl+прокрутка, не дотянувшая до шага масштаба, и время последней (`input.time`).
+    pub zoom_rest: (f32, f64),
+    /// Пункты меню Windows для открытого сейчас контекстного меню.
+    pub shell_menu: Option<crate::shell_menu::ShellMenu>,
+    pub shell_menu_generation: u64,
     /// Посчитанные размеры папок (целиком) и те, что ещё считаются.
     pub folder_sizes: HashMap<PathBuf, DirSize>,
     pub sizes_pending: HashSet<PathBuf>,
@@ -350,6 +355,9 @@ impl FilesApp {
             drop_menu: None,
             columns: Columns::default(),
             pending_chord: None,
+            zoom_rest: (0.0, 0.0),
+            shell_menu: None,
+            shell_menu_generation: 0,
             folder_sizes: HashMap::new(),
             sizes_pending: HashSet::new(),
             sizes_cancel: None,
@@ -751,6 +759,9 @@ impl FilesApp {
             Event::Preflight { transfer, conflicts } => self.on_preflight(transfer, conflicts),
             Event::FolderSize { ticket, path, size } => self.on_folder_size(ticket, path, size),
             Event::Menu { paths, choice } => self.on_menu(paths, choice),
+            Event::ShellMenu { generation, items, commands } => {
+                crate::shell_menu::on_ready(self, ctx, generation, items, commands);
+            }
             Event::IndexResults { ticket, result } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
                     tab.on_index_results(ticket, result);
@@ -1006,6 +1017,7 @@ impl FilesApp {
             dialogs::show(&ctx, self);
         }
         settings_window::show(&ctx, self);
+        crate::shell_menu::end_frame(self);
 
         self.handle_drops(&ctx);
         self.run_actions(&ctx);
@@ -1549,7 +1561,7 @@ fn apply_sizes(tab: &mut Tab, sizes: &HashMap<PathBuf, DirSize>) {
     }
 }
 
-/// Корни дисков без опроса: показать сразу, пока идёт опрос.
+/// Подпись диска: «C: Локальный диск», «D: Фото».
 pub fn drive_title(drive: &DriveInfo) -> String {
     let root = mh_files_core::location::path_label(&drive.root);
     let kind = match drive.kind {
@@ -1559,7 +1571,8 @@ pub fn drive_title(drive: &DriveInfo) -> String {
         _ => "Локальный диск",
     };
     let label = if drive.label.is_empty() { kind } else { drive.label.as_str() };
-    format!("{label} ({root})")
+    // Буква первой: диски в списке выравниваются по ней и ищутся с первого символа.
+    format!("{root} {label}")
 }
 
 /// Корень диска для пути: по нему решается «переместить или копировать» при перетаскивании.

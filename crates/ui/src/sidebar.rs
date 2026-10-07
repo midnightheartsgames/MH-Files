@@ -11,6 +11,7 @@ use eframe::egui::{
 use mh_files_core::format;
 use mh_files_core::location::Location;
 use mh_files_core::settings::Group;
+use mh_files_platform::shell::MenuTarget;
 
 use crate::app::{Action, DropZone, FilesApp, Target, drive_title};
 use crate::{icons, theme, widgets};
@@ -348,6 +349,9 @@ fn location_menu(
         if ui.button("Копировать путь").clicked() {
             ui.ctx().copy_text(path.display().to_string());
             ui.close();
+        }
+        if crate::shell_menu::section(ui, app, MenuTarget::Items(vec![path.clone()])) {
+            ui.separator();
         }
         if ui.button("Свойства").clicked() {
             app.actions.push(Action::Shell(mh_files_fs::ShellJob::Properties(vec![path.clone()])));

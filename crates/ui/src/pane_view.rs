@@ -3,7 +3,7 @@
 //! Список виртуальный: рисуются только видимые строки, поэтому сто тысяч записей прокручиваются
 //! так же, как десять. Ввод-вывода здесь нет: всё, что нужно с диска, просится у воркеров.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::{
@@ -18,6 +18,7 @@ use mh_files_core::location::{Location, path_label};
 use mh_files_core::selection::Modifiers;
 use mh_files_core::session::ViewMode;
 use mh_files_core::sort::SortColumn;
+use mh_files_platform::shell::MenuTarget;
 
 use crate::app::{Action, DragFiles, DragTab, DropZone, FilesApp, Target};
 use crate::commands::CommandId;
@@ -979,18 +980,20 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
         menu_item(ui, app, command);
     }
     ui.separator();
-    for command in [
-        CommandId::AddFavorite,
-        CommandId::OpenTerminal,
-        CommandId::WindowsMenu,
-        CommandId::Properties,
-    ] {
-        menu_item(ui, app, command);
+    menu_item(ui, app, CommandId::AddFavorite);
+    menu_item(ui, app, CommandId::OpenTerminal);
+    match tab.dir() {
+        Some(dir) if crate::shell_menu::enabled(app) => {
+            crate::shell_menu::section(ui, app, MenuTarget::Background(dir));
+            ui.separator();
+        }
+        _ => menu_item(ui, app, CommandId::WindowsMenu),
     }
+    menu_item(ui, app, CommandId::Properties);
 }
 
-/// Контекстное меню объектов.
-fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool) {
+/// Контекстное меню объектов: свои команды, ниже — пункты Windows для `targets`.
+fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool, targets: Vec<PathBuf>) {
     ui.set_min_width(270.0);
     menu_item(ui, app, CommandId::Open);
     if is_dir {
@@ -1028,7 +1031,13 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool) {
         menu_item(ui, app, CommandId::SortFolder);
     }
     menu_item(ui, app, CommandId::RevealInExplorer);
-    menu_item(ui, app, CommandId::WindowsMenu);
+    // В архиве объектов нет на диске — и меню Windows для них нет.
+    if crate::shell_menu::enabled(app) && app.available_cached(CommandId::WindowsMenu) {
+        crate::shell_menu::section(ui, app, MenuTarget::Items(targets));
+        ui.separator();
+    } else {
+        menu_item(ui, app, CommandId::WindowsMenu);
+    }
     menu_item(ui, app, CommandId::Properties);
 }
 
@@ -1458,7 +1467,7 @@ pub(crate) fn item(
     }
     let many = tab.selection.len() > 1;
     let is_dir = entry.is_dir();
-    response.context_menu(|ui| item_menu(ui, app, is_dir, many));
+    response.context_menu(|ui| item_menu(ui, app, is_dir, many, tab.targets()));
 }
 
 /// Имя для показа: без расширения, если так настроено.

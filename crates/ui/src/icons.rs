@@ -216,6 +216,23 @@ pub fn computer(painter: &Painter, rect: Rect, color: Color32) {
     polyline(painter, rect, color, &[(0.5, 0.7), (0.5, 0.9)]);
 }
 
+/// Шестерёнка — настройки MH Files.
+pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
+    let center = rect.center();
+    let ring = rect.width() * 0.3;
+    let stroke = stroke(rect, color);
+    painter.circle_stroke(center, ring, stroke);
+    painter.circle_stroke(center, rect.width() * 0.1, stroke);
+    for tooth in 0..8 {
+        let angle = tooth as f32 * std::f32::consts::TAU / 8.0;
+        let direction = vec2(angle.cos(), angle.sin());
+        painter.line_segment(
+            [center + direction * ring, center + direction * rect.width() * 0.48],
+            stroke,
+        );
+    }
+}
+
 /// Цвет метки файла по типу.
 pub fn category_color(ext: &str) -> Color32 {
     match ext {

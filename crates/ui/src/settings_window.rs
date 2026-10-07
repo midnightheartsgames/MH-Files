@@ -144,6 +144,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     }
     let builder = ViewportBuilder::default()
         .with_title("MH Files — настройки")
+        .with_icon(crate::settings_icon())
         .with_inner_size([900.0, 620.0])
         .with_min_inner_size([760.0, 480.0]);
     let mut applied: Option<(Settings, Option<mh_files_core::sorting::Config>)> = None;
@@ -463,6 +464,17 @@ fn files(ui: &mut Ui, s: &mut Settings) {
         switch_row(ui, "Расширения имён", None, &mut s.files.show_extensions);
         switch_row(ui, "Папки первыми", None, &mut s.files.folders_first);
         switch_row(ui, "Даты «Сегодня», «Вчера»", None, &mut s.files.relative_dates);
+    });
+    card(ui, "Контекстное меню", |ui| {
+        switch_row(
+            ui,
+            "Пункты меню Windows",
+            Some(
+                "7-Zip, Git, «Отправить», «Открыть с помощью» и другие пункты Проводника — \
+                 под командами MH Files. Полное меню Windows — Shift+F10.",
+            ),
+            &mut s.files.windows_menu_items,
+        );
     });
     card(ui, "Удаление", |ui| {
         switch_row(

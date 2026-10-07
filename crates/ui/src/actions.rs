@@ -39,7 +39,45 @@ const IN_TEXT: &[CommandId] = &[
     CommandId::SearchEverywhere,
 ];
 
+/// Шаг масштаба: Ctrl+Plus/Minus и один щелчок колеса с Ctrl.
+const ZOOM_STEP: f32 = 0.1;
+
+/// Сколько натечь Ctrl+прокрутки (логарифм множителя egui) на один шаг масштаба. Щелчок
+/// колеса даёт около 0,2 (40 точек × 1/200), но egui размазывает его на несколько кадров;
+/// тачпад и жест щипка дают мелкие доли — шаги идут по мере жеста.
+const WHEEL_ZOOM_STEP: f32 = 0.12;
+
+/// Пауза, после которой недокрученный остаток забывается: иначе следующий щелчок колеса
+/// через минуту дал бы два шага.
+const WHEEL_ZOOM_IDLE: f64 = 0.3;
+
 impl FilesApp {
+    /// Ctrl+колесо мыши (и щипок на тачпаде) — масштаб, как Ctrl+Plus/Minus. egui сам не
+    /// прокручивает списки, пока зажат Ctrl, а отдаёт прокрутку множителем `zoom_delta`.
+    fn wheel_zoom(&mut self, ctx: &egui::Context) {
+        let (delta, now) = ctx.input(|i| (i.zoom_delta(), i.time));
+        let (mut accumulated, last) = self.zoom_rest;
+        if delta == 1.0 {
+            if now - last > WHEEL_ZOOM_IDLE {
+                self.zoom_rest.0 = 0.0;
+            }
+            return;
+        }
+        accumulated += delta.ln();
+        let command = if accumulated >= WHEEL_ZOOM_STEP {
+            Some(CommandId::ZoomIn)
+        } else if accumulated <= -WHEEL_ZOOM_STEP {
+            Some(CommandId::ZoomOut)
+        } else {
+            None
+        };
+        if let Some(command) = command {
+            accumulated = 0.0;
+            self.actions.push(Action::Run(command));
+        }
+        self.zoom_rest = (accumulated, now);
+    }
+
     pub(crate) fn handle_keys(&mut self, ctx: &egui::Context) {
         // Сбрасываются каждый кадр, даже когда открыт диалог: иначе сработают позже невпопад.
         let intercepted = mh_files_platform::window::take_intercepted();
@@ -50,6 +88,7 @@ impl FilesApp {
         if overlay {
             return;
         }
+        self.wheel_zoom(ctx);
         let text_focus = ctx.egui_wants_keyboard_input();
         let renaming = self.tab().rename.is_some();
         if !text_focus && !renaming {
@@ -625,8 +664,8 @@ impl FilesApp {
             ZoomIn | ZoomOut | ZoomReset => {
                 let scale = &mut self.settings.appearance.font_scale;
                 *scale = match command {
-                    ZoomIn => *scale + 0.1,
-                    ZoomOut => *scale - 0.1,
+                    ZoomIn => *scale + ZOOM_STEP,
+                    ZoomOut => *scale - ZOOM_STEP,
                     _ => 1.0,
                 };
                 let settings = std::mem::take(&mut self.settings).sanitized();

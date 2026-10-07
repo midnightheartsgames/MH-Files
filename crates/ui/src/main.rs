@@ -22,6 +22,7 @@ mod pane_view;
 mod preview_ui;
 mod quick;
 mod settings_window;
+mod shell_menu;
 mod sidebar;
 mod sorter;
 mod startup;
@@ -128,30 +129,68 @@ fn instance_key(data: &std::path::Path) -> String {
     format!("MH-Files-{hash:016x}")
 }
 
+/// Сторона значков окон в пикселях.
+const ICON_SIZE: usize = 64;
+const ICON_BACKGROUND: [u8; 4] = [0x12, 0x16, 0x1D, 0xFF];
+const ICON_ACCENT: [u8; 4] = [0x3F, 0xD0, 0xD8, 0xFF];
+
 /// Значок окна рисуется кодом: три столбика акцента, как у MH Sidebar, на тёмной плитке.
 fn app_icon() -> IconData {
-    const SIZE: usize = 64;
+    icon_tile(|x, y| {
+        [(22.0, 15.0), (40.0, 28.0), (30.0, 41.0)].iter().any(|&(height, left)| {
+            (left..left + 9.0).contains(&x) && (52.0 - height..52.0).contains(&y)
+        })
+    })
+}
+
+/// Значок окна настроек: на той же плитке — шестерёнка, чтобы на панели задач и в Alt+Tab
+/// настройки не путались с главным окном.
+pub(crate) fn settings_icon() -> std::sync::Arc<IconData> {
+    static ICON: std::sync::OnceLock<std::sync::Arc<IconData>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| {
+        std::sync::Arc::new(icon_tile(|x, y| {
+            let (dx, dy) = (x - 32.0, y - 32.0);
+            let radius = dx.hypot(dy);
+            // Восемь зубцов: доля оборота внутри своего сектора меньше половины — зубец.
+            let turn = (dy.atan2(dx) / std::f32::consts::TAU * 8.0).rem_euclid(1.0);
+            let outer = if (0.25..0.75).contains(&turn) { 25.0 } else { 19.0 };
+            (9.0..outer).contains(&radius)
+        }))
+    })
+    .clone()
+}
+
+/// Тёмная скруглённая плитка с рисунком цвета акцента: `inside(x, y)` — точка рисунка.
+/// Края сглажены: каждый пиксель — среднее 4×4 точек.
+fn icon_tile(inside: impl Fn(f32, f32) -> bool) -> IconData {
+    const SIZE: usize = ICON_SIZE;
+    const SAMPLES: usize = 4;
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
-    let background = [0x12, 0x16, 0x1D, 0xFF];
-    let accent = [0x3F, 0xD0, 0xD8, 0xFF];
     let radius = 12.0f32;
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let cx = fx.clamp(radius, SIZE as f32 - radius);
-            let cy = fy.clamp(radius, SIZE as f32 - radius);
-            let inside = (fx - cx).powi(2) + (fy - cy).powi(2) <= radius * radius;
-            if inside {
-                rgba[(y * SIZE + x) * 4..][..4].copy_from_slice(&background);
+            let (mut tile, mut mark) = (0usize, 0usize);
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let fx = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
+                    let fy = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
+                    let cx = fx.clamp(radius, SIZE as f32 - radius);
+                    let cy = fy.clamp(radius, SIZE as f32 - radius);
+                    if (fx - cx).powi(2) + (fy - cy).powi(2) <= radius * radius {
+                        tile += 1;
+                        mark += usize::from(inside(fx, fy));
+                    }
+                }
             }
-        }
-    }
-    for (i, height) in [22usize, 40, 30].into_iter().enumerate() {
-        let left = 15 + i * 13;
-        for y in (52 - height)..52 {
-            for x in left..left + 9 {
-                rgba[(y * SIZE + x) * 4..][..4].copy_from_slice(&accent);
+            let pixel = &mut rgba[(y * SIZE + x) * 4..][..4];
+            let total = (SAMPLES * SAMPLES) as f32;
+            let share = mark as f32 / tile.max(1) as f32;
+            for channel in 0..3 {
+                let mixed = f32::from(ICON_BACKGROUND[channel]) * (1.0 - share)
+                    + f32::from(ICON_ACCENT[channel]) * share;
+                pixel[channel] = mixed.round() as u8;
             }
+            pixel[3] = (tile as f32 / total * 255.0).round() as u8;
         }
     }
     IconData { rgba, width: SIZE as u32, height: SIZE as u32 }

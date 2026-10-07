@@ -18,7 +18,7 @@ use mh_files_platform::clipboard::ClipboardFiles;
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
 use mh_files_platform::integration;
-use mh_files_platform::shell::MenuChoice;
+use mh_files_platform::shell::{MenuChoice, ShellMenuItem};
 
 pub mod archive;
 mod archive_tool;
@@ -143,6 +143,13 @@ pub enum Event {
         ticket: Ticket,
         path: PathBuf,
         size: DirSize,
+    },
+    /// Пункты меню Windows для своего контекстного меню (поколение запроса — `generation`).
+    /// Номер выбранной команды — в `commands`; отпустить отправитель — меню закрыто.
+    ShellMenu {
+        generation: u64,
+        items: Result<Vec<ShellMenuItem>, String>,
+        commands: Sender<u32>,
     },
     /// Меню Windows закрыто; `paths` — для чего его открывали.
     Menu {

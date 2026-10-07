@@ -9,9 +9,16 @@ use std::cell::RefCell;
 use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
+use std::time::Duration;
+
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 
 use windows::Win32::Foundation::{
     ERROR_CANCELLED, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+};
+use windows::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+    GetDIBits, GetObjectW, HBITMAP, HGDIOBJ,
 };
 use windows::Win32::System::Com::IBindCtx;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -27,16 +34,19 @@ use windows::Win32::UI::Shell::{
     SHBindToParent, SHCreateDefaultContextMenu,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, GetCursorPos,
-    HMENU, PostMessageW, RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenuEx, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR,
-    WM_NULL, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
+    GetCursorPos, GetMenuItemCount, GetMenuItemInfoW, HMENU, MENUITEMINFOW, MFS_DISABLED,
+    MFT_OWNERDRAW, MFT_SEPARATOR, MIIM_BITMAP, MIIM_CHECKMARKS, MIIM_FTYPE, MIIM_ID, MIIM_STATE,
+    MIIM_STRING, MIIM_SUBMENU, MSG, PM_REMOVE, PeekMessageW, PostMessageW, RegisterClassW,
+    SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+    TranslateMessage, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WM_NULL,
+    WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
 };
-use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PSTR, w};
+use windows::core::{HRESULT, Interface, PCSTR, PCWSTR, PSTR, PWSTR, w};
 
 use super::com::{Apartment, describe, owner_hwnd, wide};
 use super::shell::Pidls;
-use crate::shell::{MenuChoice, MenuGate};
+use crate::shell::{MenuChoice, MenuGate, MenuIcon, MenuTarget, ShellMenuItem, menu_label};
 
 /// Номера команд расширений. Ноль `TrackPopupMenuEx` возвращает, если ничего не выбрали.
 const FIRST_COMMAND: u32 = 1;
@@ -58,13 +68,23 @@ pub fn context_menu(
 ) -> Result<MenuChoice, String> {
     let _com = Apartment::sta();
     let _ole = Ole::init();
+    let window = OwnerWindow::new()?;
+    let (menu, _pidls) = object_menu(paths, window.hwnd, extensions)?;
+    show(&menu, &window, None, gate)
+}
+
+/// Меню объектов. Одно меню умеет только объекты одной папки: остальные отбрасываются.
+/// PIDL возвращаются вместе с меню: пусть живут, пока живо оно.
+fn object_menu(
+    paths: &[PathBuf],
+    hwnd: HWND,
+    extensions: bool,
+) -> Result<(IContextMenu, Pidls), String> {
     let first = paths.first().ok_or("нет объектов для меню")?;
-    // Одно меню умеет только объекты одной папки: остальные отбрасываются.
     let same: Vec<PathBuf> =
         paths.iter().filter(|path| path.parent() == first.parent()).cloned().collect();
     let pidls = Pidls::new(&same)?;
     let absolute = pidls.as_const();
-    let window = OwnerWindow::new()?;
     // SAFETY: PIDL живут, пока жив `pidls`; относительные — указатели внутрь абсолютных.
     let menu: IContextMenu = unsafe {
         let folder: IShellFolder = SHBindToParent(absolute[0], None)
@@ -73,7 +93,7 @@ pub fn context_menu(
             absolute.iter().map(|&pidl| ILFindLastID(pidl).cast_const()).collect();
         if extensions {
             folder
-                .GetUIObjectOf(window.hwnd, &children, None)
+                .GetUIObjectOf(hwnd, &children, None)
                 .map_err(|error| describe("меню объектов недоступно", &error))?
         } else {
             let parent = first.parent().ok_or("у объекта нет папки")?;
@@ -82,7 +102,7 @@ pub fn context_menu(
                 children.iter().map(|&pidl| pidl.cast_mut()).collect();
             // Без ключей реестра (`aKeys`) в меню только встроенные команды Windows.
             let mut info = DEFCONTEXTMENU {
-                hwnd: window.hwnd,
+                hwnd,
                 pidlFolder: parent.as_const()[0].cast_mut(),
                 psf: ManuallyDrop::new(Some(folder)),
                 cidl: children.len() as u32,
@@ -94,26 +114,251 @@ pub fn context_menu(
             menu.map_err(|error| describe("меню объектов недоступно", &error))?
         }
     };
-    show(&menu, &window, None, gate)
+    Ok((menu, pidls))
 }
 
 pub fn background_menu(dir: &Path, gate: &MenuGate) -> Result<MenuChoice, String> {
     let _com = Apartment::sta();
     let _ole = Ole::init();
-    let pidls = Pidls::new(std::slice::from_ref(&dir.to_path_buf()))?;
     let window = OwnerWindow::new()?;
+    let menu = folder_menu(dir, window.hwnd)?;
+    let dir_w = wide(dir);
+    show(&menu, &window, Some(PCWSTR(dir_w.as_ptr())), gate)
+}
+
+/// Меню пустого места папки.
+fn folder_menu(dir: &Path, hwnd: HWND) -> Result<IContextMenu, String> {
+    let pidls = Pidls::new(std::slice::from_ref(&dir.to_path_buf()))?;
     // SAFETY: PIDL жив до конца вызова; папка хранит свою копию.
-    let menu: IContextMenu = unsafe {
+    unsafe {
         let folder: IShellFolder =
             SHBindToObject(None::<&IShellFolder>, pidls.as_const()[0], None::<&IBindCtx>).map_err(
                 |error| describe(&format!("папка {} недоступна", dir.display()), &error),
             )?;
-        folder
-            .CreateViewObject(window.hwnd)
-            .map_err(|error| describe("меню папки недоступно", &error))?
+        folder.CreateViewObject(hwnd).map_err(|error| describe("меню папки недоступно", &error))
+    }
+}
+
+/// См. [`crate::shell::live_menu`].
+pub fn live_menu(
+    target: &MenuTarget,
+    commands: &Receiver<u32>,
+    ready: impl FnOnce(Result<Vec<ShellMenuItem>, String>),
+) -> Result<MenuChoice, String> {
+    let _com = Apartment::sta();
+    let _ole = Ole::init();
+    // Shift в момент щелчка — как в Проводнике: расширенные команды.
+    let shift = key_down(VK_SHIFT);
+    let built = (|| {
+        let window = OwnerWindow::new()?;
+        let (menu, pidls) = match target {
+            MenuTarget::Items(paths) => {
+                let (menu, pidls) = object_menu(paths, window.hwnd, true)?;
+                (menu, Some(pidls))
+            }
+            MenuTarget::Background(dir) => (folder_menu(dir, window.hwnd)?, None),
+        };
+        let popup = Popup::new()?;
+        query(&menu, &popup, shift)?;
+        let items = read_menu(&menu, popup.0, 0);
+        Ok::<_, String>((window, menu, pidls, popup, items))
+    })();
+    let (window, menu, _pidls, _popup, items) = match built {
+        Ok(built) => built,
+        Err(error) => {
+            ready(Err(error));
+            return Ok(MenuChoice::Dismissed);
+        }
     };
-    let dir_w = wide(dir);
-    show(&menu, &window, Some(PCWSTR(dir_w.as_ptr())), gate)
+    ready(Ok(items));
+    let Some(id) = wait_command(commands) else {
+        return Ok(MenuChoice::Dismissed);
+    };
+    let Some(offset) = id.checked_sub(FIRST_COMMAND) else {
+        return Ok(MenuChoice::Dismissed);
+    };
+    let directory = match target {
+        MenuTarget::Background(dir) => Some(wide(dir)),
+        MenuTarget::Items(_) => None,
+    };
+    let mut cursor = POINT::default();
+    // SAFETY: простой запрос положения курсора.
+    let _ = unsafe { GetCursorPos(&mut cursor) };
+    let directory = directory.as_ref().map(|dir| PCWSTR(dir.as_ptr()));
+    let choice = invoke(&menu, &window, offset as usize, directory, shift, cursor);
+    // Меню — раньше своего окна-владельца и PIDL.
+    drop(menu);
+    choice
+}
+
+/// Номер выбранной команды; `None` — канал закрыт (меню закрыли). Пока ждёт, обслуживает
+/// сообщения окон потока: расширениям, которые что-то себе посылают, есть кому ответить.
+fn wait_command(commands: &Receiver<u32>) -> Option<u32> {
+    loop {
+        let mut msg = MSG::default();
+        // SAFETY: MSG живёт до конца вызовов; окна этого потока обслуживает этот же поток.
+        unsafe {
+            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+        match commands.recv_timeout(Duration::from_millis(30)) {
+            Ok(id) => return Some(id),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return None,
+        }
+    }
+}
+
+/// Сколько уровней подменю читать: «Отправить ▸» — второй, глубже почти не бывает.
+const MAX_DEPTH: usize = 3;
+
+/// Пункты меню Win32 одного уровня. Подменю сначала получают `WM_INITMENUPOPUP` — так их
+/// заполняют расширения («Отправить», «Создать», «Открыть с помощью»), как при показе.
+fn read_menu(menu: &IContextMenu, hmenu: HMENU, depth: usize) -> Vec<ShellMenuItem> {
+    // SAFETY: меню создано этим потоком и живо до конца функции.
+    let count = unsafe { GetMenuItemCount(Some(hmenu)) }.max(0) as u32;
+    let mut items = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let mut text = [0u16; 512];
+        let mut info = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_FTYPE
+                | MIIM_STATE
+                | MIIM_ID
+                | MIIM_SUBMENU
+                | MIIM_STRING
+                | MIIM_BITMAP
+                | MIIM_CHECKMARKS,
+            dwTypeData: PWSTR(text.as_mut_ptr()),
+            cch: text.len() as u32 - 1,
+            ..Default::default()
+        };
+        // SAFETY: буфер текста живёт до конца вызова, его размер — в `cch`.
+        if unsafe { GetMenuItemInfoW(hmenu, index, true, &mut info) }.is_err() {
+            continue;
+        }
+        if info.fType.contains(MFT_SEPARATOR) {
+            items.push(ShellMenuItem::Separator);
+            continue;
+        }
+        // У нарисованных расширением пунктов (MFT_OWNERDRAW) текста может не быть — такие
+        // пропускаются: показать их в своём меню нечем.
+        let len = (info.cch as usize).min(text.len());
+        let raw = if info.fType.contains(MFT_OWNERDRAW) {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&text[..len])
+        };
+        let label = menu_label(&raw);
+        if label.is_empty() {
+            continue;
+        }
+        let enabled = info.fState.0 & MFS_DISABLED.0 == 0;
+        let icon = menu_bitmap(info.hbmpItem).or_else(|| menu_bitmap(info.hbmpUnchecked));
+        if !info.hSubMenu.is_invalid() {
+            if depth + 1 >= MAX_DEPTH {
+                continue;
+            }
+            init_popup(menu, info.hSubMenu, index);
+            let children = read_menu(menu, info.hSubMenu, depth + 1);
+            items.push(ShellMenuItem::Submenu { label, icon, enabled, items: children });
+            continue;
+        }
+        if !(FIRST_COMMAND..=LAST_COMMAND).contains(&info.wID) {
+            continue;
+        }
+        let verb = verb_of(menu, (info.wID - FIRST_COMMAND) as usize);
+        items.push(ShellMenuItem::Command { id: info.wID, label, verb, icon, enabled });
+    }
+    items
+}
+
+/// Подменю вот-вот покажут: расширение заполняет его по `WM_INITMENUPOPUP`.
+fn init_popup(menu: &IContextMenu, submenu: HMENU, index: u32) {
+    let wparam = WPARAM(submenu.0 as usize);
+    let lparam = LPARAM(index as isize);
+    // SAFETY: параметры — те, что Windows шлёт при открытии подменю.
+    unsafe {
+        if let Ok(menu3) = menu.cast::<IContextMenu3>() {
+            let mut result = LRESULT(0);
+            let _ = menu3.HandleMenuMsg2(WM_INITMENUPOPUP, wparam, lparam, Some(&mut result));
+        } else if let Ok(menu2) = menu.cast::<IContextMenu2>() {
+            let _ = menu2.HandleMenuMsg(WM_INITMENUPOPUP, wparam, lparam);
+        }
+    }
+}
+
+/// Картинка пункта меню (32-бит, premultiplied alpha). Особые значения (`HBMMENU_CALLBACK` —
+/// значок рисует само расширение, системные кнопки окна) и пустые — `None`.
+fn menu_bitmap(bitmap: HBITMAP) -> Option<MenuIcon> {
+    // HBMMENU_CALLBACK = -1, системные HBMMENU_* — от 1 до 11.
+    if (-1..=11).contains(&(bitmap.0 as isize)) {
+        return None;
+    }
+    let mut header = BITMAP::default();
+    // SAFETY: GetObjectW пишет не больше переданного размера.
+    let size = unsafe {
+        GetObjectW(
+            HGDIOBJ(bitmap.0),
+            size_of::<BITMAP>() as i32,
+            Some(std::ptr::from_mut(&mut header).cast()),
+        )
+    };
+    let (width, height) = (header.bmWidth, header.bmHeight.abs());
+    if size == 0 || !(1..=256).contains(&width) || !(1..=256).contains(&height) {
+        return None;
+    }
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            // Отрицательная высота — строки сверху вниз.
+            biHeight: -height,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    // SAFETY: буфер вмещает width×height пикселей по 4 байта; DC свой и удаляется сразу.
+    let lines = unsafe {
+        let dc = CreateCompatibleDC(None);
+        let lines = GetDIBits(
+            dc,
+            bitmap,
+            0,
+            height as u32,
+            Some(pixels.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        let _ = DeleteDC(dc);
+        lines
+    };
+    if lines == 0 {
+        return None;
+    }
+    // Картинка без прозрачности (24 бита или нулевой альфа-канал) — непрозрачная.
+    let opaque = header.bmBitsPixel < 32 || pixels.as_chunks::<4>().0.iter().all(|px| px[3] == 0);
+    for px in pixels.as_chunks_mut::<4>().0 {
+        px.swap(0, 2);
+        if opaque {
+            px[3] = 255;
+        } else {
+            // Premultiplied: цвет не ярче альфы. Иначе картинка в обычной альфе — умножить.
+            let alpha = px[3];
+            if px[..3].iter().any(|&c| c > alpha) {
+                for c in &mut px[..3] {
+                    *c = (u16::from(*c) * u16::from(alpha) / 255) as u8;
+                }
+            }
+        }
+    }
+    Some(MenuIcon { width: width as u32, height: height as u32, rgba: pixels })
 }
 
 fn show(
@@ -124,15 +369,7 @@ fn show(
 ) -> Result<MenuChoice, String> {
     let popup = Popup::new()?;
     let shift = key_down(VK_SHIFT);
-    let mut flags = CMF_NORMAL | CMF_EXPLORE;
-    if shift {
-        // Как в Проводнике: Shift добавляет «Копировать как путь», «Открыть окно PowerShell»…
-        flags |= CMF_EXTENDEDVERBS;
-    }
-    // SAFETY: меню живо до конца функции; расширения добавляют в него свои пункты.
-    unsafe { menu.QueryContextMenu(popup.0, 0, FIRST_COMMAND, LAST_COMMAND, flags) }
-        .ok()
-        .map_err(|error| describe("меню не собрано", &error))?;
+    query(menu, &popup, shift)?;
     // Пока расширения собирали меню, его могли перестать ждать (сторож в fs::shell).
     if !gate.try_show() {
         return Ok(MenuChoice::Dismissed);
@@ -160,7 +397,31 @@ fn show(
     else {
         return Ok(MenuChoice::Dismissed);
     };
-    let offset = offset as usize;
+    invoke(menu, window, offset as usize, directory, shift, cursor)
+}
+
+/// Расширения добавляют в `popup` свои пункты. `shift` — как в Проводнике: Shift добавляет
+/// «Копировать как путь», «Открыть окно PowerShell»…
+fn query(menu: &IContextMenu, popup: &Popup, shift: bool) -> Result<(), String> {
+    let mut flags = CMF_NORMAL | CMF_EXPLORE;
+    if shift {
+        flags |= CMF_EXTENDEDVERBS;
+    }
+    // SAFETY: меню живо до конца вызова; расширения добавляют в него свои пункты.
+    unsafe { menu.QueryContextMenu(popup.0, 0, FIRST_COMMAND, LAST_COMMAND, flags) }
+        .ok()
+        .map_err(|error| describe("меню не собрано", &error))
+}
+
+/// Выполнить команду меню с номером `offset` (от `FIRST_COMMAND`).
+fn invoke(
+    menu: &IContextMenu,
+    window: &OwnerWindow,
+    offset: usize,
+    directory: Option<PCWSTR>,
+    shift: bool,
+    cursor: POINT,
+) -> Result<MenuChoice, String> {
     let verb = verb_of(menu, offset);
     // Переименованию Shell нужно своё представление папки; у MH Files — своё поле ввода.
     if verb.as_deref() == Some("rename") {
