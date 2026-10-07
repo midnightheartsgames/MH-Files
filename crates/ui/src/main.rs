@@ -22,6 +22,7 @@ mod pane_view;
 mod preview_ui;
 mod quick;
 mod settings_window;
+mod shell_menu;
 mod sidebar;
 mod sorter;
 mod startup;

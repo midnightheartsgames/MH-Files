@@ -465,6 +465,17 @@ fn files(ui: &mut Ui, s: &mut Settings) {
         switch_row(ui, "Папки первыми", None, &mut s.files.folders_first);
         switch_row(ui, "Даты «Сегодня», «Вчера»", None, &mut s.files.relative_dates);
     });
+    card(ui, "Контекстное меню", |ui| {
+        switch_row(
+            ui,
+            "Пункты меню Windows",
+            Some(
+                "7-Zip, Git, «Отправить», «Открыть с помощью» и другие пункты Проводника — \
+                 под командами MH Files. Полное меню Windows — Shift+F10.",
+            ),
+            &mut s.files.windows_menu_items,
+        );
+    });
     card(ui, "Удаление", |ui| {
         switch_row(
             ui,

@@ -222,6 +222,140 @@ pub fn background_menu(dir: &Path, gate: &MenuGate) -> Result<MenuChoice, String
     }
 }
 
+/// Для чего меню Windows: объекты одной папки или пустое место папки.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuTarget {
+    Items(Vec<PathBuf>),
+    Background(PathBuf),
+}
+
+impl MenuTarget {
+    /// Пути, которые могла затронуть команда меню: объекты или сама папка.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        match self {
+            MenuTarget::Items(paths) => paths.clone(),
+            MenuTarget::Background(dir) => vec![dir.clone()],
+        }
+    }
+}
+
+/// Значок пункта меню: RGBA с premultiplied alpha (так их хранит Windows), строка за строкой.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MenuIcon {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+impl std::fmt::Debug for MenuIcon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MenuIcon({}×{})", self.width, self.height)
+    }
+}
+
+/// Пункт меню Windows, прочитанный для показа в своём меню MH Files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellMenuItem {
+    Separator,
+    /// Команда: `id` передаётся обратно потоку меню, чтобы её выполнить.
+    Command {
+        id: u32,
+        label: String,
+        /// Имя команды для Shell («delete», «7-Zip.Extract»…), если расширение его сообщает.
+        verb: Option<String>,
+        icon: Option<MenuIcon>,
+        enabled: bool,
+    },
+    Submenu {
+        label: String,
+        icon: Option<MenuIcon>,
+        enabled: bool,
+        items: Vec<ShellMenuItem>,
+    },
+}
+
+/// Подпись пункта меню Win32 без служебного: `&` перед буквой-мнемоникой (`&&` — сам
+/// амперсанд) и сочетание клавиш после табуляции.
+pub fn menu_label(raw: &str) -> String {
+    let text = raw.split('\t').next().unwrap_or_default();
+    let mut label = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '&' {
+            if let Some(next) = chars.next() {
+                label.push(next);
+            }
+        } else {
+            label.push(c);
+        }
+    }
+    label.trim().to_string()
+}
+
+/// Пункты Windows для вставки в своё меню: без команд, которые у MH Files уже есть (`hidden` —
+/// их имена для Shell), без повторов одной подписи (Windows 11 показывает пункт PowerToys и
+/// как современную команду, и как старое расширение), без пустых подменю и лишних
+/// разделителей.
+pub fn tidy_menu(items: Vec<ShellMenuItem>, hidden: &[&str]) -> Vec<ShellMenuItem> {
+    let mut tidy: Vec<ShellMenuItem> = Vec::with_capacity(items.len());
+    let mut labels = std::collections::HashSet::new();
+    for item in items {
+        let item = match item {
+            ShellMenuItem::Separator => {
+                if !matches!(tidy.last(), None | Some(ShellMenuItem::Separator)) {
+                    tidy.push(ShellMenuItem::Separator);
+                }
+                continue;
+            }
+            ShellMenuItem::Command { ref verb, ref label, .. } => {
+                let own = verb
+                    .as_deref()
+                    .is_some_and(|verb| hidden.iter().any(|h| h.eq_ignore_ascii_case(verb)));
+                if own || label.is_empty() || !labels.insert(label.to_lowercase()) {
+                    continue;
+                }
+                item
+            }
+            ShellMenuItem::Submenu { label, icon, enabled, items } => {
+                let items = tidy_menu(items, hidden);
+                if items.is_empty() || label.is_empty() || !labels.insert(label.to_lowercase()) {
+                    continue;
+                }
+                ShellMenuItem::Submenu { label, icon, enabled, items }
+            }
+        };
+        tidy.push(item);
+    }
+    if matches!(tidy.last(), Some(ShellMenuItem::Separator)) {
+        tidy.pop();
+    }
+    tidy
+}
+
+/// Меню Windows для встраивания в своё меню. Собирает меню Shell для `target` (с пунктами
+/// сторонних расширений, подменю «Отправить», «Создать», «Открыть с помощью» заполняются
+/// сразу) и отдаёт пункты в `ready`; затем ждёт номер выбранной команды из `commands` и
+/// выполняет её. Канал закрыт — меню закрыли, ничего не выбрав.
+///
+/// Блокирует, пока ждёт; вызывать из фонового потока: объекты меню живут в нём (STA).
+/// Ошибка сборки меню уходит в `ready`, ошибка выполнения команды — в результат.
+pub fn live_menu(
+    target: &MenuTarget,
+    commands: &crossbeam_channel::Receiver<u32>,
+    ready: impl FnOnce(Result<Vec<ShellMenuItem>, String>),
+) -> Result<MenuChoice, String> {
+    #[cfg(windows)]
+    {
+        crate::win::menu::live_menu(target, commands, ready)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (target, commands);
+        ready(Err("меню Windows есть только в Windows".into()));
+        Ok(MenuChoice::Dismissed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +371,64 @@ mod tests {
         assert!(gate.try_abandon());
         assert!(gate.abandoned());
         assert!(!gate.try_show(), "брошенное меню не показывается");
+    }
+
+    #[test]
+    fn menu_labels_lose_mnemonics_and_shortcuts() {
+        assert_eq!(menu_label("&Открыть"), "Открыть");
+        assert_eq!(menu_label("Tom && Jerry"), "Tom & Jerry");
+        assert_eq!(menu_label("Вы&резать\tCtrl+X"), "Вырезать");
+        assert_eq!(menu_label("7-Zip"), "7-Zip");
+    }
+
+    fn command(id: u32, label: &str, verb: Option<&str>) -> ShellMenuItem {
+        ShellMenuItem::Command {
+            id,
+            label: label.into(),
+            verb: verb.map(Into::into),
+            icon: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn tidy_menu_drops_own_commands_repeats_and_extra_separators() {
+        let items = vec![
+            ShellMenuItem::Separator,
+            command(1, "Открыть", Some("open")),
+            command(2, "Разблокировать", None),
+            ShellMenuItem::Separator,
+            ShellMenuItem::Separator,
+            command(3, "Разблокировать", Some("Locksmith")),
+            command(4, "Вырезать", Some("CUT")),
+            ShellMenuItem::Submenu {
+                label: "Пусто".into(),
+                icon: None,
+                enabled: true,
+                items: vec![ShellMenuItem::Separator, command(5, "Удалить", Some("delete"))],
+            },
+            ShellMenuItem::Submenu {
+                label: "7-Zip".into(),
+                icon: None,
+                enabled: true,
+                items: vec![command(6, "Распаковать", Some("7-Zip.Extract"))],
+            },
+            ShellMenuItem::Separator,
+        ];
+        let tidy = tidy_menu(items, &["open", "cut", "delete"]);
+        assert_eq!(
+            tidy,
+            vec![
+                command(2, "Разблокировать", None),
+                ShellMenuItem::Separator,
+                ShellMenuItem::Submenu {
+                    label: "7-Zip".into(),
+                    icon: None,
+                    enabled: true,
+                    items: vec![command(6, "Распаковать", Some("7-Zip.Extract"))],
+                },
+            ]
+        );
     }
 
     #[cfg(not(windows))]

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use mh_files_platform::shell::MenuGate;
+use mh_files_platform::shell::{MenuChoice, MenuGate, MenuTarget};
 use mh_files_platform::{clipboard, shell};
 
 use crate::{Event, Workers};
@@ -34,6 +34,12 @@ pub enum ShellJob {
     ContextMenu(Vec<PathBuf>),
     /// Меню Windows для пустого места папки.
     BackgroundMenu(PathBuf),
+    /// Пункты меню Windows для своего контекстного меню ([`Event::ShellMenu`]); поток ждёт
+    /// выбора, пока меню открыто.
+    LiveMenu {
+        generation: u64,
+        target: MenuTarget,
+    },
     /// Ярлыки на объекты в папке `dest`.
     CreateShortcuts {
         targets: Vec<PathBuf>,
@@ -69,6 +75,17 @@ pub(crate) fn run(workers: &Workers, job: ShellJob) {
             // Меню закрыто или не собралось: сторожу больше нечего ждать.
             if gate.try_show() {
                 workers.send(Event::Menu { paths, choice });
+            }
+            return;
+        }
+        ShellJob::LiveMenu { generation, target } => {
+            // Отправитель уходит в UI вместе с пунктами: закрыл меню — канал закрылся.
+            let (commands, chosen) = crossbeam_channel::bounded(1);
+            let choice = shell::live_menu(&target, &chosen, |items| {
+                workers.send(Event::ShellMenu { generation, items, commands });
+            });
+            if choice != Ok(MenuChoice::Dismissed) {
+                workers.send(Event::Menu { paths: target.paths(), choice });
             }
             return;
         }
