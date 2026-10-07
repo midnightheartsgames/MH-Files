@@ -1,6 +1,7 @@
 //! Свой заголовок окна в стиле MH: значок и название, где мы сейчас, строка поиска по дискам и
 //! кнопки окна. Пустое место тянет окно, двойной щелчок разворачивает его, края окна меняют
-//! размер. Выключается в настройках — тогда рамка системная.
+//! размер. Выключается в настройках — тогда рамка системная. Тень и скруглённые углы — от
+//! Windows (DWM), над «Развернуть» в Windows 11 появляются Snap Layouts.
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Id, Painter, Rect, ResizeDirection, Sense, Stroke, Ui,
@@ -66,6 +67,19 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
     if button(Button::Maximize) {
         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
     }
+    // Над кнопкой «Развернуть» Windows 11 показывает Snap Layouts: ей нужен прямоугольник
+    // кнопки в пикселях окна.
+    let maximize = Rect::from_min_size(
+        pos2(rect.right() - 2.0 * BUTTON_WIDTH, rect.top()),
+        vec2(BUTTON_WIDTH, rect.height()),
+    );
+    let scale = ctx.pixels_per_point();
+    mh_files_platform::window::set_maximize_button(Some([
+        (maximize.left() * scale).round() as i32,
+        (maximize.top() * scale).round() as i32,
+        (maximize.right() * scale).round() as i32,
+        (maximize.bottom() * scale).round() as i32,
+    ]));
     if button(Button::Minimize) {
         ctx.send_viewport_cmd(ViewportCommand::Minimized(true));
     }
@@ -134,7 +148,9 @@ fn window_button(
     maximized: bool,
 ) -> bool {
     let response = ui.interact(area, Id::new(("window-button", kind as u8)), Sense::click());
-    let hovered = response.hovered();
+    // Над «Развернуть» мышь в Windows видит система (Snap Layouts), а не egui.
+    let hovered = response.hovered()
+        || kind == Button::Maximize && mh_files_platform::window::maximize_button_hovered();
     if hovered {
         let fill = if kind == Button::Close { CLOSE_HOVER } else { theme::CARD };
         painter.rect_filled(area, CornerRadius::ZERO, fill);

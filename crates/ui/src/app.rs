@@ -913,6 +913,8 @@ impl FilesApp {
                 .exact_size(crate::titlebar::HEIGHT)
                 .frame(egui::Frame::new().fill(theme::PANEL))
                 .show(ui, |ui| crate::titlebar::show(ui, self));
+        } else {
+            mh_files_platform::window::set_maximize_button(None);
         }
 
         egui::Panel::bottom("status")

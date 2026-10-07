@@ -37,7 +37,7 @@ pub fn show(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
     if tab.filter_open {
         filter_bar(ui, tab, app);
     }
-    if let Location::Search { root, query } = &tab.location {
+    if let Location::Search { root, query, .. } = &tab.location {
         search_header(ui, tab.search.as_ref(), root, query, tab.listing.len());
     }
     if matches!(tab.location, Location::Index { .. }) {
@@ -721,6 +721,7 @@ pub fn index_state(status: &mh_files_fs::IndexStatus) -> String {
         let label = path_label(&volume.root);
         match &volume.state {
             VolumeState::Loading => parts.push(format!("{label}: загрузка")),
+            VolumeState::ReadingMft => parts.push(format!("{label}: чтение MFT")),
             VolumeState::Scanning { dirs } => {
                 parts.push(format!("{label}: обход, папок {}", format::count(*dirs)))
             }

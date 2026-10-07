@@ -9,10 +9,12 @@ pub enum Location {
     /// Список дисков.
     Computer,
     Dir(PathBuf),
-    /// Рекурсивный поиск по `root`.
+    /// Рекурсивный поиск по `root`: по имени или (`content`) по тексту внутри файлов.
     Search {
         root: PathBuf,
         query: String,
+        #[serde(default)]
+        content: bool,
     },
     /// Поиск по индексу всех дисков.
     Index {
@@ -103,6 +105,7 @@ impl Location {
         match self {
             Location::Computer => COMPUTER_TITLE.to_string(),
             Location::Dir(path) => path_label(path),
+            Location::Search { query, content: true, .. } => format!("Текст: {query}"),
             Location::Search { query, .. } => format!("Поиск: {query}"),
             Location::Index { query } if query.is_empty() => INDEX_TITLE.to_string(),
             Location::Index { query } => format!("Везде: {query}"),
@@ -183,10 +186,9 @@ impl Location {
             });
         }
         match self {
-            Location::Search { query, .. } => {
-                crumbs.push(Crumb {
-                    label: format!("Поиск «{query}»"), location: self.clone()
-                });
+            Location::Search { query, content, .. } => {
+                let what = if *content { "Текст" } else { "Поиск" };
+                crumbs.push(Crumb { label: format!("{what} «{query}»"), location: self.clone() });
             }
             Location::Duplicates { .. } => {
                 crumbs.push(Crumb { label: DUPLICATES_TITLE.into(), location: self.clone() });
@@ -274,7 +276,8 @@ mod tests {
         assert_eq!(labels, [COMPUTER_TITLE, "/", "home", "user"]);
         assert_eq!(dir.title(), "user");
         assert_eq!(Location::Dir(PathBuf::from("/")).title(), "/");
-        let search = Location::Search { root: PathBuf::from("/home"), query: "x".into() };
+        let search =
+            Location::Search { root: PathBuf::from("/home"), query: "x".into(), content: false };
         assert_eq!(search.crumbs().last().unwrap().label, "Поиск «x»");
         assert_eq!(search.dir(), None);
         let index = Location::Index { query: "x".into() };

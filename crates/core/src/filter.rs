@@ -77,9 +77,64 @@ fn glob(pattern: &[char], text: &[char]) -> bool {
     pattern[p..].iter().all(|&c| c == '*')
 }
 
+/// Запрос поиска по содержимому: слова — в тексте файла (все, в любом порядке, без учёта
+/// регистра), маски `*.txt` — по имени файла (хотя бы одна, если они есть):
+/// `договор аренды *.docx *.txt`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContentQuery {
+    masks: Vec<Vec<char>>,
+    words: Vec<String>,
+}
+
+impl ContentQuery {
+    pub fn new(query: &str) -> ContentQuery {
+        let mut parsed = ContentQuery::default();
+        for token in query.split_whitespace() {
+            let token = token.to_lowercase();
+            if token.contains(['*', '?']) {
+                parsed.masks.push(token.chars().collect());
+            } else {
+                parsed.words.push(token);
+            }
+        }
+        parsed
+    }
+
+    /// Искать нечего: без слов поиск по содержимому не имеет смысла.
+    pub fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// Подходит ли файл по имени (маски).
+    pub fn name_matches(&self, name: &str) -> bool {
+        if self.masks.is_empty() {
+            return true;
+        }
+        let name: Vec<char> = name.to_lowercase().chars().collect();
+        self.masks.iter().any(|mask| glob(mask, &name))
+    }
+
+    /// Есть ли в тексте все слова. `text` — уже в нижнем регистре.
+    pub fn text_matches(&self, lower_text: &str) -> bool {
+        self.words.iter().all(|word| lower_text.contains(word.as_str()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_query_splits_masks_and_words() {
+        let query = ContentQuery::new("Договор  аренды *.DOCX *.txt");
+        assert!(!query.is_empty());
+        assert!(query.name_matches("план.TXT") && query.name_matches("a.docx"));
+        assert!(!query.name_matches("a.pdf"));
+        assert!(query.text_matches("здесь аренды и договор квартиры"));
+        assert!(!query.text_matches("только договор"));
+        assert!(ContentQuery::new("*.txt").is_empty(), "одних масок мало");
+        assert!(ContentQuery::new("слово").name_matches("любое.bin"));
+    }
 
     #[test]
     fn words_in_any_order() {

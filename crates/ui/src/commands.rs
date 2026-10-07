@@ -59,6 +59,7 @@ commands! {
     CommandPalette => "Палитра команд", ["commands", "palette"], ["Ctrl+Shift+P", "F1"];
     Filter => "Фильтр папки", ["filter", "find"], ["Ctrl+F"];
         Search => "Поиск во вложенных папках", ["search", "найти"], ["Ctrl+Shift+F"];
+    SearchContent => "Поиск по содержимому", ["grep", "текст", "внутри файлов", "content"], ["Ctrl+Alt+F"];
     SearchEverywhere => "Поиск по дискам", ["everything", "везде", "index", "индекс"], ["Ctrl+E"];
     SaveSearch => "Сохранить поиск", ["save search", "запомнить"], [];
     Reindex => "Переиндексировать диски", ["reindex", "rescan", "индекс"], [];

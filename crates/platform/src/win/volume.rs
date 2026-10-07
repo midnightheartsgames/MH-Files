@@ -10,8 +10,8 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Component, Path, PathBuf, Prefix};
 
 use windows::Win32::Foundation::{
-    ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED, ERROR_JOURNAL_NOT_ACTIVE,
-    GENERIC_READ, HANDLE,
+    ERROR_HANDLE_EOF, ERROR_JOURNAL_DELETE_IN_PROGRESS, ERROR_JOURNAL_ENTRY_DELETED,
+    ERROR_JOURNAL_NOT_ACTIVE, GENERIC_READ, HANDLE,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::Storage::FileSystem::{
@@ -22,10 +22,11 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Ioctl::{
-    FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0,
-    USN_REASON_BASIC_INFO_CHANGE, USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE,
-    USN_REASON_DATA_TRUNCATION, USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE,
-    USN_REASON_RENAME_NEW_NAME, USN_REASON_RENAME_OLD_NAME,
+    FSCTL_ENUM_USN_DATA, FSCTL_QUERY_USN_JOURNAL, FSCTL_READ_USN_JOURNAL, MFT_ENUM_DATA_V0,
+    READ_USN_JOURNAL_DATA_V0, USN_JOURNAL_DATA_V0, USN_REASON_BASIC_INFO_CHANGE,
+    USN_REASON_DATA_EXTEND, USN_REASON_DATA_OVERWRITE, USN_REASON_DATA_TRUNCATION,
+    USN_REASON_FILE_CREATE, USN_REASON_FILE_DELETE, USN_REASON_RENAME_NEW_NAME,
+    USN_REASON_RENAME_OLD_NAME,
 };
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentThread, OpenProcessToken, SetThreadPriority,
@@ -34,7 +35,7 @@ use windows::Win32::System::Threading::{
 use windows::core::{HRESULT, Owned, PCWSTR};
 
 use super::com::{describe, wide};
-use crate::volume::{Journal, JournalChanges};
+use crate::volume::{Journal, JournalChanges, MFT_ROOT, MftRecord};
 
 /// Буфер чтения журнала. Из `u64`, чтобы записи (в них есть 64-битные поля) были выровнены.
 const READ_WORDS: usize = 64 * 1024 / 8;
@@ -106,6 +107,107 @@ pub fn changed_dirs(root: &Path, since: Journal) -> Result<JournalChanges, Strin
     };
     let dirs = parents.into_iter().filter_map(|frn| path_by_id(&volume, frn)).collect();
     Ok(JournalChanges { dirs, journal: Journal { id: current.id, next_usn }, reset: false })
+}
+
+pub fn mft_records(root: &Path) -> Result<Vec<MftRecord>, String> {
+    let volume = open_volume(root)?;
+    let data = query(&volume, root)?;
+    let mut buffer = vec![0u64; READ_WORDS * 4];
+    let mut records = Vec::new();
+    let mut request =
+        MFT_ENUM_DATA_V0 { StartFileReferenceNumber: 0, LowUsn: 0, HighUsn: data.NextUsn };
+    loop {
+        let mut bytes = 0u32;
+        // SAFETY: входная структура и буфер живут до конца синхронного вызова, размеры верные.
+        let read = unsafe {
+            DeviceIoControl(
+                *volume,
+                FSCTL_ENUM_USN_DATA,
+                Some(&request as *const _ as *const _),
+                size_of::<MFT_ENUM_DATA_V0>() as u32,
+                Some(buffer.as_mut_ptr() as *mut _),
+                (buffer.len() * 8) as u32,
+                Some(&mut bytes),
+                None,
+            )
+        };
+        match read {
+            Ok(()) => {}
+            // Записи кончились.
+            Err(error) if is_win32(&error, ERROR_HANDLE_EOF.0) => break,
+            Err(error) => {
+                return Err(describe(
+                    &format!("не удалось прочитать MFT диска {}", root.display()),
+                    &error,
+                ));
+            }
+        }
+        if bytes <= 8 {
+            break;
+        }
+        // SAFETY: Vec<u64> можно читать как байты; длина не больше выделенной.
+        let raw = unsafe {
+            std::slice::from_raw_parts(
+                buffer.as_ptr() as *const u8,
+                (bytes as usize).min(buffer.len() * 8),
+            )
+        };
+        // Первые 8 байт — номер, с которого продолжать.
+        let next = buffer[0];
+        collect_records(&raw[8..], &mut records);
+        if next <= request.StartFileReferenceNumber {
+            break;
+        }
+        request.StartFileReferenceNumber = next;
+    }
+    Ok(records)
+}
+
+/// Номер записи без номера последовательности (старшие 16 бит).
+const FRN_MASK: u64 = (1 << 48) - 1;
+
+/// Разбирает `USN_RECORD_V2` с проверкой границ. Служебные записи NTFS (номера до 16, кроме
+/// корня) отбрасываются: от корня до их детей (`$Extend\…`) тогда тоже не дойти.
+fn collect_records(raw: &[u8], records: &mut Vec<MftRecord>) {
+    let u16_at = |at: usize| raw.get(at..at + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at =
+        |at: usize| raw.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let u64_at =
+        |at: usize| raw.get(at..at + 8)?.first_chunk::<8>().map(|b| u64::from_le_bytes(*b));
+    let mut offset = 0usize;
+    while let (Some(length), Some(major)) = (u32_at(offset), u16_at(offset + 4)) {
+        if length == 0 {
+            break;
+        }
+        let record = (|| {
+            if major != 2 {
+                return None;
+            }
+            let id = u64_at(offset + 8)? & FRN_MASK;
+            let parent = u64_at(offset + 16)? & FRN_MASK;
+            let attributes = u32_at(offset + 52)?;
+            let name_len = u16_at(offset + 56)? as usize;
+            let name_at = offset + u16_at(offset + 58)? as usize;
+            if id < 16 && id != MFT_ROOT {
+                return None;
+            }
+            let units: Vec<u16> = raw
+                .get(name_at..name_at + name_len)?
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            Some(MftRecord {
+                id,
+                parent,
+                name: String::from_utf16_lossy(&units),
+                is_dir: attributes & 0x10 != 0,
+                hidden: attributes & 0x2 != 0,
+                system: attributes & 0x4 != 0,
+            })
+        })();
+        records.extend(record);
+        offset += length as usize;
+    }
 }
 
 /// Номера родительских папок всех записей от `start` до `current.next_usn` и положение, с

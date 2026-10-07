@@ -35,6 +35,7 @@ const IN_TEXT: &[CommandId] = &[
     CommandId::Refresh,
     CommandId::Filter,
     CommandId::Search,
+    CommandId::SearchContent,
     CommandId::SearchEverywhere,
 ];
 
@@ -315,7 +316,7 @@ impl FilesApp {
             GoForward => tab.history.can_forward(),
             GoUp => tab.location.parent().is_some(),
             Paste | NewFolder | OpenTerminal => has_dir,
-            Search => has_dir,
+            Search | SearchContent => has_dir,
             SaveSearch => matches!(&tab.location, Location::Index { query } if !query.is_empty()),
             Reindex => self.indexer.status().enabled,
             CheckUpdates => !self.update.checking,
@@ -430,6 +431,11 @@ impl FilesApp {
             Search => {
                 if let Some(dir) = dir {
                     self.palette = Some(palette::State::search(dir));
+                }
+            }
+            SearchContent => {
+                if let Some(dir) = dir {
+                    self.palette = Some(palette::State::search_content(dir));
                 }
             }
             Extract => self.extract_command(false),

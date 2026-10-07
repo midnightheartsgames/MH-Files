@@ -73,3 +73,29 @@ pub fn bring_to_front() {
     #[cfg(windows)]
     crate::win::window::bring_to_front();
 }
+
+/// Кнопка «Развернуть» своего заголовка окна в пикселях экрана относительно клиентской
+/// области: `[левый, верхний, правый, нижний]`; `None` — заголовок системный.
+///
+/// В Windows 11 по этой области окно отвечает системе `HTMAXBUTTON`: наведение показывает
+/// Snap Layouts, а щелчок разворачивает окно как обычная кнопка. Звать из потока окна (там
+/// же при первом вызове подменяется обработчик сообщений окна).
+pub fn set_maximize_button(rect: Option<[i32; 4]>) {
+    #[cfg(windows)]
+    crate::win::window::set_maximize_button(rect);
+    #[cfg(not(windows))]
+    let _ = rect;
+}
+
+/// Мышь над кнопкой «Развернуть», а события ей шлёт система, а не окно (Snap Layouts):
+/// подсветку рисует заголовок по этому признаку.
+pub fn maximize_button_hovered() -> bool {
+    #[cfg(windows)]
+    {
+        crate::win::window::maximize_button_hovered()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}

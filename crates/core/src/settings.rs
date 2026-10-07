@@ -97,6 +97,12 @@ pub struct IndexSettings {
     /// Досканировать при запуске папки, изменённые пока программа была закрыта. Без журнала
     /// USN (нужны права администратора) — полный обход в фоне.
     pub rescan_on_start: bool,
+    /// Когда `roots` пусто: индексировать и съёмные диски (флешки, внешние диски) — пока
+    /// они подключены.
+    pub removable: bool,
+    /// То же для сетевых дисков с буквой. Изменения в сети видны не всегда сразу: сервер
+    /// может не сообщать о них.
+    pub network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +118,8 @@ impl Default for IndexSettings {
             roots: Vec::new(),
             exclude: Vec::new(),
             rescan_on_start: true,
+            removable: false,
+            network: false,
         }
     }
 }
