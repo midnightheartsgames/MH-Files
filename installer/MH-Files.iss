@@ -1,5 +1,5 @@
 ﻿; Установщик MH Files (Inno Setup 6). Собирается из tools\build-release.ps1:
-;   iscc /DAppVersion=1.0.0-rc.1 /DFileVersion=1.0.0 /DSourceDir=..\target\dist\app installer\MH-Files.iss
+;   iscc /DAppVersion=1.0.0-rc.2 /DFileVersion=1.0.0 /DSourceDir=..\target\dist\app installer\MH-Files.iss
 ;
 ; Ставится для текущего пользователя, без прав администратора: в
 ; %LOCALAPPDATA%\Programs\MH Files. Настройки (%APPDATA%\MH Files) при удалении остаются —
