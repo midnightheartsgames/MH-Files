@@ -122,6 +122,8 @@ pub struct Tab {
     pub columns_shown: Vec<Option<Location>>,
     /// Встать на первую строку, когда список загрузится (вход в папку стрелкой вправо).
     pub select_first: bool,
+    /// Когда начато чтение — для замеров.
+    pub load_started: Instant,
     /// Вид списка, как его задали настройки и пользователь. Поиск по дискам показывает
     /// скрытое независимо от него (см. [`options_for`]).
     pub options: ViewOptions,
@@ -182,6 +184,7 @@ impl Tab {
             sort: None,
             columns_shown: Vec::new(),
             select_first: false,
+            load_started: Instant::now(),
             rename: None,
             scroll_to: None,
             grid_columns: 1,
@@ -269,6 +272,7 @@ impl Tab {
 
     /// Перечитать. `soft` — не очищать список до прихода нового (после операций, F5).
     pub fn reload(&mut self, workers: &Workers, soft: bool) {
+        self.load_started = Instant::now();
         if let Some(cancel) = self.cancel.take() {
             cancel.cancel();
         }

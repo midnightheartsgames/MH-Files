@@ -204,6 +204,11 @@ pub enum Event {
         report: mh_files_core::sorting::Report,
         journal: PathBuf,
     },
+    /// Есть ли пункт «Открыть в MH Files» в меню Проводника; ошибка — если менять не вышло.
+    ExplorerMenu {
+        installed: bool,
+        error: Option<String>,
+    },
     /// Последняя операция сортировщика, которую ещё можно отменить.
     SortLast {
         ticket: Ticket,
@@ -510,6 +515,24 @@ impl Workers {
         self.spawn("sort-last", move |workers| {
             let last = sorting::last_active(&history);
             workers.send(Event::SortLast { ticket, last });
+        });
+    }
+
+    /// Пункт «Открыть в MH Files» в Проводнике: `Some(true)` — добавить, `Some(false)` —
+    /// убрать, `None` — только узнать, есть ли. Реестр — в фоне.
+    pub fn explorer_menu(&self, change: Option<bool>) {
+        use mh_files_platform::integration;
+        self.spawn("explorer-menu", move |workers| {
+            let error = match change {
+                Some(true) => match std::env::current_exe() {
+                    Ok(exe) => integration::install_explorer_menu(&exe).err(),
+                    Err(error) => Some(error.to_string()),
+                },
+                Some(false) => integration::uninstall_explorer_menu().err(),
+                None => None,
+            };
+            let installed = integration::explorer_menu_installed();
+            workers.send(Event::ExplorerMenu { installed, error });
         });
     }
 

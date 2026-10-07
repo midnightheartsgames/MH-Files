@@ -65,3 +65,11 @@ pub fn take_intercepted() -> Vec<Intercepted> {
 pub fn message_hook(msg: *const std::ffi::c_void) -> bool {
     crate::win::window::message_hook(msg)
 }
+
+/// Вывести главное окно на передний план: развернуть, если свёрнуто, и сделать активным.
+/// Не ждёт поток окна, поэтому можно звать из любого потока. Windows может отказать (фокус у
+/// другой программы, а права вывести окно у нас нет) — тогда кнопка на панели задач мигает.
+pub fn bring_to_front() {
+    #[cfg(windows)]
+    crate::win::window::bring_to_front();
+}

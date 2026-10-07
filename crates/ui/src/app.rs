@@ -205,6 +205,16 @@ pub struct FilesApp {
     next_id: u64,
     pub workers: Workers,
     pub indexer: Indexer,
+    /// Замеры: запуск, чтение папок.
+    pub diag: crate::diag::Diagnostics,
+    /// Пути от следующих запусков программы.
+    incoming: Option<crossbeam_channel::Receiver<Vec<crate::startup::Target>>>,
+    /// Сервер единственной копии.
+    _instance: Option<Box<dyn std::any::Any>>,
+    /// Прошлый запуск кончился сбоем: отчёт для «Настройки → Система».
+    pub previous: crate::crash::Previous,
+    /// Пункт «Открыть в MH Files» в Проводнике: есть ли (узнаётся в фоне).
+    pub explorer_menu: Option<bool>,
     /// Сортировщик: категории и журналы.
     pub sorter: crate::sorter::Shared,
     /// Идущие извлечения из архивов.
@@ -256,7 +266,9 @@ impl FilesApp {
         settings: Settings,
         session: Option<Session>,
         notice: Option<String>,
+        startup: crate::startup::Startup,
     ) -> FilesApp {
+        let _ = startup.repaint.set(cc.egui_ctx.clone());
         theme::set_accent(settings.appearance.accent);
         theme::install(&cc.egui_ctx);
         cc.egui_ctx.set_zoom_factor(settings.appearance.font_scale);
@@ -284,6 +296,11 @@ impl FilesApp {
             indexer,
             column_cache: Default::default(),
             sorter: crate::sorter::Shared::load(&storage::config_dir()),
+            diag: crate::diag::Diagnostics::new(startup.started),
+            incoming: startup.incoming,
+            _instance: startup.keepalive,
+            previous: startup.previous.clone(),
+            explorer_menu: None,
             extractions: Vec::new(),
             next_extract: 0,
             events,
@@ -319,12 +336,38 @@ impl FilesApp {
             window: None,
             settings,
         };
-        let session = session
-            .filter(|_| app.settings.panes.restore_session)
-            .unwrap_or_else(|| Session::single(app.home_location()));
-        app.restore(session);
+        let restored = session.filter(|_| app.settings.panes.restore_session);
+        let fresh = restored.is_none();
+        app.restore(restored.unwrap_or_else(|| Session::single(app.home_location())));
         app.workers.drives();
         app.workers.known_folders();
+        app.workers.explorer_menu(None);
+        // Пути из командной строки: без восстановленного сеанса первый — в домашнюю вкладку.
+        app.open_targets_from_outside(startup.open, fresh);
+        // Сбой — только паника с отчётом; без отчёта процесс сняли или выключили компьютер.
+        if startup.previous.report.is_some() {
+            app.set_status(
+                "прошлый запуск закончился сбоем — отчёт в «Настройки → Система»",
+                Level::Error,
+            );
+        } else if let Some(old) = &startup.upgraded_from {
+            app.set_status(
+                format!(
+                    "MH Files обновлён с {old} до {} — прежние настройки сохранены в backup",
+                    env!("CARGO_PKG_VERSION")
+                ),
+                Level::Info,
+            );
+        } else if !startup.missing.is_empty() {
+            let list: Vec<String> =
+                startup.missing.iter().map(|p| p.display().to_string()).collect();
+            app.set_status(format!("не найдено: {}", list.join(", ")), Level::Error);
+        } else if !startup.unknown_flags.is_empty() {
+            app.set_status(
+                format!("незнакомые ключи: {}", startup.unknown_flags.join(" ")),
+                Level::Error,
+            );
+        }
         if let Some(notice) = notice {
             app.set_status(notice, Level::Error);
         } else if !key_errors.is_empty() {
@@ -334,6 +377,34 @@ impl FilesApp {
             );
         }
         app
+    }
+
+    /// Открыть пути, пришедшие снаружи (командная строка, следующий запуск): папки —
+    /// вкладками, файлы — своей папкой с выделением. `replace_first` — первый путь занимает
+    /// текущую вкладку вместо новой.
+    pub fn open_targets_from_outside(
+        &mut self,
+        targets: Vec<crate::startup::Target>,
+        mut replace_first: bool,
+    ) {
+        for (path, is_dir) in targets {
+            let (dir, select) = if is_dir {
+                (path, None)
+            } else {
+                match path.parent() {
+                    Some(parent) => (parent.to_path_buf(), Some(path.clone())),
+                    None => continue,
+                }
+            };
+            let target = if replace_first { Target::Current } else { Target::NewTab };
+            replace_first = false;
+            self.open_location(Location::Dir(dir), target);
+            if let Some(select) = select {
+                let tab = self.tab_mut();
+                tab.pending_select = Some(select);
+                tab.reveal_pending();
+            }
+        }
     }
 
     pub fn home_location(&self) -> Location {
@@ -472,6 +543,14 @@ impl FilesApp {
     // ── События воркеров ─────────────────────────────────────────────────────────────
 
     fn poll(&mut self, ctx: &egui::Context) {
+        let incoming: Vec<Vec<crate::startup::Target>> =
+            self.incoming.as_ref().map(|rx| rx.try_iter().collect()).unwrap_or_default();
+        for targets in incoming {
+            // Следующий запуск без путей — просто показать окно.
+            self.open_targets_from_outside(targets, false);
+            mh_files_platform::window::bring_to_front();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
         let events: Vec<Event> = self.events.try_iter().collect();
         for event in events {
             self.on_event(ctx, event);
@@ -509,11 +588,13 @@ impl FilesApp {
                     if !sizes.is_empty() {
                         apply_sizes(tab, sizes);
                     }
-                    // Прочитанная папка заодно освежает индекс.
+                    // Прочитанная папка заодно освежает индекс и попадает в замеры.
                     if let Some(dir) = tab.dir()
                         && tab.listing.state == LoadState::Done
                     {
                         self.indexer.observe(&dir, tab.listing.all());
+                        let took = tab.load_started.elapsed();
+                        self.diag.listing(dir, tab.listing.total_len(), took);
                     }
                 }
             }
@@ -613,6 +694,12 @@ impl FilesApp {
                 self.on_sort_done(ticket, report, journal)
             }
             Event::SortLast { ticket, last } => self.on_sort_last(ticket, last),
+            Event::ExplorerMenu { installed, error } => {
+                self.explorer_menu = Some(installed);
+                if let Some(error) = error {
+                    self.set_status(error, Level::Error);
+                }
+            }
             Event::Missing { owner, paths } => {
                 if let Some(tab) = self.tab_by_id(owner) {
                     tab.forget_paths(&paths);
@@ -740,6 +827,7 @@ impl FilesApp {
 
     fn frame(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.diag.frame();
         self.poll(&ctx);
         self.handle_keys(&ctx);
         self.run_actions(&ctx);
@@ -1251,6 +1339,7 @@ impl eframe::App for FilesApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_session_if_changed(true);
         self.indexer.shutdown(INDEX_SAVE_WAIT);
+        crate::crash::finish();
     }
 }
 

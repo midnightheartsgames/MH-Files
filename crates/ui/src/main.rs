@@ -9,6 +9,8 @@ mod archives;
 mod batch;
 mod columns;
 mod commands;
+mod crash;
+mod diag;
 mod dialogs;
 mod icons;
 mod images;
@@ -21,6 +23,7 @@ mod quick;
 mod settings_window;
 mod sidebar;
 mod sorter;
+mod startup;
 mod statusbar;
 mod storage;
 mod tabs;
@@ -31,8 +34,49 @@ mod widgets;
 use eframe::egui::{IconData, ViewportBuilder};
 
 fn main() -> eframe::Result {
+    let started = std::time::Instant::now();
+    let line = mh_files_core::cli::CommandLine::parse(std::env::args().skip(1));
+    if line.version {
+        println!("MH Files {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let data = storage::init(line.portable);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let (open, missing) = startup::resolve(&line.paths, &cwd);
+
     let (settings, notice) = storage::load_settings();
+    // Одна копия: пути уходят в уже открытое окно, а этот процесс завершается.
+    let repaint = std::sync::Arc::new(std::sync::OnceLock::new());
+    let mut incoming = None;
+    let mut keepalive: Option<Box<dyn std::any::Any>> = None;
+    if settings.system.single_instance && !line.new_window {
+        use mh_files_platform::instance::{Claim, claim};
+        let args: Vec<String> = open.iter().map(|(p, _)| p.display().to_string()).collect();
+        let (rx, handler) = startup::incoming_channel(repaint.clone());
+        match claim(&instance_key(&data.config), &args, handler) {
+            Claim::Forwarded => return Ok(()),
+            Claim::First(server) => {
+                incoming = Some(rx);
+                keepalive = Some(Box::new(server));
+            }
+            Claim::Failed(_) => {}
+        }
+    }
+    crash::install_hook(&data.config);
+    let previous = crash::start(&data.config);
+    let upgraded_from = storage::backup_on_upgrade();
     let session = storage::load_session();
+    let startup = startup::Startup {
+        started,
+        open,
+        missing,
+        unknown_flags: line.unknown,
+        previous,
+        upgraded_from,
+        incoming,
+        repaint,
+        keepalive,
+    };
 
     let mut viewport = ViewportBuilder::default()
         .with_title("MH Files")
@@ -66,8 +110,21 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "MH Files",
         options,
-        Box::new(move |cc| Ok(Box::new(app::FilesApp::new(cc, settings, session, notice)))),
+        Box::new(move |cc| {
+            Ok(Box::new(app::FilesApp::new(cc, settings, session, notice, startup)))
+        }),
     )
+}
+
+/// Имя единственной копии зависит от папки данных: переносная копия на флешке и
+/// установленная — разные программы со своими настройками, пути друг другу не передают.
+/// FNV-1a: имя не должно меняться от сборки к сборке.
+fn instance_key(data: &std::path::Path) -> String {
+    let text = data.to_string_lossy().to_lowercase();
+    let hash = text
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    format!("MH-Files-{hash:016x}")
 }
 
 /// Значок окна рисуется кодом: три столбика акцента, как у MH Sidebar, на тёмной плитке.

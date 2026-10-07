@@ -3,6 +3,7 @@
 //! Файловая система, Shell и поток UI сюда не заходят. Воркеры (`mh-files-fs`) приносят
 //! [`Entry`], интерфейс (`mh-files`) показывает [`Listing`] и меняет его командами.
 
+pub mod cli;
 pub mod duplicates;
 pub mod entry;
 pub mod filter;

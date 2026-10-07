@@ -90,7 +90,14 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Сборка
+      - name: Inno Setup
+        # На образах windows-latest он обычно уже есть; нет — ставится из Chocolatey.
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup --no-progress -y
+          }
+
+      - name: "Сборка: exe, установщик, переносная версия"
         run: .\tools\build-release.ps1
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
