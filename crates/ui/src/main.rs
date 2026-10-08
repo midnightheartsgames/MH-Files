@@ -136,13 +136,28 @@ const ICON_SIZE: usize = 64;
 const ICON_BACKGROUND: [u8; 4] = [0x12, 0x16, 0x1D, 0xFF];
 const ICON_ACCENT: [u8; 4] = [0x3F, 0xD0, 0xD8, 0xFF];
 
-/// Значок окна рисуется кодом: три столбика акцента, как у MH Sidebar, на тёмной плитке.
+/// Значок окна рисуется кодом — та же папка со столбиками, что в `MH-Files.ico`
+/// (`tools/make-icon.py`): фигуры [`icons::LOGO`], каждая следующая поверх предыдущих.
 fn app_icon() -> IconData {
     icon_tile(|x, y| {
-        [(22.0, 15.0), (40.0, 28.0), (30.0, 41.0)].iter().any(|&(height, left)| {
-            (left..left + 9.0).contains(&x) && (52.0 - height..52.0).contains(&y)
-        })
+        let mut share = 0.0;
+        for &(left, top, right, bottom, radius, value) in icons::LOGO {
+            if in_rounded(x, y, (left, top, right, bottom), radius) {
+                share = value;
+            }
+        }
+        share
     })
+}
+
+/// Точка внутри скруглённого прямоугольника.
+fn in_rounded(x: f32, y: f32, (left, top, right, bottom): (f32, f32, f32, f32), r: f32) -> bool {
+    if !((left..right).contains(&x) && (top..bottom).contains(&y)) {
+        return false;
+    }
+    let cx = x.clamp(left + r, right - r);
+    let cy = y.clamp(top + r, bottom - r);
+    (x - cx).powi(2) + (y - cy).powi(2) <= r * r
 }
 
 /// Значок окна настроек: на той же плитке — шестерёнка, чтобы на панели задач и в Alt+Tab
@@ -156,22 +171,22 @@ pub(crate) fn settings_icon() -> std::sync::Arc<IconData> {
             // Восемь зубцов: доля оборота внутри своего сектора меньше половины — зубец.
             let turn = (dy.atan2(dx) / std::f32::consts::TAU * 8.0).rem_euclid(1.0);
             let outer = if (0.25..0.75).contains(&turn) { 25.0 } else { 19.0 };
-            (9.0..outer).contains(&radius)
+            if (9.0..outer).contains(&radius) { 1.0 } else { 0.0 }
         }))
     })
     .clone()
 }
 
-/// Тёмная скруглённая плитка с рисунком цвета акцента: `inside(x, y)` — точка рисунка.
-/// Края сглажены: каждый пиксель — среднее 4×4 точек.
-fn icon_tile(inside: impl Fn(f32, f32) -> bool) -> IconData {
+/// Тёмная скруглённая плитка с рисунком цвета акцента: `shade(x, y)` — доля акцента в точке
+/// (0 — фон плитки). Края сглажены: каждый пиксель — среднее 4×4 точек.
+fn icon_tile(shade: impl Fn(f32, f32) -> f32) -> IconData {
     const SIZE: usize = ICON_SIZE;
     const SAMPLES: usize = 4;
     let mut rgba = vec![0u8; SIZE * SIZE * 4];
     let radius = 12.0f32;
     for y in 0..SIZE {
         for x in 0..SIZE {
-            let (mut tile, mut mark) = (0usize, 0usize);
+            let (mut tile, mut mark) = (0usize, 0.0f32);
             for sy in 0..SAMPLES {
                 for sx in 0..SAMPLES {
                     let fx = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
@@ -180,13 +195,13 @@ fn icon_tile(inside: impl Fn(f32, f32) -> bool) -> IconData {
                     let cy = fy.clamp(radius, SIZE as f32 - radius);
                     if (fx - cx).powi(2) + (fy - cy).powi(2) <= radius * radius {
                         tile += 1;
-                        mark += usize::from(inside(fx, fy));
+                        mark += shade(fx, fy);
                     }
                 }
             }
             let pixel = &mut rgba[(y * SIZE + x) * 4..][..4];
             let total = (SAMPLES * SAMPLES) as f32;
-            let share = mark as f32 / tile.max(1) as f32;
+            let share = mark / tile.max(1) as f32;
             for channel in 0..3 {
                 let mixed = f32::from(ICON_BACKGROUND[channel]) * (1.0 - share)
                     + f32::from(ICON_ACCENT[channel]) * share;

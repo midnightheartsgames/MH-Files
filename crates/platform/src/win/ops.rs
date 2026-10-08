@@ -10,7 +10,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::{E_ABORT, ERROR_CANCELLED};
-use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::{
     COPYENGINE_E_USER_CANCELLED, FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION,
@@ -129,6 +129,21 @@ pub fn execute(
                         None,
                     )
                     .map_err(|error| describe("создание папки не подготовлено", &error))?;
+                top = Vec::new();
+                fallback_created.push(parent.join(name));
+            }
+            FileOp::NewFile { parent, name } => {
+                set_flags(&operation, base)?;
+                let name_w = wide(name);
+                operation
+                    .NewItem(
+                        &item(parent)?,
+                        FILE_ATTRIBUTE_NORMAL.0,
+                        PCWSTR(name_w.as_ptr()),
+                        PCWSTR::null(),
+                        None,
+                    )
+                    .map_err(|error| describe("создание файла не подготовлено", &error))?;
                 top = Vec::new();
                 fallback_created.push(parent.join(name));
             }

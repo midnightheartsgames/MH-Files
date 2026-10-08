@@ -89,6 +89,35 @@ impl LayoutNode {
         }
     }
 
+    /// Новая панель во весь край раскладки: слева или справа (`Horizontal`), сверху или
+    /// снизу (`Vertical`) от всех остальных. Доля — как у одной колонки: при одной панели
+    /// пополам, при двух — треть.
+    pub fn split_edge(&mut self, direction: SplitDirection, new: PaneId, new_first: bool) {
+        let share = 1.0 / (self.columns(direction) + 1) as f32;
+        let rest = std::mem::replace(self, LayoutNode::Pane(new));
+        let (first, second, ratio) = if new_first {
+            (LayoutNode::Pane(new), rest, share)
+        } else {
+            (rest, LayoutNode::Pane(new), 1.0 - share)
+        };
+        *self = LayoutNode::Split {
+            direction,
+            ratio: ratio.clamp(MIN_RATIO, MAX_RATIO),
+            first: Box::new(first),
+            second: Box::new(second),
+        };
+    }
+
+    /// Сколько панелей встаёт в ряд по `direction` на верхнем уровне.
+    pub fn columns(&self, direction: SplitDirection) -> usize {
+        match self {
+            LayoutNode::Split { direction: d, first, second, .. } if *d == direction => {
+                first.columns(direction) + second.columns(direction)
+            }
+            _ => 1,
+        }
+    }
+
     /// Убирает панель; её соседка занимает освободившееся место. Последнюю панель убрать
     /// нельзя — `false`.
     pub fn remove(&mut self, target: PaneId) -> bool {
@@ -146,6 +175,27 @@ mod tests {
         assert!(!layout.split(PaneId(9), SplitDirection::Vertical, PaneId(10)));
         assert!(layout.split_at(PaneId(3), SplitDirection::Horizontal, PaneId(4), true));
         assert_eq!(layout.panes(), [PaneId(4), PaneId(3)], "новая панель слева");
+    }
+
+    #[test]
+    fn split_edge_spans_the_whole_side() {
+        let mut layout = LayoutNode::Pane(PaneId(1));
+        layout.split_edge(SplitDirection::Horizontal, PaneId(2), false);
+        let LayoutNode::Split { ratio, .. } = &layout else { panic!() };
+        assert_eq!(*ratio, 0.5);
+        assert_eq!(layout.panes(), [PaneId(1), PaneId(2)]);
+        // Слева от обеих: треть ширины, остальные две — справа, как были.
+        layout.split_edge(SplitDirection::Horizontal, PaneId(3), true);
+        assert_eq!(layout.panes(), [PaneId(3), PaneId(1), PaneId(2)]);
+        let LayoutNode::Split { ratio, second, .. } = &layout else { panic!() };
+        assert!((*ratio - 1.0 / 3.0).abs() < 1e-6);
+        assert!(matches!(&**second, LayoutNode::Split { .. }));
+        // Справа от панелей одна над другой — пополам.
+        let mut stacked = LayoutNode::Pane(PaneId(1));
+        stacked.split(PaneId(1), SplitDirection::Vertical, PaneId(2));
+        stacked.split_edge(SplitDirection::Horizontal, PaneId(3), false);
+        let LayoutNode::Split { ratio, .. } = &stacked else { panic!() };
+        assert_eq!(*ratio, 0.5);
     }
 
     #[test]

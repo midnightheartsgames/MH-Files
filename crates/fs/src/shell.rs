@@ -42,6 +42,10 @@ pub enum ShellJob {
         /// Shift при щелчке: расширенные команды.
         extended: bool,
     },
+    /// Окно корзины в Проводнике.
+    OpenRecycleBin,
+    /// Очистить корзину (Windows сама спросит подтверждение).
+    EmptyRecycleBin,
     /// Ярлыки на объекты в папке `dest`.
     CreateShortcuts {
         targets: Vec<PathBuf>,
@@ -57,6 +61,12 @@ pub(crate) fn run(workers: &Workers, job: ShellJob) {
         ShellJob::Properties(paths) => ("Свойства", shell::properties(&paths)),
         ShellJob::Terminal { dir, command } => ("Терминал", shell::open_terminal(&dir, &command)),
         ShellJob::Reveal(path) => ("Показать в Проводнике", shell::reveal_in_explorer(&path)),
+        ShellJob::OpenRecycleBin => ("Корзина", mh_files_platform::recycle::open()),
+        ShellJob::EmptyRecycleBin => {
+            let result = mh_files_platform::recycle::empty();
+            workers.send(Event::RecycleBin(mh_files_platform::recycle::query()));
+            ("Очистить корзину", result)
+        }
         ShellJob::CreateShortcuts { targets, dest } => {
             ("Ярлыки", shell::create_shortcuts(&targets, &dest).map(|_| ()))
         }

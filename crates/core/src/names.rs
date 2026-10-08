@@ -76,9 +76,28 @@ pub fn unique_name(base: &str, existing: &[&str]) -> String {
         .expect("бесконечная последовательность")
 }
 
+/// Свободное имя файла: `Новый текстовый документ.txt`, `… (2).txt` — номер перед
+/// расширением, как в Проводнике.
+pub fn unique_file_name(stem: &str, ext: &str, existing: &[&str]) -> String {
+    let taken: HashSet<String> = existing.iter().map(|name| name.to_lowercase()).collect();
+    std::iter::once(format!("{stem}.{ext}"))
+        .chain((2..).map(|n| format!("{stem} ({n}).{ext}")))
+        .find(|name| !taken.contains(&name.to_lowercase()))
+        .expect("бесконечная последовательность")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_file_names_keep_the_extension() {
+        assert_eq!(unique_file_name("Новый", "txt", &["a.txt"]), "Новый.txt");
+        assert_eq!(
+            unique_file_name("Новый", "txt", &["новый.TXT", "Новый (2).txt"]),
+            "Новый (3).txt"
+        );
+    }
 
     #[test]
     fn validation() {

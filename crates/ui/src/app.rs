@@ -21,7 +21,7 @@ use mh_files_core::sort::SortColumn;
 use mh_files_fs::{CancelToken, DirSize, Event, Indexer, Ticket, Workers};
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
-use mh_files_platform::ops::{Executor, OpEvent};
+use mh_files_platform::ops::{Executor, FileOp, OpEvent};
 use mh_files_platform::shell::MenuChoice;
 
 use crate::commands::{CommandId, Keymap};
@@ -74,6 +74,10 @@ pub enum Target {
     Current,
     NewTab,
     OtherPane,
+    /// Новой панелью во весь левый (`first`) или правый край — бросок папки на край окна.
+    EdgePane {
+        first: bool,
+    },
 }
 
 /// Что перетаскивают внутри окна.
@@ -84,6 +88,8 @@ pub struct DragFiles {
     pub archive: Option<PathBuf>,
     /// Тащат правой кнопкой: при отпускании — меню «Копировать / Переместить / Ярлыки».
     pub right: bool,
+    /// Тащат одну папку с диска: на краю окна она открывается новой панелью.
+    pub folder: Option<PathBuf>,
 }
 
 /// Меню после броска правой кнопкой, как в Проводнике.
@@ -101,8 +107,18 @@ pub struct DropZone {
     pub dir: PathBuf,
     /// Строки внутри панели важнее самой панели.
     pub priority: u8,
-    /// Бросок на группу избранного добавляет в неё, а не копирует.
-    pub favorite_group: Option<usize>,
+    pub kind: ZoneKind,
+}
+
+/// Что делает бросок на место.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneKind {
+    /// Копировать или переместить в папку `dir`.
+    Folder,
+    /// Добавить в группу избранного, а не копировать.
+    Favorites(usize),
+    /// Удалить в корзину.
+    RecycleBin,
 }
 
 /// Ширины столбцов таблицы (имя занимает остаток).
@@ -252,6 +268,10 @@ pub struct FilesApp {
     pub ops: Executor,
     pub operations: crate::operations::Operations,
     pub drives: Vec<DriveInfo>,
+    /// Сколько в корзине; `None` — ещё не знаем или корзины нет (не Windows).
+    pub recycle_bin: Option<mh_files_platform::recycle::BinInfo>,
+    /// Окно было в фокусе в прошлом кадре: вернулись в окно — корзину опросить снова.
+    was_focused: bool,
     pub places: Vec<(KnownFolder, PathBuf)>,
     pub recent: Vec<PathBuf>,
     pub closed: Vec<TabSession>,
@@ -355,6 +375,8 @@ impl FilesApp {
             ops,
             operations: Default::default(),
             drives: Vec::new(),
+            recycle_bin: None,
+            was_focused: true,
             places: Vec::new(),
             recent: Vec::new(),
             closed: Vec::new(),
@@ -399,6 +421,7 @@ impl FilesApp {
         app.restore(restored.unwrap_or_else(|| Session::single(app.home_location())));
         app.workers.watch_drives();
         app.workers.known_folders();
+        app.workers.recycle_bin();
         app.workers.integration(None);
         // Пути из командной строки: без восстановленного сеанса первый — в домашнюю вкладку.
         app.open_targets_from_outside(startup.open, fresh);
@@ -788,6 +811,7 @@ impl FilesApp {
                 }
             }
             Event::KnownFolders(places) => self.places = places,
+            Event::RecycleBin(info) => self.recycle_bin = info,
             Event::Image { key, result } => self.images.on_result(ctx, key, result),
             Event::ThumbnailTypes(types) => self.images.on_types(types),
             Event::Shell { what, result } => {
@@ -997,6 +1021,12 @@ impl FilesApp {
         let ctx = ui.ctx().clone();
         self.diag.frame();
         self.poll(&ctx);
+        // Корзину могли очистить или пополнить в Проводнике, пока окно было в фоне.
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.was_focused {
+            self.workers.recycle_bin();
+        }
+        self.was_focused = focused;
         self.handle_keys(&ctx);
         self.run_actions(&ctx);
         self.drop_zones.clear();
@@ -1251,7 +1281,7 @@ impl FilesApp {
             let right = std::mem::take(&mut self.external_right);
             let at = at.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
             match at.and_then(|pos| self.zone_at(pos).cloned().map(|zone| (pos, zone))) {
-                Some((pos, zone)) if right && zone.favorite_group.is_none() => {
+                Some((pos, zone)) if right && zone.kind == ZoneKind::Folder => {
                     self.drop_menu =
                         Some(DropMenu { paths: dropped, dest: zone.dir, archive: None, at: pos });
                 }
@@ -1261,12 +1291,34 @@ impl FilesApp {
         } else if !hovering {
             self.external_right = false;
         }
+        // Одну папку бросают на левый или правый край окна — она открывается новой панелью.
+        let edge = match (egui::DragAndDrop::payload::<DragFiles>(ctx), pointer) {
+            (Some(payload), Some(pos)) if payload.folder.is_some() && !payload.right => {
+                self.edge_target(pos)
+            }
+            _ => None,
+        };
+        if edge.is_some() {
+            self.drop_hover = None;
+        }
+        if dragging
+            && ctx.input(|i| i.pointer.any_released())
+            && let Some((first, _)) = edge
+            && let Some(folder) =
+                egui::DragAndDrop::take_payload::<DragFiles>(ctx).and_then(|p| p.folder.clone())
+        {
+            self.actions.push(Action::Open {
+                location: Location::Dir(folder),
+                target: Target::EdgePane { first },
+            });
+            return;
+        }
         if dragging && ctx.input(|i| i.pointer.any_released()) {
             let payload = egui::DragAndDrop::take_payload::<DragFiles>(ctx);
             if let (Some(payload), Some(pos)) = (payload, pointer)
                 && let Some(zone) = self.zone_at(pos).cloned()
             {
-                if payload.right && zone.favorite_group.is_none() {
+                if payload.right && zone.kind == ZoneKind::Folder {
                     self.drop_menu = Some(DropMenu {
                         paths: payload.paths.clone(),
                         dest: zone.dir,
@@ -1275,32 +1327,108 @@ impl FilesApp {
                     });
                     return;
                 }
-                match &payload.archive {
-                    Some(archive) if zone.favorite_group.is_none() => {
+                match (&payload.archive, zone.kind) {
+                    (Some(archive), ZoneKind::Folder) => {
                         self.extract_drop(archive.clone(), payload.paths.clone(), zone.dir)
                     }
+                    // Внутри архива удалять нечего: файлов на диске нет.
+                    (Some(_), ZoneKind::RecycleBin) => {}
                     _ => self.drop_on(zone, payload.paths.clone(), ctx),
                 }
             }
         }
-        if dragging && let Some(pos) = pointer {
-            let label = match &self.drop_hover {
-                Some(dir) => format!("В «{}»", mh_files_core::location::path_label(dir)),
-                None => "…".to_string(),
-            };
-            egui::Area::new(Id::new("drag-label"))
-                .order(egui::Order::Tooltip)
-                .fixed_pos(pos + vec2(14.0, 10.0))
-                .interactable(false)
-                .show(ctx, |ui| {
-                    egui::Frame::new()
-                        .fill(theme::CARD)
-                        .stroke(Stroke::new(1.0, theme::CARD_STROKE))
-                        .corner_radius(CornerRadius::same(4))
-                        .inner_margin(egui::Margin::symmetric(8, 4))
-                        .show(ui, |ui| ui.label(label));
-                });
+        if dragging
+            && let Some(pos) = pointer
+            && let Some(payload) = egui::DragAndDrop::payload::<DragFiles>(ctx)
+        {
+            if let Some((_, rect)) = edge {
+                paint_drop_area(ctx, Id::new("edge-drop"), rect);
+            }
+            let hint = self.drag_hint(ctx, &payload, edge.map(|(first, _)| first));
+            drag_label(ctx, pos, &hint);
         }
+    }
+
+    /// Край окна, на который можно бросить папку: `true` — левый. С прямоугольником, где
+    /// встанет новая панель.
+    fn edge_target(&self, pos: egui::Pos2) -> Option<(bool, Rect)> {
+        let area =
+            self.pane_regions.iter().map(|r| r.strip.union(r.content)).reduce(|a, b| a.union(b))?;
+        // Узкая полоса: дальше от края — обычный бросок в папку под курсором.
+        let edge = (area.width() * 0.04).clamp(24.0, 40.0);
+        if !area.contains(pos) {
+            return None;
+        }
+        let first = if pos.x < area.left() + edge {
+            true
+        } else if pos.x > area.right() - edge {
+            false
+        } else {
+            return None;
+        };
+        let share = 1.0 / (self.layout.columns(SplitDirection::Horizontal) + 1) as f32;
+        let width = area.width() * share;
+        let rect = if first {
+            Rect::from_min_max(area.min, egui::pos2(area.left() + width, area.bottom()))
+        } else {
+            Rect::from_min_max(egui::pos2(area.right() - width, area.top()), area.max)
+        };
+        Some((first, rect))
+    }
+
+    /// Подсказка у курсора: что случится, если отпустить здесь.
+    fn drag_hint(&self, ctx: &egui::Context, payload: &DragFiles, edge: Option<bool>) -> String {
+        use mh_files_core::location::path_label;
+        if let (Some(first), Some(folder)) = (edge, &payload.folder) {
+            let side = if first { "слева" } else { "справа" };
+            return format!("Открыть «{}» новой панелью {side}", short(&path_label(folder)));
+        }
+        let Some(zone) = self.drop_hover.as_ref().and_then(|dir| {
+            self.drop_zones.iter().filter(|z| &z.dir == dir).max_by_key(|z| z.priority)
+        }) else {
+            return "Наведите на папку или панель".into();
+        };
+        let what = match payload.paths.len() {
+            1 => String::new(),
+            n => format!(" {}", mh_files_core::format::items(n)),
+        };
+        match zone.kind {
+            ZoneKind::Folder => {}
+            ZoneKind::Favorites(_) => return "Добавить в избранное".into(),
+            ZoneKind::RecycleBin if payload.archive.is_some() => {
+                return "Из архива в корзину нельзя".into();
+            }
+            ZoneKind::RecycleBin => return format!("Удалить{what} в корзину"),
+        }
+        let name = short(&path_label(&zone.dir));
+        if payload.archive.is_some() {
+            return format!("Извлечь{what} в «{name}»");
+        }
+        if payload.paths.iter().all(|p| p.parent() == Some(zone.dir.as_path())) {
+            return format!("Уже в «{name}»");
+        }
+        if payload.paths.iter().any(|p| zone.dir.starts_with(p)) {
+            return "Папку нельзя положить в саму себя".into();
+        }
+        if payload.right {
+            return format!("В «{name}»: копировать, переместить или ярлыки");
+        }
+        if crate::actions::writable_zip(&zone.dir).is_some() {
+            return format!("Добавить{what} в архив «{name}»");
+        }
+        let modifiers = ctx.input(|i| i.modifiers);
+        let action = if modifiers.ctrl && modifiers.shift || modifiers.alt {
+            "Создать ярлыки"
+        } else if modifiers.ctrl {
+            "Копировать"
+        } else if modifiers.shift {
+            "Переместить"
+        } else if payload.paths.iter().any(|p| root_of(p) != root_of(&zone.dir)) {
+            "Копировать"
+        } else {
+            "Переместить"
+        };
+        format!("{action}{what} в «{name}»")
     }
 
     /// Файлы вытащили за край окна: дальше перетаскивание ведёт Windows (OLE), и их можно
@@ -1451,30 +1579,25 @@ impl FilesApp {
             return;
         }
         if let Some((_, rect)) = target {
-            egui::Area::new(Id::new("tab-drop"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(rect.min)
-                .interactable(false)
-                .show(ctx, |ui| {
-                    ui.painter().rect_filled(
-                        rect,
-                        CornerRadius::same(6),
-                        theme::accent().gamma_multiply(0.18),
-                    );
-                    ui.painter().rect_stroke(
-                        rect.shrink(1.0),
-                        CornerRadius::same(6),
-                        Stroke::new(1.5, theme::accent()),
-                        egui::StrokeKind::Inside,
-                    );
-                });
+            paint_drop_area(ctx, Id::new("tab-drop"), rect);
         }
     }
 
     fn drop_on(&mut self, zone: DropZone, paths: Vec<PathBuf>, ctx: &egui::Context) {
-        if let Some(group) = zone.favorite_group {
-            self.actions.push(Action::AddFavorites { group, paths });
-            return;
+        match zone.kind {
+            ZoneKind::Folder => {}
+            ZoneKind::Favorites(group) => {
+                self.actions.push(Action::AddFavorites { group, paths });
+                return;
+            }
+            ZoneKind::RecycleBin => {
+                if self.settings.files.confirm_recycle {
+                    self.dialog = Some(crate::dialogs::Dialog::delete(paths, false));
+                } else {
+                    self.submit(FileOp::Delete { paths, permanent: false }, None);
+                }
+                return;
+            }
         }
         // Окно без фокуса (файлы тянули из Проводника) не знает о клавишах — спросить систему.
         let keys = mh_files_platform::window::drag_keys();
@@ -1580,6 +1703,8 @@ impl FilesApp {
             ));
         }
         let mut settings = settings;
+        // Громкость меняют в быстром просмотре, а не в окне настроек: его копия могла устареть.
+        settings.preview.volume = self.settings.preview.volume;
         // Пока окно настроек было открыто, расписание могло отработать: его время новее.
         for schedule in &mut settings.sort_schedules {
             if let Some(current) =
@@ -1673,6 +1798,68 @@ pub fn drive_title(drive: &DriveInfo) -> String {
     let label = if drive.label.is_empty() { kind } else { drive.label.as_str() };
     // Буква первой: диски в списке выравниваются по ней и ищутся с первого символа.
     format!("{root} {label}")
+}
+
+/// Подсветка места, куда встанет панель.
+fn paint_drop_area(ctx: &egui::Context, id: Id, rect: Rect) {
+    egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.painter().rect_filled(
+                rect,
+                CornerRadius::same(6),
+                theme::accent().gamma_multiply(0.18),
+            );
+            ui.painter().rect_stroke(
+                rect.shrink(1.0),
+                CornerRadius::same(6),
+                Stroke::new(1.5, theme::accent()),
+                egui::StrokeKind::Inside,
+            );
+        });
+}
+
+/// Плашка у курсора при перетаскивании. Одной строкой и целиком в окне: у правого края
+/// встаёт слева от курсора, у нижнего — над ним.
+fn drag_label(ctx: &egui::Context, pos: egui::Pos2, text: &str) {
+    let screen = ctx.content_rect();
+    let galley = ctx.fonts_mut(|fonts| {
+        fonts.layout_no_wrap(text.to_string(), theme::regular(13.0), theme::TEXT_PRIMARY)
+    });
+    let size = galley.size() + vec2(16.0, 8.0);
+    let mut at = pos + vec2(16.0, 12.0);
+    if at.x + size.x > screen.right() - 4.0 {
+        at.x = pos.x - 8.0 - size.x;
+    }
+    if at.y + size.y > screen.bottom() - 4.0 {
+        at.y = pos.y - 8.0 - size.y;
+    }
+    at.x = at.x.max(screen.left() + 4.0);
+    let rect = Rect::from_min_size(at, size);
+    let painter =
+        ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::new("drag-label")));
+    painter.rect(
+        rect,
+        CornerRadius::same(4),
+        theme::CARD,
+        Stroke::new(1.0, theme::CARD_STROKE),
+        egui::StrokeKind::Inside,
+    );
+    painter.galley(rect.min + vec2(8.0, 4.0), galley, theme::TEXT_PRIMARY);
+}
+
+/// Длинное имя — с многоточием в середине, чтобы плашка не тянулась через всё окно.
+fn short(name: &str) -> String {
+    const MAX: usize = 40;
+    let chars: Vec<char> = name.chars().collect();
+    if chars.len() <= MAX {
+        return name.to_string();
+    }
+    let head: String = chars[..MAX / 2].iter().collect();
+    let tail: String = chars[chars.len() - (MAX / 2 - 1)..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 /// Корень диска для пути: по нему решается «переместить или копировать» при перетаскивании.

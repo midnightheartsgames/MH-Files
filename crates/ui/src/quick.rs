@@ -30,6 +30,8 @@ pub struct State {
     /// Эквалайзер звука: сглаженные полосы и их пики (0..1).
     bars: Vec<f32>,
     peaks: Vec<f32>,
+    /// Громкость поменяли: запомнить в настройках; `true` — ползунок отпущен, пора сохранить.
+    volume_changed: Option<(Option<f32>, bool)>,
 }
 
 impl State {
@@ -47,6 +49,7 @@ impl State {
             seeking: None,
             bars: Vec::new(),
             peaks: Vec::new(),
+            volume_changed: None,
         };
         state.request(app, None);
         state
@@ -147,7 +150,9 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let audio =
             mh_files_core::entry::media_kind(&name) == Some(mh_files_core::entry::MediaKind::Audio);
-        quick.player = Some(mh_files_platform::player::Player::open(path, 1920, audio, waker));
+        let volume = f64::from(app.settings.preview.volume.clamp(0.0, 1.0));
+        quick.player =
+            Some(mh_files_platform::player::Player::open(path, 1920, audio, volume, waker));
     }
     let mut turn = None;
     let screen = ctx.content_rect();
@@ -234,6 +239,15 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     }
     if let Some(page) = turn {
         quick.request(app, Some(page));
+    }
+    // Громкость запоминается между открытиями просмотра и запусками программы.
+    if let Some((volume, save)) = quick.volume_changed.take() {
+        if let Some(volume) = volume {
+            app.settings.preview.volume = volume;
+        }
+        if save {
+            app.save_settings();
+        }
     }
     // Enter — пауза, Shift+стрелки — на 5 секунд назад и вперёд.
     if let Some(player) = &quick.player {
@@ -354,12 +368,16 @@ fn controls_row(
         }
         let mut volume = state.volume;
         ui.spacing_mut().slider_width = volume_width - 20.0;
-        if ui
+        let slider = ui
             .add(egui::Slider::new(&mut volume, 0.0..=1.0).show_value(false))
-            .on_hover_text("Громкость")
-            .changed()
-        {
+            .on_hover_text("Громкость");
+        if slider.changed() {
             player.set_volume(volume);
+        }
+        if slider.changed() || slider.drag_stopped() {
+            // Пока тянут, громкость только запоминается; отпустили — сохраняется.
+            let value = slider.changed().then_some(volume as f32);
+            quick.volume_changed = Some((value, !slider.dragged()));
         }
     });
 }

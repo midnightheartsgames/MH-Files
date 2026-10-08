@@ -254,6 +254,8 @@ pub struct Preview {
     pub media: bool,
     /// Размер выбранной папки в Инспекторе — сразу, без кнопки.
     pub inspector_folder_size: bool,
+    /// Громкость быстрого просмотра 0..1 — какой её оставили в прошлый раз.
+    pub volume: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +356,7 @@ impl Default for Preview {
             handlers: true,
             media: true,
             inspector_folder_size: true,
+            volume: 1.0,
         }
     }
 }

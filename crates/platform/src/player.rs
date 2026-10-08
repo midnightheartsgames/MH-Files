@@ -63,8 +63,9 @@ pub struct Player {
 
 impl Player {
     /// Открыть и сразу начать воспроизведение. `max_side` — предел стороны кадра в пикселях.
-    /// `spectrum` — ещё и разложить звук для эквалайзера ([`Player::levels`]).
-    pub fn open(path: &Path, max_side: u32, spectrum: bool, waker: Waker) -> Player {
+    /// `spectrum` — ещё и разложить звук для эквалайзера ([`Player::levels`]); `volume` —
+    /// громкость 0..1 с первого звука.
+    pub fn open(path: &Path, max_side: u32, spectrum: bool, volume: f64, waker: Waker) -> Player {
         let shared = Arc::new(Shared::default());
         let (commands, receiver) = unbounded();
         #[cfg(windows)]
@@ -77,7 +78,7 @@ impl Player {
             }
             let (path, thread_shared) = (path.to_path_buf(), shared.clone());
             let started = std::thread::Builder::new().name("player".into()).spawn(move || {
-                crate::win::player::run(&path, max_side, &thread_shared, &receiver, &waker)
+                crate::win::player::run(&path, max_side, volume, &thread_shared, &receiver, &waker)
             });
             if let Err(error) = started {
                 shared.state.lock().unwrap().error = Some(error.to_string());
@@ -85,7 +86,7 @@ impl Player {
         }
         #[cfg(not(windows))]
         {
-            let _ = (path, max_side, spectrum, waker, receiver);
+            let _ = (path, max_side, spectrum, volume, waker, receiver);
             shared.state.lock().unwrap().error =
                 Some("воспроизведение есть только в Windows".into());
         }

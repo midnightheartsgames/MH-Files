@@ -39,6 +39,7 @@ const CLOCK_EVERY: Duration = Duration::from_millis(250);
 pub fn run(
     path: &Path,
     max_side: u32,
+    volume: f64,
     shared: &Arc<Shared>,
     commands: &Receiver<Command>,
     waker: &Waker,
@@ -55,7 +56,7 @@ pub fn run(
     if let Err(error) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
         fail(format!("Media Foundation недоступна: {error}"));
     } else {
-        match Engine::new(path) {
+        match Engine::new(path, volume) {
             Ok(mut engine) => engine.play_loop(max_side, shared, commands, waker),
             Err(error) => fail(error),
         }
@@ -95,7 +96,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(path: &Path) -> Result<Engine, String> {
+    fn new(path: &Path, volume: f64) -> Result<Engine, String> {
         let (device, context) = create_device()?;
         let error = Arc::new(Mutex::new(None));
         let notify: IMFMediaEngineNotify = Notify { error: error.clone() }.into();
@@ -126,6 +127,8 @@ impl Engine {
                     .map_err(text)?;
             let engine = factory.CreateInstance(0, &attributes).map_err(text)?;
             engine.SetSource(&BSTR::from(path.to_string_lossy().as_ref())).map_err(text)?;
+            // Сохранённая громкость — до первого звука.
+            let _ = engine.SetVolume(volume.clamp(0.0, 1.0));
             engine.Play().map_err(text)?;
             Ok(Engine { engine, device, context, error, target: None })
         }
@@ -140,7 +143,8 @@ impl Engine {
     ) {
         let mut last_pts = i64::MIN;
         let mut last_clock = Instant::now();
-        let mut volume = 1.0;
+        // SAFETY: обычный вызов движка в его потоке.
+        let mut volume = unsafe { self.engine.GetVolume() };
         loop {
             match commands.recv_timeout(TICK) {
                 Ok(command) => {

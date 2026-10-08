@@ -35,17 +35,8 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
 
     // Значок и название.
     let logo =
-        Rect::from_min_size(pos2(rect.left() + 14.0, rect.center().y - 8.0), vec2(16.0, 16.0));
-    for (i, h) in [7.0, 16.0, 11.0].into_iter().enumerate() {
-        painter.rect_filled(
-            Rect::from_min_size(
-                pos2(logo.left() + i as f32 * 6.0, logo.bottom() - h),
-                vec2(4.0, h),
-            ),
-            1,
-            theme::accent(),
-        );
-    }
+        Rect::from_min_size(pos2(rect.left() + 13.0, rect.center().y - 10.0), vec2(20.0, 20.0));
+    crate::icons::logo(&painter, logo, theme::PANEL);
     let name = painter.text(
         pos2(logo.right() + 10.0, rect.center().y),
         Align2::LEFT_CENTER,

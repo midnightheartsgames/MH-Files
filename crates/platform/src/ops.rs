@@ -64,6 +64,11 @@ pub enum FileOp {
         parent: PathBuf,
         name: String,
     },
+    /// Пустой файл.
+    NewFile {
+        parent: PathBuf,
+        name: String,
+    },
     /// Вернуть из корзины: `(где лежит в корзине, откуда удалили)`. Так отменяется удаление
     /// в корзину: путь в `$Recycle.Bin` сообщает `IFileOperation` при удалении.
     Restore {
@@ -97,6 +102,7 @@ impl FileOp {
             }
             FileOp::Rename { new_name, .. } => format!("Переименование в «{new_name}»"),
             FileOp::NewFolder { name, .. } => format!("Новая папка «{name}»"),
+            FileOp::NewFile { name, .. } => format!("Новый файл «{name}»"),
             FileOp::Restore { items } => format!("Из корзины: {}", count(items.len())),
         }
     }
@@ -115,7 +121,9 @@ impl FileOp {
             }
             FileOp::Delete { paths, .. } => parents(paths),
             FileOp::Rename { path, .. } => parents(std::slice::from_ref(path)),
-            FileOp::NewFolder { parent, .. } => vec![parent.clone()],
+            FileOp::NewFolder { parent, .. } | FileOp::NewFile { parent, .. } => {
+                vec![parent.clone()]
+            }
             FileOp::Restore { items } => items
                 .iter()
                 .filter_map(|(_, original)| original.parent().map(PathBuf::from))
@@ -147,7 +155,9 @@ impl FileOp {
                 let items = pairs.iter().map(|(from, to)| (to.clone(), from.clone())).collect();
                 Some(vec![FileOp::Restore { items }])
             }
-            FileOp::NewFolder { .. } | FileOp::Copy { .. } if !created.is_empty() => {
+            FileOp::NewFolder { .. } | FileOp::NewFile { .. } | FileOp::Copy { .. }
+                if !created.is_empty() =>
+            {
                 Some(vec![FileOp::Delete { paths: created.clone(), permanent: false }])
             }
             FileOp::Move { .. } if !pairs.is_empty() => {
@@ -194,7 +204,9 @@ impl FileOp {
             }
             FileOp::Delete { paths, .. } => paths.clone(),
             FileOp::Rename { path, new_name } => vec![path.clone(), path.with_file_name(new_name)],
-            FileOp::NewFolder { parent, name } => vec![parent.join(name)],
+            FileOp::NewFolder { parent, name } | FileOp::NewFile { parent, name } => {
+                vec![parent.join(name)]
+            }
             FileOp::Restore { items } => {
                 items.iter().flat_map(|(bin, original)| [bin.clone(), original.clone()]).collect()
             }
@@ -549,6 +561,15 @@ mod portable {
                 fs::create_dir(&target).map_err(|e| describe(&target, e))?;
                 Ok(OpOutcome::done(vec![target], Vec::new()))
             }
+            FileOp::NewFile { parent, name } => {
+                let target = parent.join(name);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
+                    .map_err(|e| describe(&target, e))?;
+                Ok(OpOutcome::done(vec![target], Vec::new()))
+            }
             FileOp::Restore { items } => {
                 let mut meter = Meter { done: 0, total: items.len() as u64, report };
                 let mut pairs = Vec::new();
@@ -760,6 +781,14 @@ mod tests {
     fn move_rename_and_new_folder() {
         let dir = temp_dir("move");
         exec(&FileOp::NewFolder { parent: dir.clone(), name: "sub".into() }).unwrap();
+        let file = FileOp::NewFile { parent: dir.clone(), name: "empty.txt".into() };
+        let created = exec(&file).unwrap();
+        assert_eq!(std::fs::read(dir.join("empty.txt")).unwrap(), b"");
+        assert_eq!(
+            file.inverse(&created),
+            Some(vec![FileOp::Delete { paths: vec![dir.join("empty.txt")], permanent: false }])
+        );
+        assert!(exec(&file).is_err(), "занятое имя не перезаписывается");
         std::fs::write(dir.join("f"), "x").unwrap();
         let moved = exec(&FileOp::moving(vec![dir.join("f")], dir.join("sub"))).unwrap();
         assert_eq!(

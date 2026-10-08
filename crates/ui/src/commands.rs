@@ -75,6 +75,7 @@ commands! {
     Delete => "Удалить в корзину", ["delete", "trash", "recycle"], ["Delete"];
     DeletePermanent => "Удалить насовсем", ["delete permanently", "shred"], ["Shift+Delete"];
     NewFolder => "Новая папка", ["new folder", "mkdir"], ["Ctrl+Shift+N"];
+    NewFile => "Новый текстовый файл", ["new file", "touch", "text document"], ["Ctrl+Alt+N"];
     Properties => "Свойства", ["properties"], ["Alt+Enter"];
     WindowsMenu => "Меню Windows", ["context menu", "shell menu", "7-zip", "git"], ["Shift+F10"];
     Undo => "Отменить", ["undo"], ["Ctrl+Z"];
