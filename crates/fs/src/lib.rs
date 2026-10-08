@@ -38,6 +38,7 @@ pub mod sizes;
 pub mod sorting;
 pub mod transfer;
 pub mod watch;
+pub mod zip_write;
 
 pub use duplicates::{DuplicateOptions, DuplicateProgress, LinkReport};
 pub use images::{ImageKey, ImageKind, ImageResult};
@@ -119,6 +120,11 @@ pub enum Event {
     Drive(DriveInfo),
     /// Сколько в корзине; `None` — не узнать.
     RecycleBin(Option<mh_files_platform::recycle::BinInfo>),
+    /// Файлы дописаны в zip (или нет).
+    ZipAdded {
+        archive: PathBuf,
+        result: Result<zip_write::Added, String>,
+    },
     /// Содержимое корзины для её вкладки; за ним — `ListingDone`.
     RecycleListing {
         ticket: Ticket,
@@ -397,6 +403,14 @@ impl Workers {
                 })
                 .collect();
             workers.send(Event::ThumbnailTypes(types));
+        });
+    }
+
+    /// Дописать `sources` в папку `inner` zip-архива `archive`.
+    pub fn add_to_zip(&self, archive: PathBuf, inner: String, sources: Vec<PathBuf>) {
+        self.spawn("zip-add", move |workers| {
+            let result = zip_write::add(&archive, &inner, &sources, &CancelToken::default());
+            workers.send(Event::ZipAdded { archive, result });
         });
     }
 

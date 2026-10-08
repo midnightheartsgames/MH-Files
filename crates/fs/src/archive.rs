@@ -551,6 +551,11 @@ fn open_zip(archive: &Path) -> Result<zip::ZipArchive<std::io::BufReader<File>>,
     zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(zip_error)
 }
 
+/// Имена записей zip (через `/`, без косой в конце) — так, как их видит MH Files.
+pub(crate) fn zip_names(archive: &Path) -> Result<Vec<String>, String> {
+    Ok(read_zip(archive)?.into_iter().map(|item| item.inner).collect())
+}
+
 fn read_zip(archive: &Path) -> Result<Vec<Item>, String> {
     let mut zip = open_zip(archive)?;
     let mut items = Vec::with_capacity(zip.len());

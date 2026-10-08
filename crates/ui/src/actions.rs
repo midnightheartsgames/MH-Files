@@ -885,9 +885,29 @@ impl FilesApp {
     }
 
     fn close_tab(&mut self, pane_id: mh_files_core::layout::PaneId, index: usize) {
+        let alone = self.panes.len() == 1;
         let Some(pane) = self.pane_mut(pane_id) else { return };
-        if pane.tabs.len() == 1 {
+        if pane.tabs.len() == 1 && !alone {
             self.close_pane(pane_id);
+            return;
+        }
+        // Последняя вкладка последней панели: окно не пустеет — на её месте «Этот компьютер».
+        if pane.tabs.len() == 1 {
+            if pane.tabs[0].location == Location::Computer {
+                return;
+            }
+            let view = pane.tabs[0].view;
+            let computer =
+                TabSession { location: Location::Computer, view, sort: Default::default() };
+            let fresh = self.make_tab(&computer);
+            let Some(pane) = self.pane_mut(pane_id) else { return };
+            let mut tab = std::mem::replace(&mut pane.tabs[0], fresh);
+            pane.active = 0;
+            tab.stop();
+            self.closed.push(tab.session());
+            if self.closed.len() > 32 {
+                self.closed.remove(0);
+            }
             return;
         }
         let mut tab = pane.tabs.remove(index);
@@ -1010,13 +1030,43 @@ impl FilesApp {
     /// Бросок в zip: копирование в «сжатую папку» Проводника (`IFileOperation`) — Windows
     /// сама дописывает архив и спрашивает про занятые имена. Своего кода записи в архив нет.
     fn add_to_zip(&mut self, sources: Vec<PathBuf>, dest: PathBuf) {
-        if !cfg!(windows) {
-            self.set_status("запись в архив есть только в Windows", Level::Error);
-            return;
+        let Some((archive, inner)) = Location::containing_archive(&dest) else { return };
+        let name = mh_files_core::location::path_label(&archive);
+        self.set_status(format!("дописываю в «{name}»…"), Level::Info);
+        self.workers.add_to_zip(archive, inner, sources);
+    }
+
+    /// Файлы дописаны в zip: сказать, что вышло, и перечитать архив и его папку.
+    pub fn on_zip_added(
+        &mut self,
+        archive: PathBuf,
+        result: Result<mh_files_fs::zip_write::Added, String>,
+    ) {
+        let name = mh_files_core::location::path_label(&archive);
+        match result {
+            Ok(added) => {
+                let mut text =
+                    format!("в «{name}» добавлено: {}", mh_files_core::format::items(added.files));
+                if let Some((was, now)) = added.renamed.first() {
+                    let more = added.renamed.len() - 1;
+                    text += &format!("; имя занято — «{was}» лёг как «{now}»");
+                    if more > 0 {
+                        text += &format!(" и ещё {more}");
+                    }
+                }
+                self.set_status(text, Level::Info);
+            }
+            Err(error) => self.set_status(format!("«{name}»: {error}"), Level::Error),
         }
-        let op =
-            FileOp::Copy { sources, dest, on_conflict: mh_files_platform::ops::OnConflict::Ask };
-        self.submit(op, None);
+        let workers = self.workers.clone();
+        for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+            if matches!(&tab.location, Location::Archive { archive: a, .. } if *a == archive) {
+                tab.reload(&workers, true);
+            }
+        }
+        if let Some(parent) = archive.parent() {
+            self.reload_dirs(&[parent.to_path_buf()]);
+        }
     }
 
     fn add_favorites(&mut self, group: usize, paths: Vec<PathBuf>) {

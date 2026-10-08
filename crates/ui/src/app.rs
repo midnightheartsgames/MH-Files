@@ -819,6 +819,7 @@ impl FilesApp {
                 }
                 self.recycle_bin = info;
             }
+            Event::ZipAdded { archive, result } => self.on_zip_added(archive, result),
             Event::RecycleListing { ticket, items } => {
                 if let Some(tab) = self.tab_by_id(ticket.owner) {
                     tab.on_recycled(ticket, items);
