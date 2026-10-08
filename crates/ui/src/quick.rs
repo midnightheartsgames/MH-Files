@@ -27,6 +27,9 @@ pub struct State {
     frame: Option<TextureHandle>,
     /// Ползунок перемотки, пока его тянут.
     seeking: Option<f64>,
+    /// Эквалайзер звука: сглаженные полосы и их пики (0..1).
+    bars: Vec<f32>,
+    peaks: Vec<f32>,
 }
 
 impl State {
@@ -42,6 +45,8 @@ impl State {
             player: None,
             frame: None,
             seeking: None,
+            bars: Vec::new(),
+            peaks: Vec::new(),
         };
         state.request(app, None);
         state
@@ -69,6 +74,8 @@ impl State {
         self.player = None;
         self.frame = None;
         self.seeking = None;
+        self.bars.clear();
+        self.peaks.clear();
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         self.wants_player = app.settings.preview.media
             && !is_dir
@@ -136,7 +143,11 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         let repaint = ctx.clone();
         let waker: mh_files_platform::Waker =
             std::sync::Arc::new(move || repaint.request_repaint());
-        quick.player = Some(mh_files_platform::player::Player::open(path, 1920, waker));
+        // Эквалайзер — только звуку: у видео есть картинка.
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let audio =
+            mh_files_core::entry::media_kind(&name) == Some(mh_files_core::entry::MediaKind::Audio);
+        quick.player = Some(mh_files_platform::player::Player::open(path, 1920, audio, waker));
     }
     let mut turn = None;
     let screen = ctx.content_rect();
@@ -264,6 +275,12 @@ fn media(ui: &mut egui::Ui, quick: &mut State, height: f32) {
     let state = player.state();
     let controls = 40.0;
     let area = vec2(ui.available_width(), (height - controls).max(60.0));
+    // Звук — эквалайзер (и обложка слева, если есть); не разложился — как раньше.
+    let position = quick.seeking.unwrap_or(state.position);
+    if !state.has_video && state.ready && equalizer(ui, quick, &state, position, area) {
+        controls_row(ui, quick, &state);
+        return;
+    }
     // Видео — кадр, звук — обложка из эскиза Windows, если она есть.
     let picture = if state.has_video { quick.frame.as_ref() } else { quick.texture.as_ref() };
     ui.allocate_ui(area, |ui| {
@@ -283,6 +300,16 @@ fn media(ui: &mut egui::Ui, quick: &mut State, height: f32) {
             }
         });
     });
+    controls_row(ui, quick, &state);
+}
+
+/// Кнопка, время, перемотка, громкость.
+fn controls_row(
+    ui: &mut egui::Ui,
+    quick: &mut State,
+    state: &mh_files_platform::player::PlayerState,
+) {
+    let Some(player) = &quick.player else { return };
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         let paused = state.paused || state.ended;
@@ -346,4 +373,89 @@ fn clock(seconds: f64) -> String {
     } else {
         format!("{minutes}:{secs:02}")
     }
+}
+
+/// Эквалайзер звука: полосы спектра в такт воспроизведению, с пиками, которые медленно
+/// опускаются. Обложка (эскиз Windows), если есть, — квадратом слева. `false` — спектра нет
+/// (не разложился), рисовать нечего.
+fn equalizer(
+    ui: &mut egui::Ui,
+    quick: &mut State,
+    state: &mh_files_platform::player::PlayerState,
+    position: f64,
+    area: egui::Vec2,
+) -> bool {
+    use mh_files_platform::spectrum::BANDS;
+    let Some(player) = &quick.player else { return false };
+    let mut levels = [0.0f32; BANDS];
+    let known = player.levels(position, &mut levels);
+    if !known && player.spectrum_done() && quick.bars.is_empty() {
+        return false;
+    }
+    let playing = !state.paused && !state.ended;
+    if !playing || !known {
+        levels = [0.0; BANDS];
+    }
+    quick.bars.resize(BANDS, 0.0);
+    quick.peaks.resize(BANDS, 0.0);
+    let dt = ui.input(|i| i.stable_dt).min(0.1);
+    // Быстрый подъём, плавный спад; пики опускаются чуть больше чем за секунду.
+    let (attack, release) = (1.0 - (-dt / 0.03).exp(), 1.0 - (-dt / 0.18).exp());
+    for ((bar, peak), target) in quick.bars.iter_mut().zip(&mut quick.peaks).zip(levels) {
+        *bar += (target - *bar) * if target > *bar { attack } else { release };
+        *peak = if *bar > *peak { *bar } else { (*peak - 0.7 * dt).max(*bar) };
+    }
+    let (rect, _) = ui.allocate_exact_size(area, egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    let mut bars_rect = rect.shrink2(vec2(8.0, 12.0));
+    if let Some(cover) = &quick.texture {
+        let side = (rect.height() * 0.8).min(rect.width() * 0.35);
+        let cover_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + 8.0, rect.center().y - side / 2.0),
+            vec2(side, side),
+        );
+        let size = cover.size_vec2();
+        let scale = (side / size.x).min(side / size.y);
+        let image = egui::Rect::from_center_size(cover_rect.center(), size * scale);
+        painter.image(
+            cover.id(),
+            image,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        bars_rect.min.x = cover_rect.right() + 24.0;
+    }
+    let gap = 3.0;
+    let width = ((bars_rect.width() - gap * (BANDS - 1) as f32) / BANDS as f32).clamp(2.0, 18.0);
+    let total = width * BANDS as f32 + gap * (BANDS - 1) as f32;
+    let left = bars_rect.center().x - total / 2.0;
+    let bottom = bars_rect.bottom();
+    let height = bars_rect.height();
+    let accent = theme::accent();
+    painter.line_segment(
+        [egui::pos2(left, bottom + 2.0), egui::pos2(left + total, bottom + 2.0)],
+        Stroke::new(1.0, theme::CARD_STROKE),
+    );
+    for i in 0..BANDS {
+        let x = left + i as f32 * (width + gap);
+        let level = quick.bars[i];
+        let h = (level * height).max(2.0);
+        let color = accent.gamma_multiply(0.45 + 0.55 * level);
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x, bottom - h), egui::pos2(x + width, bottom)),
+            CornerRadius::same(2),
+            color,
+        );
+        let peak = bottom - (quick.peaks[i] * height).max(2.0) - 3.0;
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x, peak - 2.0), egui::pos2(x + width, peak)),
+            CornerRadius::ZERO,
+            theme::TEXT_SECONDARY,
+        );
+    }
+    let moving = quick.bars.iter().chain(&quick.peaks).any(|&v| v > 0.002);
+    if playing || moving || !known {
+        ui.ctx().request_repaint();
+    }
+    true
 }

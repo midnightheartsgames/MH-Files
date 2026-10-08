@@ -304,3 +304,14 @@ impl Drop for MemDc {
         }
     }
 }
+
+/// IThumbnailProvider и старый IExtractImage: так программы (Blender, Affinity, CAD)
+/// регистрируют эскизы своих файлов.
+const THUMBNAIL_PROVIDER: &str = "{e357fccd-a995-4576-b01f-234630154e96}";
+const EXTRACT_IMAGE: &str = "{bb2e617c-0920-11d1-9a0b-00c04fc2d6c1}";
+
+pub fn has_thumbnail_provider(ext: &str) -> bool {
+    [THUMBNAIL_PROVIDER, EXTRACT_IMAGE]
+        .iter()
+        .any(|iid| super::com::shell_extension(ext, iid).is_some())
+}

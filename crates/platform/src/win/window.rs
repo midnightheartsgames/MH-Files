@@ -41,6 +41,33 @@ pub fn message_hook(msg: *const std::ffi::c_void) -> bool {
     false
 }
 
+pub fn cursor_in_window() -> Option<(f32, f32)> {
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let hwnd = super::com::owner_hwnd()?;
+    let mut point = POINT::default();
+    // SAFETY: обе функции пишут только в локальную точку; HWND — главного окна.
+    unsafe {
+        GetCursorPos(&mut point).ok()?;
+        ScreenToClient(hwnd, &mut point).as_bool().then_some((point.x as f32, point.y as f32))
+    }
+}
+
+pub fn drag_keys() -> crate::window::DragKeys {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VIRTUAL_KEY, VK_CONTROL, VK_MENU, VK_RBUTTON, VK_SHIFT,
+    };
+    // SAFETY: только читает состояние клавиш и кнопок мыши.
+    let down = |key: VIRTUAL_KEY| unsafe { GetAsyncKeyState(key.0 as i32) } < 0;
+    crate::window::DragKeys {
+        ctrl: down(VK_CONTROL),
+        shift: down(VK_SHIFT),
+        alt: down(VK_MENU),
+        right: down(VK_RBUTTON),
+    }
+}
+
 pub fn double_click_time() -> std::time::Duration {
     // SAFETY: только читает системную настройку.
     let ms = unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime() };

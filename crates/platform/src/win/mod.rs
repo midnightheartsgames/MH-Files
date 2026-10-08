@@ -8,6 +8,7 @@ pub mod files;
 pub mod folders;
 pub mod instance;
 pub mod integration;
+pub mod locale;
 pub mod media;
 pub mod menu;
 pub mod net;

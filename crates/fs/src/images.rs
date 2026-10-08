@@ -137,7 +137,7 @@ pub fn render_svg_file(
 
 /// То же для SVG в памяти (из архива).
 pub fn render_svg(data: &[u8], max_side: u32) -> Result<(Bitmap, (u32, u32)), String> {
-    use resvg::{tiny_skia, usvg};
+    use resvg::usvg;
     let mut options = usvg::Options { fontdb: svg_fonts(), ..Default::default() };
     // Только встроенные (data:) картинки. Ссылка на файл, тем более на \\сервер\папку, не
     // открывается: просмотр чужого SVG не должен читать диск и ходить в сеть.
@@ -151,10 +151,23 @@ pub fn render_svg(data: &[u8], max_side: u32) -> Result<(Bitmap, (u32, u32)), St
     let scale = max_side as f32 / width.max(height);
     let pixels_w = ((width * scale).round() as u32).clamp(1, max_side);
     let pixels_h = ((height * scale).round() as u32).clamp(1, max_side);
-    let mut pixmap = tiny_skia::Pixmap::new(pixels_w, pixels_h).ok_or("SVG: пустая картинка")?;
-    let transform =
-        tiny_skia::Transform::from_scale(pixels_w as f32 / width, pixels_h as f32 / height);
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let bitmap = rasterize(&tree, pixels_w, pixels_h)?;
+    Ok((bitmap, (width.round() as u32, height.round() as u32)))
+}
+
+/// Нарисовать разобранный SVG в картинку `width`×`height` (растягивая под неё).
+pub(crate) fn rasterize(
+    tree: &resvg::usvg::Tree,
+    width: u32,
+    height: u32,
+) -> Result<Bitmap, String> {
+    use resvg::tiny_skia;
+    let mut pixmap = tiny_skia::Pixmap::new(width, height).ok_or("SVG: пустая картинка")?;
+    let transform = tiny_skia::Transform::from_scale(
+        width as f32 / tree.size().width(),
+        height as f32 / tree.size().height(),
+    );
+    resvg::render(tree, transform, &mut pixmap.as_mut());
     // tiny-skia отдаёт premultiplied alpha, а картинки здесь — с обычной.
     let mut rgba = pixmap.take();
     for pixel in rgba.as_chunks_mut::<4>().0 {
@@ -165,8 +178,7 @@ pub fn render_svg(data: &[u8], max_side: u32) -> Result<(Bitmap, (u32, u32)), St
             }
         }
     }
-    let bitmap = Bitmap { width: pixels_w, height: pixels_h, rgba };
-    Ok((bitmap, (width.round() as u32, height.round() as u32)))
+    Ok(Bitmap { width, height, rgba })
 }
 
 /// Системные шрифты для текста в SVG — один раз на процесс: поток предпросмотра каждый раз

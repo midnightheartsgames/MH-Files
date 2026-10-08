@@ -98,10 +98,35 @@ pub fn kind(ext: &str, is_dir: bool) -> String {
     }
 }
 
+/// Давность даты от 0 (только что) до 1 (год и старше) — для цвета кружка у даты. Шкала
+/// логарифмическая: минуты, часы, дни и месяцы различимы одинаково хорошо. Дата из будущего —
+/// как «только что».
+pub fn age(time: SystemTime, now: SystemTime) -> f32 {
+    const NEWEST: f64 = 60.0; // минута
+    const OLDEST: f64 = 365.0 * 24.0 * 3600.0; // год
+    let seconds = now.duration_since(time).map_or(0.0, |d| d.as_secs_f64());
+    if seconds <= NEWEST {
+        return 0.0;
+    }
+    ((seconds / NEWEST).ln() / (OLDEST / NEWEST).ln()).clamp(0.0, 1.0) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn ages_grow_from_new_to_old() {
+        use std::time::Duration;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        let ago = |secs: u64| age(now - Duration::from_secs(secs), now);
+        assert_eq!(ago(10), 0.0);
+        assert_eq!(age(now + Duration::from_secs(60), now), 0.0, "из будущего — новое");
+        let (hour, day, month) = (ago(3600), ago(86_400), ago(30 * 86_400));
+        assert!(0.0 < hour && hour < day && day < month && month < 1.0, "{hour} {day} {month}");
+        assert_eq!(ago(3 * 365 * 86_400), 1.0);
+    }
 
     #[test]
     fn sizes() {

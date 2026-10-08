@@ -52,3 +52,39 @@ pub fn owner_hwnd() -> Option<HWND> {
 pub fn describe(what: &str, error: &windows::core::Error) -> String {
     format!("{what}: {error}")
 }
+
+/// CLSID расширения Shell `iid` (обработчик предпросмотра, эскизов…) для расширения файла
+/// (без точки). `AssocQueryStringW` сама смотрит `.ext\ShellEx`, ProgID и
+/// `SystemFileAssociations`. Читает реестр — результат кэшировать у вызывающего.
+pub fn shell_extension(ext: &str, iid: &str) -> Option<windows::core::GUID> {
+    use windows::Win32::UI::Shell::{
+        ASSOCF_INIT_IGNOREUNKNOWN, ASSOCF_NOTRUNCATE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW,
+    };
+    use windows::core::{GUID, PCWSTR, PWSTR};
+
+    let ext = ext.trim_start_matches('.');
+    if ext.is_empty() {
+        return None;
+    }
+    let assoc = wide(format!(".{ext}"));
+    let iid = wide(iid);
+    let mut buffer = [0u16; 64];
+    let mut len = buffer.len() as u32;
+    // SAFETY: строки и буфер живут до конца вызова; len — размер буфера в символах.
+    let found = unsafe {
+        AssocQueryStringW(
+            ASSOCF_INIT_IGNOREUNKNOWN | ASSOCF_NOTRUNCATE,
+            ASSOCSTR_SHELLEXTENSION,
+            PCWSTR(assoc.as_ptr()),
+            PCWSTR(iid.as_ptr()),
+            Some(PWSTR(buffer.as_mut_ptr())),
+            &mut len,
+        )
+    };
+    if found.is_err() {
+        return None;
+    }
+    let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+    let text = String::from_utf16_lossy(&buffer[..end]);
+    GUID::try_from(text.trim().trim_start_matches('{').trim_end_matches('}')).ok()
+}

@@ -26,7 +26,6 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::Shell::PropertiesSystem::{IInitializeWithFile, IInitializeWithStream};
 use windows::Win32::UI::Shell::{
-    ASSOCF_INIT_IGNOREUNKNOWN, ASSOCF_NOTRUNCATE, ASSOCSTR_SHELLEXTENSION, AssocQueryStringW,
     IInitializeWithItem, IPreviewHandler, IPreviewHandlerVisuals, IShellItem,
     SHCreateItemFromParsingName, SHCreateStreamOnFileEx,
 };
@@ -40,7 +39,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TranslateMessage, WINEVENT_OUTOFCONTEXT, WM_APP, WM_CLOSE, WM_MOUSEACTIVATE, WNDCLASSW,
     WS_CLIPCHILDREN, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::core::{GUID, Interface, PCWSTR, PWSTR, w};
+use windows::core::{GUID, Interface, PCWSTR, w};
 
 use super::com::{Apartment, describe, owner_hwnd, wide};
 
@@ -65,34 +64,8 @@ pub fn has_handler(ext: &str) -> bool {
     handler_clsid(ext).is_some()
 }
 
-/// CLSID обработчика предпросмотра для расширения. `AssocQueryStringW` сама смотрит
-/// `.ext\ShellEx`, ProgID и `SystemFileAssociations`.
 fn handler_clsid(ext: &str) -> Option<GUID> {
-    let ext = ext.trim_start_matches('.');
-    if ext.is_empty() {
-        return None;
-    }
-    let assoc = wide(format!(".{ext}"));
-    let iid = wide(PREVIEW_HANDLER_IID);
-    let mut buffer = [0u16; 64];
-    let mut len = buffer.len() as u32;
-    // SAFETY: строки и буфер живут до конца вызова; len — размер буфера в символах.
-    let found = unsafe {
-        AssocQueryStringW(
-            ASSOCF_INIT_IGNOREUNKNOWN | ASSOCF_NOTRUNCATE,
-            ASSOCSTR_SHELLEXTENSION,
-            PCWSTR(assoc.as_ptr()),
-            PCWSTR(iid.as_ptr()),
-            Some(PWSTR(buffer.as_mut_ptr())),
-            &mut len,
-        )
-    };
-    if found.is_err() {
-        return None;
-    }
-    let end = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
-    let text = String::from_utf16_lossy(&buffer[..end]);
-    GUID::try_from(text.trim().trim_start_matches('{').trim_end_matches('}')).ok()
+    super::com::shell_extension(ext, PREVIEW_HANDLER_IID)
 }
 
 /// Команда потоку окна. Прямоугольник — в клиентских координатах главного окна.

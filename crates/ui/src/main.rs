@@ -68,6 +68,7 @@ fn main() -> eframe::Result {
     let previous = crash::start(&data.config);
     let upgraded_from = storage::backup_on_upgrade();
     let session = storage::load_session();
+    let labels = storage::load_labels();
     let startup = startup::Startup {
         started,
         open,
@@ -78,6 +79,7 @@ fn main() -> eframe::Result {
         incoming,
         repaint,
         keepalive,
+        labels,
     };
 
     let mut viewport = ViewportBuilder::default()

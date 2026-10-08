@@ -21,7 +21,7 @@ use windows::Win32::Media::MediaFoundation::{
     IMFMediaEngineClassFactory, IMFMediaEngineNotify, IMFMediaEngineNotify_Impl,
     MF_MEDIA_ENGINE_CALLBACK, MF_MEDIA_ENGINE_DXGI_MANAGER, MF_MEDIA_ENGINE_EVENT_ERROR,
     MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, MF_VERSION, MFCreateAttributes, MFCreateDXGIDeviceManager,
-    MFSTARTUP_FULL, MFShutdown, MFStartup,
+    MFSTARTUP_FULL, MFSTARTUP_LITE, MFShutdown, MFStartup,
 };
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
@@ -323,4 +323,94 @@ fn describe_error(code: usize, hresult: u32) -> String {
         _ => "воспроизведение прервано",
     };
     format!("{what} (0x{hresult:08X})")
+}
+
+/// Разложить звук файла для эквалайзера: Source Reader отдаёт отсчёты float, анализатор
+/// копит кадры спектра в `shared.spectrum` пачками. Свой поток — MTA со своей парой
+/// `MFStartup`/`MFShutdown` (счётчик у Media Foundation общий на процесс).
+pub fn spectrum(path: &Path, shared: &Arc<Shared>) {
+    // SAFETY: парный CoUninitialize — в конце этой же функции.
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    // SAFETY: парный MFShutdown — в конце.
+    if unsafe { MFStartup(MF_VERSION, MFSTARTUP_LITE) }.is_ok() {
+        // Не вышло (нет кодека, защищённый файл) — эквалайзера просто не будет.
+        let _ = decode_spectrum(path, shared);
+        // SAFETY: парный вызов к успешному MFStartup.
+        let _ = unsafe { MFShutdown() };
+    }
+    if let Ok(mut spectrum) = shared.spectrum.lock() {
+        spectrum.done = true;
+    }
+    if com {
+        // SAFETY: парный вызов к успешному CoInitializeEx в этом потоке.
+        unsafe { CoUninitialize() };
+    }
+}
+
+fn decode_spectrum(path: &Path, shared: &Arc<Shared>) -> windows::core::Result<()> {
+    use std::sync::atomic::Ordering;
+
+    use windows::Win32::Media::MediaFoundation::{
+        MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+        MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+        MF_SOURCE_READERF_ENDOFSTREAM, MFAudioFormat_Float, MFCreateMediaType,
+        MFCreateSourceReaderFromURL, MFMediaType_Audio,
+    };
+    use windows::core::HSTRING;
+
+    use crate::spectrum::Analyzer;
+
+    // SAFETY: обычные вызовы Media Foundation; все объекты живут до конца функции, буфер
+    // отсчётов читается только между Lock и Unlock.
+    unsafe {
+        let reader = MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), None)?;
+        let audio = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+        reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)?;
+        reader.SetStreamSelection(audio, true)?;
+        let wanted = MFCreateMediaType()?;
+        wanted.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio)?;
+        wanted.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float)?;
+        reader.SetCurrentMediaType(audio, None, &wanted)?;
+        let actual = reader.GetCurrentMediaType(audio)?;
+        let rate = actual.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)?;
+        let channels = actual.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)?;
+        let mut analyzer = Analyzer::new(rate, channels);
+        if let Ok(mut spectrum) = shared.spectrum.lock() {
+            spectrum.rate = analyzer.frame_rate();
+        }
+        let mut pending = Vec::new();
+        loop {
+            if shared.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+            let mut flags = 0u32;
+            let mut sample = None;
+            reader.ReadSample(audio, 0, None, Some(&mut flags), None, Some(&mut sample))?;
+            if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                break;
+            }
+            let Some(sample) = sample else { continue };
+            let buffer = sample.ConvertToContiguousBuffer()?;
+            let mut data = std::ptr::null_mut();
+            let mut length = 0u32;
+            buffer.Lock(&mut data, None, Some(&mut length))?;
+            let samples =
+                std::slice::from_raw_parts(data as *const f32, length as usize / size_of::<f32>());
+            let more = analyzer.push(samples, &mut pending);
+            buffer.Unlock()?;
+            // Пачками: окно берёт замок каждый кадр.
+            if pending.len() >= 64 * crate::spectrum::BANDS || !more {
+                if let Ok(mut spectrum) = shared.spectrum.lock() {
+                    spectrum.data.append(&mut pending);
+                }
+                if !more {
+                    break;
+                }
+            }
+        }
+        if let Ok(mut spectrum) = shared.spectrum.lock() {
+            spectrum.data.append(&mut pending);
+        }
+    }
+    Ok(())
 }

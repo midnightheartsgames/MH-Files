@@ -12,6 +12,7 @@ crossbeam-channel.workspace = true
 parking_lot.workspace = true
 image.workspace = true
 resvg.workspace = true
+skrifa.workspace = true
 encoding_rs.workspace = true
 mh-files-platform.workspace = true
 zip.workspace = true

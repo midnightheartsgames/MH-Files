@@ -35,9 +35,18 @@ pub struct State {
     host: PreviewHost,
     /// Где в этом кадре должен стоять обработчик: путь и место в точках.
     handler_rect: Option<(PathBuf, egui::Rect)>,
+    /// Размер выбранной папки считается сам: какой папки и как отменить.
+    sizing: Option<(PathBuf, CancelToken)>,
 }
 
 impl State {
+    /// Размер папки посчитан.
+    pub fn size_done(&mut self, path: &std::path::Path) {
+        if self.sizing.as_ref().is_some_and(|(p, _)| p == path) {
+            self.sizing = None;
+        }
+    }
+
     pub fn on_preview(
         &mut self,
         ctx: &egui::Context,
@@ -99,6 +108,52 @@ pub fn follow(app: &mut FilesApp) {
     state.is_dir = is_dir;
     state.page = 0;
     request(app);
+    request_size(app);
+}
+
+/// Размер выбранной папки — сразу: из индекса поиска мгновенно, иначе обходом на своих
+/// дисках. На сетевых дисках и приводах обхода нет — там остаётся кнопка.
+fn request_size(app: &mut FilesApp) {
+    if let Some((_, cancel)) = app.inspector.sizing.take() {
+        cancel.cancel();
+    }
+    let Some(path) = app.inspector.path.clone() else { return };
+    if !app.inspector.is_dir
+        || !app.settings.preview.inspector_folder_size
+        || matches!(app.tab().location, Location::Archive { .. })
+        // Корень диска — это весь диск: его занятое место видно и так.
+        || path.parent().is_none()
+    {
+        return;
+    }
+    let network = path.components().next().is_some_and(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(p)
+                if matches!(p.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..))
+        )
+    });
+    let local = !network
+        && app
+            .drives
+            .iter()
+            .filter(|d| path.starts_with(&d.root))
+            .max_by_key(|d| d.root.as_os_str().len())
+            .is_none_or(|d| {
+                d.ready
+                    && matches!(
+                        d.kind,
+                        mh_files_platform::drives::DriveKind::Fixed
+                            | mh_files_platform::drives::DriveKind::Removable
+                            | mh_files_platform::drives::DriveKind::Ram
+                    )
+            });
+    let ticket = Ticket { owner: crate::app::OWNER_INSPECTOR_SIZE, generation: 0 };
+    let cancel = app.indexer.folder_sizes(ticket, vec![path.clone()], local);
+    // Без обхода ответа может и не быть (тома нет в индексе) — тогда остаётся кнопка.
+    if local {
+        app.inspector.sizing = Some((path, cancel));
+    }
 }
 
 /// Попросить предпросмотр того, что выбрано, с текущей страницей.
@@ -135,6 +190,7 @@ fn wants_handler(app: &mut FilesApp, path: &std::path::Path, is_dir: bool) -> bo
         || ext == "pdf"
         || mh_files_fs::images::decodable(&ext)
         || mh_files_fs::preview::text_like(&ext)
+        || mh_files_fs::font::is_font(&ext)
         || mh_files_fs::archive::is_archive_ext(&ext);
     // Внутри архива файла на диске нет — обработчику нечего открыть.
     if own || matches!(app.tab().location, Location::Archive { .. }) {
@@ -257,10 +313,12 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
                 );
             }
             if let Some(time) = entry.modified {
-                field(ui, "Изменён", &format::date_full(time));
+                let dot = crate::pane_view::age_dot_color(app, time);
+                dated_field(ui, "Изменён", &format::date_full(time), dot);
             }
             if let Some(time) = entry.created {
-                field(ui, "Создан", &format::date_full(time));
+                let dot = crate::pane_view::age_dot_color(app, time);
+                dated_field(ui, "Создан", &format::date_full(time), dot);
             }
             let mut attributes = Vec::new();
             if entry.attributes.readonly() {
@@ -312,6 +370,27 @@ fn field(ui: &mut Ui, label: &str, value: &str) {
     ui.add_space(4.0);
 }
 
+/// Поле с датой и кружком давности слева от неё.
+fn dated_field(ui: &mut Ui, label: &str, value: &str, dot: Option<egui::Color32>) {
+    let Some(color) = dot else {
+        field(ui, label, value);
+        return;
+    };
+    ui.label(RichText::new(label).font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(value).font(theme::regular(14.0)).color(theme::TEXT_PRIMARY),
+            )
+            .wrap(),
+        );
+    });
+    ui.add_space(4.0);
+}
+
 /// `8 589 934 592` — пробелы между разрядами.
 fn group_digits(value: u64) -> String {
     let digits = value.to_string();
@@ -335,7 +414,9 @@ fn folder_size(ui: &mut Ui, app: &mut FilesApp, path: &std::path::Path) {
             size.dirs
         );
         field(ui, "Размер целиком", &text);
-    } else if app.sizes_pending.contains(path) {
+    } else if app.sizes_pending.contains(path)
+        || app.inspector.sizing.as_ref().is_some_and(|(p, _)| p == path)
+    {
         field(ui, "Размер целиком", "считается…");
     } else if ui.button("Посчитать размер").clicked() {
         app.actions.push(Action::FolderSizes(vec![path.to_path_buf()]));

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, CornerRadius, Id, Rect, Sense, Stroke, UiBuilder, vec2};
+use mh_files_core::Entry;
 use mh_files_core::layout::{LayoutNode, MAX_RATIO, MIN_RATIO, PaneId, SplitDirection};
 use mh_files_core::listing::LoadState;
 use mh_files_core::listing::ViewOptions;
@@ -39,6 +40,10 @@ pub const OWNER_CRUMBS: u64 = u64::MAX - 4;
 pub const OWNER_BATCH: u64 = u64::MAX - 5;
 pub const OWNER_SIZES: u64 = u64::MAX - 6;
 pub const OWNER_COLUMNS: u64 = u64::MAX - 7;
+/// Размеры вложенных папок в списке — сами, из индекса.
+pub const OWNER_AUTO_SIZES: u64 = u64::MAX - 10;
+/// Размер выбранной папки в Инспекторе — сам.
+pub const OWNER_INSPECTOR_SIZE: u64 = u64::MAX - 11;
 
 /// Как долго ждать второй шаг последовательности (`Alt+G` → `D`).
 const CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -264,6 +269,10 @@ pub struct FilesApp {
     pub drop_zones: Vec<DropZone>,
     /// Куда бросят, если отпустить сейчас (по прошлому кадру) — для подсветки.
     pub drop_hover: Option<PathBuf>,
+    /// Цветные метки файлов и папок.
+    pub labels: mh_files_core::labels::Labels,
+    /// Файлы из другой программы тянут правой кнопкой: при броске — меню.
+    pub external_right: bool,
     pub crumb_menu: Option<CrumbMenu>,
     pub drop_menu: Option<DropMenu>,
     pub columns: Columns,
@@ -283,6 +292,8 @@ pub struct FilesApp {
     pub folder_sizes: HashMap<PathBuf, DirSize>,
     pub sizes_pending: HashSet<PathBuf>,
     sizes_cancel: Option<CancelToken>,
+    /// Размеры вложенных папок открытой папки — из индекса.
+    auto_sizes_cancel: Option<CancelToken>,
     sizes_generation: u64,
     pub pane_regions: Vec<PaneRegion>,
     /// Доступность команд на начало кадра: меню рисуются, пока панель вынута из списка.
@@ -359,6 +370,8 @@ impl FilesApp {
             actions: Vec::new(),
             drop_zones: Vec::new(),
             drop_hover: None,
+            labels: startup.labels.clone(),
+            external_right: false,
             crumb_menu: None,
             drop_menu: None,
             columns: Columns::default(),
@@ -372,6 +385,7 @@ impl FilesApp {
             folder_sizes: HashMap::new(),
             sizes_pending: HashSet::new(),
             sizes_cancel: None,
+            auto_sizes_cancel: None,
             sizes_generation: 0,
             pane_regions: Vec::new(),
             availability: HashMap::new(),
@@ -686,6 +700,24 @@ impl FilesApp {
                         self.indexer.observe(&dir, tab.listing.all());
                         let took = tab.load_started.elapsed();
                         self.diag.listing(dir, tab.listing.total_len(), took);
+                        // Размеры вложенных папок — из индекса, без обращения к диску.
+                        if self.settings.files.auto_folder_sizes {
+                            let dirs: Vec<PathBuf> = tab
+                                .listing
+                                .all()
+                                .iter()
+                                .filter(|e| e.is_dir() && !e.attributes.reparse())
+                                .map(Entry::path)
+                                .collect();
+                            if !dirs.is_empty() {
+                                let ticket = Ticket { owner: OWNER_AUTO_SIZES, generation: 0 };
+                                if let Some(cancel) = self.auto_sizes_cancel.take() {
+                                    cancel.cancel();
+                                }
+                                self.auto_sizes_cancel =
+                                    Some(self.indexer.folder_sizes(ticket, dirs, false));
+                            }
+                        }
                     }
                 }
             }
@@ -757,6 +789,7 @@ impl FilesApp {
             }
             Event::KnownFolders(places) => self.places = places,
             Event::Image { key, result } => self.images.on_result(ctx, key, result),
+            Event::ThumbnailTypes(types) => self.images.on_types(types),
             Event::Shell { what, result } => {
                 if let Err(error) = result {
                     self.set_status(format!("{what}: {error}"), Level::Error);
@@ -897,15 +930,20 @@ impl FilesApp {
         self.sizes_cancel = Some(self.workers.folder_sizes(ticket, dirs));
     }
 
+    /// Размер папки посчитан — по Ctrl+Shift+S, сам из индекса для списка или для
+    /// Инспектора. Размер верен в любом случае; поколение важно только для «считается…».
     fn on_folder_size(&mut self, ticket: Ticket, path: PathBuf, size: DirSize) {
-        if ticket.generation != self.sizes_generation {
-            return;
+        if ticket.owner == OWNER_SIZES && ticket.generation == self.sizes_generation {
+            self.sizes_pending.remove(&path);
         }
-        self.sizes_pending.remove(&path);
+        if ticket.owner == OWNER_INSPECTOR_SIZE {
+            self.inspector.size_done(&path);
+        }
         self.folder_sizes.insert(path.clone(), size);
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             if tab.listing.set_dir_size(&path, size.bytes) {
-                tab.listing.refresh();
+                // Пачка размеров из индекса — пересортировка одна, в ближайший такт.
+                tab.mark_dirty();
             }
         }
     }
@@ -1175,13 +1213,10 @@ impl FilesApp {
         if dragging && self.drag_left_window(ctx) {
             return;
         }
-        let external = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        self.drop_hover = if dragging || external {
-            pointer.and_then(|pos| self.zone_at(pos)).map(|zone| zone.dir.clone())
-        } else {
-            None
-        };
-        // Файлы из Проводника и других программ.
+        // Файлы из Проводника и других программ. Пока их тянут, мышь захвачена источником:
+        // окну не приходят ни движения мыши, ни клавиши — где курсор и что нажато,
+        // спрашивается у системы.
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1190,12 +1225,41 @@ impl FilesApp {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
+        let external = !dragging && (hovering || !dropped.is_empty());
+        let outside_pointer = if external {
+            let ppp = ctx.pixels_per_point();
+            mh_files_platform::window::cursor_in_window()
+                .map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+                .or(pointer)
+        } else {
+            None
+        };
+        if hovering {
+            // Пока тянут, событий нет — подсветка цели следит за курсором сама.
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            let keys = mh_files_platform::window::drag_keys();
+            // Правая кнопка к моменту броска уже отпущена — запомнить, пока тянут.
+            self.external_right |= keys.right;
+        }
+        let at = if external { outside_pointer } else { pointer };
+        self.drop_hover = if dragging || hovering {
+            at.and_then(|pos| self.zone_at(pos)).map(|zone| zone.dir.clone())
+        } else {
+            None
+        };
         if !dropped.is_empty() {
-            let at = pointer.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
-            match at.and_then(|pos| self.zone_at(pos)).cloned() {
-                Some(zone) => self.drop_on(zone, dropped, ctx),
+            let right = std::mem::take(&mut self.external_right);
+            let at = at.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+            match at.and_then(|pos| self.zone_at(pos).cloned().map(|zone| (pos, zone))) {
+                Some((pos, zone)) if right && zone.favorite_group.is_none() => {
+                    self.drop_menu =
+                        Some(DropMenu { paths: dropped, dest: zone.dir, archive: None, at: pos });
+                }
+                Some((_, zone)) => self.drop_on(zone, dropped, ctx),
                 None => self.set_status("бросьте файлы на папку или панель", Level::Info),
             }
+        } else if !hovering {
+            self.external_right = false;
         }
         if dragging && ctx.input(|i| i.pointer.any_released()) {
             let payload = egui::DragAndDrop::take_payload::<DragFiles>(ctx);
@@ -1412,10 +1476,18 @@ impl FilesApp {
             self.actions.push(Action::AddFavorites { group, paths });
             return;
         }
+        // Окно без фокуса (файлы тянули из Проводника) не знает о клавишах — спросить систему.
+        let keys = mh_files_platform::window::drag_keys();
         let modifiers = ctx.input(|i| i.modifiers);
-        let copy = if modifiers.ctrl {
+        let (ctrl, shift) = (modifiers.ctrl || keys.ctrl, modifiers.shift || keys.shift);
+        let copy = if ctrl && shift || keys.alt {
+            // Ctrl+Shift или Alt — ярлыки, как в Проводнике.
+            self.workers
+                .shell(mh_files_fs::ShellJob::CreateShortcuts { targets: paths, dest: zone.dir });
+            return;
+        } else if ctrl {
             Some(true)
-        } else if modifiers.shift {
+        } else if shift {
             Some(false)
         } else {
             None
@@ -1472,6 +1544,14 @@ impl FilesApp {
         } else {
             std::thread::spawn(write);
         }
+    }
+
+    /// Цветные метки — в фоне, через временный файл.
+    pub fn save_labels(&self) {
+        let json = self.labels.to_json();
+        std::thread::spawn(move || {
+            let _ = storage::write_atomic(&storage::labels_path(), &json);
+        });
     }
 
     pub fn save_settings(&self) {

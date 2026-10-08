@@ -1,7 +1,7 @@
 //! Текстуры значков и эскизов. Ограниченный кэш; всё, чего нет, запрашивается у пула воркеров
 //! и рисуется заглушкой, пока не придёт.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
@@ -20,6 +20,10 @@ pub struct ImageCache {
     icons: LruCache<ImageKey, Slot>,
     thumbnails: LruCache<ImageKey, Slot>,
     wanted: HashSet<ImageKey>,
+    /// Есть ли у расширения обработчик эскизов Windows (`None` — спросили, ждём ответа).
+    types: HashMap<String, Option<bool>>,
+    /// Расширения, о которых ещё не спрашивали.
+    ask: Vec<String>,
     pub system_icons: bool,
     pub thumbnails_enabled: bool,
 }
@@ -34,6 +38,8 @@ impl ImageCache {
             icons: LruCache::new(NonZeroUsize::new(ICONS).unwrap()),
             thumbnails: LruCache::new(NonZeroUsize::new(THUMBNAILS).unwrap()),
             wanted: HashSet::new(),
+            types: HashMap::new(),
+            ask: Vec::new(),
             system_icons: true,
             thumbnails_enabled: true,
         }
@@ -83,7 +89,17 @@ impl ImageCache {
     }
 
     /// Конец кадра: заявки, которые больше не видны, отменяются.
+    /// Ответ, у каких расширений есть обработчик эскизов Windows.
+    pub fn on_types(&mut self, types: Vec<(String, bool)>) {
+        for (ext, has) in types {
+            self.types.insert(ext, Some(has));
+        }
+    }
+
     pub fn end_frame(&mut self, workers: &Workers) {
+        if !self.ask.is_empty() {
+            workers.thumbnail_types(std::mem::take(&mut self.ask));
+        }
         let wanted = std::mem::take(&mut self.wanted);
         for cache in [&mut self.icons, &mut self.thumbnails] {
             let stale: Vec<ImageKey> = cache
@@ -137,8 +153,25 @@ impl ImageCache {
         entry: &Entry,
         pixels: f32,
     ) -> Option<TextureHandle> {
-        if !self.thumbnails_enabled || entry.is_dir() || !has_thumbnail(&entry.extension()) {
+        if !self.thumbnails_enabled || entry.is_dir() {
             return None;
+        }
+        let ext = entry.extension();
+        // Известные типы — сразу; прочие — если программа зарегистрировала в Windows свои
+        // эскизы (Blender для .blend): ответ из фона, до него — значок.
+        if !has_thumbnail(&ext) {
+            if !cfg!(windows) || ext.is_empty() {
+                return None;
+            }
+            match self.types.get(&ext) {
+                Some(Some(true)) => {}
+                Some(_) => return None,
+                None => {
+                    self.types.insert(ext.clone(), None);
+                    self.ask.push(ext);
+                    return None;
+                }
+            }
         }
         let key = ImageKey {
             kind: ImageKind::Thumbnail,

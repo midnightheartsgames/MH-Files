@@ -88,18 +88,38 @@ pub fn hint(ui: &mut Ui, text: &str) {
 
 /// Кнопка в стиле окна: основная — залитая акцентом.
 pub fn button(ui: &mut Ui, text: &str, primary: bool) -> Response {
-    let (fill, color) = if primary {
-        (theme::accent(), theme::BACKGROUND)
-    } else {
-        (theme::FIELD, theme::TEXT_PRIMARY)
-    };
-    ui.add(
-        egui::Button::new(RichText::new(text).font(theme::regular(14.0)).color(color))
-            .fill(fill)
-            .stroke(Stroke::new(1.0, theme::CARD_STROKE))
-            .corner_radius(CornerRadius::same(4))
-            .min_size(vec2(110.0, 30.0)),
-    )
+    let font = theme::regular(14.0);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), font, Color32::PLACEHOLDER);
+    let size = vec2((galley.size().x + 28.0).max(110.0), 30.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), text));
+    if ui.is_rect_visible(rect) {
+        // Свой цвет фона у кнопки egui не меняет при наведении — подсветка своя: светлее
+        // при наведении, темнее при нажатии, рамка цвета акцента.
+        let hover = ui.ctx().animate_bool_responsive(response.id, response.hovered());
+        let (base, color) = if primary {
+            (theme::accent(), theme::BACKGROUND)
+        } else {
+            (theme::FIELD, theme::TEXT_PRIMARY)
+        };
+        let lit = if primary { lerp_color(base, Color32::WHITE, 0.18) } else { theme::CARD_STROKE };
+        let mut fill = lerp_color(base, lit, hover);
+        if response.is_pointer_button_down_on() {
+            fill = lerp_color(fill, Color32::BLACK, 0.15);
+        }
+        let stroke = lerp_color(theme::CARD_STROKE, theme::accent(), hover);
+        let painter = ui.painter();
+        painter.rect(
+            rect,
+            CornerRadius::same(4),
+            fill,
+            Stroke::new(1.0, stroke),
+            egui::StrokeKind::Inside,
+        );
+        painter.galley(rect.center() - galley.size() / 2.0, galley, color);
+    }
+    response
 }
 
 /// Тумблер «вкл/выкл».

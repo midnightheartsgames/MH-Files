@@ -455,6 +455,48 @@ fn appearance(ui: &mut Ui, s: &mut Settings) {
         );
         switch_row(ui, "Анимации", None, &mut s.appearance.animations);
     });
+    card(ui, "Давность дат", |ui| {
+        switch_row(
+            ui,
+            "Кружок у даты изменения",
+            Some(
+                "В списке и Инспекторе: цвет от только что изменённых до изменённых год назад и раньше.",
+            ),
+            &mut s.appearance.age_dots,
+        );
+        ui.add_enabled_ui(s.appearance.age_dots, |ui| {
+            row(ui, "Только что", |ui| {
+                ui.color_edit_button_srgb(&mut s.appearance.age_new)
+            });
+            row(ui, "Давно", |ui| ui.color_edit_button_srgb(&mut s.appearance.age_old));
+            row(ui, "Шкала", |ui| {
+                let (rect, _) =
+                    ui.allocate_exact_size(egui::vec2(220.0, 12.0), egui::Sense::hover());
+                let painter = ui.painter();
+                let steps = 44;
+                let width = rect.width() / steps as f32;
+                for i in 0..steps {
+                    let t = i as f32 / (steps - 1) as f32;
+                    let color = theme::age_color(s.appearance.age_new, s.appearance.age_old, t);
+                    let x = rect.left() + i as f32 * width;
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(x, rect.top()),
+                            egui::vec2(width + 0.5, rect.height()),
+                        ),
+                        CornerRadius::ZERO,
+                        color,
+                    );
+                }
+                let defaults = (mh_files_core::settings::AGE_NEW, mh_files_core::settings::AGE_OLD);
+                if (s.appearance.age_new, s.appearance.age_old) != defaults
+                    && ui.button("По умолчанию").clicked()
+                {
+                    (s.appearance.age_new, s.appearance.age_old) = defaults;
+                }
+            });
+        });
+    });
     card(ui, "Окно", |ui| {
         switch_row(
             ui,
@@ -485,6 +527,17 @@ fn files(ui: &mut Ui, s: &mut Settings) {
         switch_row(ui, "Папки первыми", None, &mut s.files.folders_first);
         switch_row(ui, "Даты «Сегодня», «Вчера»", None, &mut s.files.relative_dates);
     });
+    card(ui, "Размеры папок", |ui| {
+        switch_row(
+            ui,
+            "Размеры папок в списке сразу",
+            Some(
+                "Из индекса поиска по дискам — мгновенно и без обращения к диску. Где индекса \
+                 нет — по Ctrl+Shift+S.",
+            ),
+            &mut s.files.auto_folder_sizes,
+        );
+    });
     card(ui, "Контекстное меню", |ui| {
         switch_row(
             ui,
@@ -513,6 +566,17 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
             "Эскизы картинок и видео",
             Some("Из кэша эскизов Windows; не тормозят переход по папкам."),
             &mut s.preview.thumbnails,
+        );
+    });
+    card(ui, "Инспектор", |ui| {
+        switch_row(
+            ui,
+            "Размер выбранной папки сразу",
+            Some(
+                "Из индекса поиска, иначе подсчётом на своих дисках. На сетевых дисках — по \
+                 кнопке.",
+            ),
+            &mut s.preview.inspector_folder_size,
         );
     });
     card(ui, "Обработчики Windows", |ui| {
