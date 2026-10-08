@@ -20,7 +20,7 @@ use mh_files_core::session::ViewMode;
 use mh_files_core::sort::SortColumn;
 use mh_files_platform::shell::MenuTarget;
 
-use crate::app::{Action, DragFiles, DragTab, DropZone, FilesApp, Target};
+use crate::app::{Action, DragFiles, DragTab, DropZone, FilesApp, Target, ZoneKind};
 use crate::commands::CommandId;
 use crate::tabs::{Band, InlineRename, Pane, Tab};
 use crate::{icons, theme, widgets};
@@ -164,7 +164,7 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             color,
         );
         if let Some(dir) = tab.dir() {
-            app.drop_zones.push(DropZone { rect, dir, priority: 3, favorite_group: None });
+            app.drop_zones.push(DropZone { rect, dir, priority: 3, kind: ZoneKind::Folder });
         }
         let mut close = false;
         if active || hovered {
@@ -274,7 +274,7 @@ fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app:
         run(app, CommandId::Refresh);
     }
     ui.add_space(4.0);
-    let right = 3.0 * 28.0;
+    let right = 5.0 * 28.0 + 6.0;
     let width = (ui.available_width() - right).max(80.0);
     let (crumb_rect, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
     if tab.address.is_some() {
@@ -283,6 +283,19 @@ fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app:
         breadcrumbs(ui, crumb_rect, pane, tab, app);
     }
     ui.add_space(4.0);
+    // Создать — в папке этой панели (в архиве и в поиске негде).
+    let can_create = tab.dir().is_some();
+    if widgets::icon_button(ui, can_create, "Новая папка (Ctrl+Shift+N)", icons::new_folder)
+        .clicked()
+    {
+        run(app, CommandId::NewFolder);
+    }
+    if widgets::icon_button(ui, can_create, "Новый текстовый файл (Ctrl+Alt+N)", icons::new_file)
+        .clicked()
+    {
+        run(app, CommandId::NewFile);
+    }
+    ui.add_space(6.0);
     let filter_tip = "Фильтр (Ctrl+F)";
     if widgets::icon_button(ui, true, filter_tip, icons::search).clicked() {
         if tab.filter_open {
@@ -363,7 +376,7 @@ fn breadcrumbs(
                             rect: response.rect,
                             dir: dir.clone(),
                             priority: 3,
-                            favorite_group: None,
+                            kind: ZoneKind::Folder,
                         });
                         let path_text = dir.display().to_string();
                         response.context_menu(|ui| {
@@ -897,7 +910,7 @@ fn list_view(
         _ => None,
     };
     if let Some(dir) = tab.dir().or(zip_dir) {
-        app.drop_zones.push(DropZone { rect: area, dir, priority: 1, favorite_group: None });
+        app.drop_zones.push(DropZone { rect: area, dir, priority: 1, kind: ZoneKind::Folder });
         if app.drop_hover.as_deref() == tab.dir().as_deref() {
             ui.painter().rect_stroke(
                 area.shrink(1.0),
@@ -983,7 +996,7 @@ fn list_view(
 /// Контекстное меню пустого места.
 fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
     ui.set_min_width(250.0);
-    for command in [CommandId::Paste, CommandId::NewFolder] {
+    for command in [CommandId::Paste, CommandId::NewFolder, CommandId::NewFile] {
         menu_item(ui, app, command);
     }
     ui.separator();
@@ -1564,10 +1577,14 @@ pub(crate) fn item(
             _ => None,
         };
         let right = response.drag_started_by(egui::PointerButton::Secondary);
-        egui::DragAndDrop::set_payload(
-            ui.ctx(),
-            DragFiles { paths: tab.targets(), archive, right },
-        );
+        let paths = tab.targets();
+        let folder = match paths.as_slice() {
+            [one] if archive.is_none() && tab.entry(one).is_some_and(Entry::is_dir) => {
+                Some(one.clone())
+            }
+            _ => None,
+        };
+        egui::DragAndDrop::set_payload(ui.ctx(), DragFiles { paths, archive, right, folder });
     }
     // Папка, а ещё zip — бросок в него дописывает архив.
     if entry.is_dir() || crate::actions::writable_zip(&path).is_some() {
@@ -1575,7 +1592,7 @@ pub(crate) fn item(
             rect,
             dir: path.clone(),
             priority: 2,
-            favorite_group: None,
+            kind: ZoneKind::Folder,
         });
     }
     // В архиве объектов нет на диске — и меню Windows для них нет.
@@ -1955,7 +1972,7 @@ fn computer_view(ui: &mut Ui, app: &mut FilesApp) {
                         rect: response.rect,
                         dir: path.clone(),
                         priority: 2,
-                        favorite_group: None,
+                        kind: ZoneKind::Folder,
                     });
                     if response.clicked() {
                         app.actions.push(Action::Open {
@@ -2016,7 +2033,7 @@ fn drive_card(
         rect,
         dir: drive.root.clone(),
         priority: 2,
-        favorite_group: None,
+        kind: ZoneKind::Folder,
     });
     if response.clicked() {
         app.actions.push(Action::Open {

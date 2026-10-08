@@ -16,6 +16,7 @@ pub mod ops;
 pub mod pdf;
 pub mod player;
 pub mod preview_handler;
+pub mod recycle;
 pub mod shell;
 pub mod thumbs;
 pub mod volume;

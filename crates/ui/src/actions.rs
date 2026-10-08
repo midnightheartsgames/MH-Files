@@ -377,7 +377,7 @@ impl FilesApp {
             GoBack => tab.history.can_back(),
             GoForward => tab.history.can_forward(),
             GoUp => tab.location.parent().is_some(),
-            Paste | NewFolder | OpenTerminal => has_dir,
+            Paste | NewFolder | NewFile | OpenTerminal => has_dir,
             Search | SearchContent => has_dir,
             SaveSearch => matches!(&tab.location, Location::Index { query } if !query.is_empty()),
             Reindex => self.indexer.status().enabled,
@@ -624,6 +624,20 @@ impl FilesApp {
                     );
                 }
             }
+            NewFile => {
+                if let Some(parent) = dir {
+                    let tab = self.tab();
+                    let existing: Vec<&str> =
+                        tab.listing.all().iter().map(|e| e.name.as_str()).collect();
+                    let name =
+                        names::unique_file_name("Новый текстовый документ", "txt", &existing);
+                    let tab = self.tab().id;
+                    self.submit(
+                        FileOp::NewFile { parent, name },
+                        Some(Followup::RenameCreated { tab }),
+                    );
+                }
+            }
             Properties => {
                 let paths = if targets.is_empty() { dir.into_iter().collect() } else { targets };
                 if !paths.is_empty() {
@@ -789,6 +803,14 @@ impl FilesApp {
                 let pane = self.focused_pane_mut();
                 pane.tabs.insert(pane.active + 1, tab);
                 pane.active += 1;
+            }
+            Target::EdgePane { first } => {
+                let view = self.tab().view;
+                let tab = self.make_tab(&TabSession { location, view, sort: Default::default() });
+                let id = PaneId(self.new_id());
+                self.layout.split_edge(SplitDirection::Horizontal, id, first);
+                self.panes.push(Pane { id, tabs: vec![tab], active: 0 });
+                self.focused = id;
             }
             Target::OtherPane => {
                 if self.other_pane().is_none() {

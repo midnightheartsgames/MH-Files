@@ -13,7 +13,7 @@ use mh_files_core::location::Location;
 use mh_files_core::settings::Group;
 use mh_files_platform::shell::MenuTarget;
 
-use crate::app::{Action, DropZone, FilesApp, Target, drive_title};
+use crate::app::{Action, DropZone, FilesApp, Target, ZoneKind, drive_title};
 use crate::{icons, theme, widgets};
 
 #[derive(Debug, Clone)]
@@ -121,6 +121,7 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
         for drive in app.drives.clone() {
             drive_row(ui, app, &drive, current.as_deref());
         }
+        recycle_row(ui, app);
 
         if !app.places.is_empty() {
             ui.add_space(10.0);
@@ -177,20 +178,11 @@ fn saved_searches(ui: &mut Ui, app: &mut FilesApp) {
     }
 }
 
-/// Заголовок в духе MH Sidebar: три столбика акцента и название.
+/// Заголовок: знак MH Files и название.
 fn header(ui: &mut Ui) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
-        for (i, h) in [7.0, 16.0, 11.0].into_iter().enumerate() {
-            ui.painter().rect_filled(
-                Rect::from_min_size(
-                    pos2(rect.left() + i as f32 * 6.0, rect.bottom() - h),
-                    vec2(4.0, h),
-                ),
-                1,
-                theme::accent(),
-            );
-        }
+        icons::logo(ui.painter(), rect, theme::PANEL);
         ui.label(
             RichText::new("MH FILES")
                 .font(theme::bold(15.0))
@@ -278,7 +270,7 @@ fn drive_row(
         rect: response.rect,
         dir: drive.root.clone(),
         priority: 2,
-        favorite_group: None,
+        kind: ZoneKind::Folder,
     });
     open_on_click(app, &response, &drive.root);
     let root = drive.root.clone();
@@ -288,6 +280,53 @@ fn drive_row(
         format!("{} · {}", root.display(), drive.file_system)
     };
     location_menu(app, &response.on_hover_text(tip), &root, None);
+}
+
+/// Место, на которое бросают файлы, чтобы удалить их в корзину (путём не бывает).
+pub const RECYCLE_BIN: &str = "::recycle-bin";
+
+/// Корзина под дисками: сколько в ней; щелчок открывает её окно, бросок — удаляет туда.
+fn recycle_row(ui: &mut Ui, app: &mut FilesApp) {
+    let bin = app.recycle_bin;
+    let full = bin.is_some_and(|b| b.items > 0);
+    let right =
+        bin.map(|b| if b.items == 0 { "пусто".to_string() } else { format::size(b.bytes) });
+    let hover = app.drop_hover.as_deref() == Some(Path::new(RECYCLE_BIN));
+    let response = row(ui, |p, r, c| icons::trash(p, r, c, full), "Корзина", right, false, hover);
+    app.drop_zones.push(DropZone {
+        rect: response.rect,
+        dir: PathBuf::from(RECYCLE_BIN),
+        priority: 2,
+        kind: ZoneKind::RecycleBin,
+    });
+    if response.clicked() {
+        app.actions.push(Action::Shell(mh_files_fs::ShellJob::OpenRecycleBin));
+    }
+    let tip = match bin {
+        Some(b) if b.items > 0 => {
+            format!(
+                "{} · {} — открыть в Проводнике",
+                format::items(b.items as usize),
+                format::size(b.bytes)
+            )
+        }
+        Some(_) => "Корзина пуста".to_string(),
+        None => "Корзина Windows".to_string(),
+    };
+    response.on_hover_text(tip).context_menu(|ui| {
+        ui.set_min_width(200.0);
+        if ui.button("Открыть в Проводнике").clicked() {
+            app.actions.push(Action::Shell(mh_files_fs::ShellJob::OpenRecycleBin));
+            ui.close();
+        }
+        if ui
+            .add_enabled(bin.is_none_or(|b| b.items > 0), egui::Button::new("Очистить корзину"))
+            .clicked()
+        {
+            app.actions.push(Action::Shell(mh_files_fs::ShellJob::EmptyRecycleBin));
+            ui.close();
+        }
+    });
 }
 
 /// Число без единицы для «занято / всего»: единица стоит у второго числа.
@@ -312,7 +351,7 @@ fn place_row(
         rect: response.rect,
         dir: path.to_path_buf(),
         priority: 2,
-        favorite_group: None,
+        kind: ZoneKind::Folder,
     });
     open_on_click(app, &response, path);
     let response = response.on_hover_text(path.display().to_string());
@@ -454,7 +493,7 @@ fn group(ui: &mut Ui, app: &mut FilesApp, g: usize, current: Option<&Path>) {
             rect,
             dir: PathBuf::new(),
             priority: 4,
-            favorite_group: Some(g),
+            kind: ZoneKind::Favorites(g),
         });
         if response.clicked() {
             app.actions.push(Action::Sidebar(Edit::ToggleGroup(g)));

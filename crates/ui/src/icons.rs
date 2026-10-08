@@ -216,6 +216,87 @@ pub fn computer(painter: &Painter, rect: Rect, color: Color32) {
     polyline(painter, rect, color, &[(0.5, 0.7), (0.5, 0.9)]);
 }
 
+/// Знак MH Files в квадрате 64×64: `(left, top, right, bottom, радиус, доля акцента)`, каждая
+/// фигура поверх предыдущих. Язычок и задняя стенка папки — притушенным акцентом, передняя —
+/// полным, три столбика семейства MH — прорезями. Те же фигуры — в `tools/make-icon.py`.
+pub const LOGO: &[(f32, f32, f32, f32, f32, f32)] = &[
+    (8.0, 11.0, 28.0, 22.0, 3.0, 0.55),
+    (8.0, 16.0, 56.0, 53.0, 3.0, 0.55),
+    (8.0, 23.0, 56.0, 53.0, 3.0, 1.0),
+    (19.0, 39.0, 25.0, 47.0, 1.0, 0.0),
+    (29.0, 31.0, 35.0, 47.0, 1.0, 0.0),
+    (39.0, 36.0, 45.0, 47.0, 1.0, 0.0),
+];
+
+/// Знак MH Files без плитки — в заголовке окна и боковой панели; `background` — цвет
+/// под знаком (им прорезаны столбики).
+pub fn logo(painter: &Painter, rect: Rect, background: Color32) {
+    // Знак занимает 8..56 по ширине плитки: растянуть его на весь `rect`.
+    let scale = rect.width() / 48.0;
+    let at = |x: f32, y: f32| pos2(rect.left() + (x - 8.0) * scale, rect.top() + (y - 8.0) * scale);
+    for &(left, top, right, bottom, radius, share) in LOGO {
+        let color = lerp_color(background, theme::accent(), share);
+        let shape = Rect::from_min_max(at(left, top), at(right, bottom));
+        painter.rect_filled(shape, CornerRadius::same((radius * scale).round() as u8), color);
+    }
+}
+
+fn lerp_color(from: Color32, to: Color32, t: f32) -> Color32 {
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color32::from_rgb(mix(from.r(), to.r()), mix(from.g(), to.g()), mix(from.b(), to.b()))
+}
+
+/// Корзина: ведро с крышкой; `full` — с содержимым (ведро залито).
+pub fn trash(painter: &Painter, rect: Rect, color: Color32, full: bool) {
+    let body: Vec<Pos2> = [(0.2, 0.3), (0.27, 0.92), (0.73, 0.92), (0.8, 0.3)]
+        .iter()
+        .map(|&(x, y)| p(rect, x, y))
+        .collect();
+    if full {
+        painter.add(Shape::convex_polygon(body.clone(), color.gamma_multiply(0.35), Stroke::NONE));
+    }
+    painter.add(Shape::closed_line(body, stroke(rect, color)));
+    polyline(painter, rect, color, &[(0.1, 0.22), (0.9, 0.22)]);
+    polyline(painter, rect, color, &[(0.38, 0.22), (0.38, 0.1), (0.62, 0.1), (0.62, 0.22)]);
+    polyline(painter, rect, color, &[(0.42, 0.42), (0.43, 0.8)]);
+    polyline(painter, rect, color, &[(0.58, 0.42), (0.57, 0.8)]);
+}
+
+/// Плюс в кружке в правом нижнем углу — «создать».
+fn plus_badge(painter: &Painter, rect: Rect, color: Color32) {
+    let center = p(rect, 0.74, 0.74);
+    let radius = rect.width() * 0.32;
+    painter.circle_filled(center, radius, theme::WINDOW_BACKGROUND);
+    let arm = radius * 0.75;
+    let stroke = stroke(rect, color);
+    painter.line_segment([center - vec2(arm, 0.0), center + vec2(arm, 0.0)], stroke);
+    painter.line_segment([center - vec2(0.0, arm), center + vec2(0.0, arm)], stroke);
+}
+
+/// Новая папка: контур папки и плюс.
+pub fn new_folder(painter: &Painter, rect: Rect, color: Color32) {
+    polyline(
+        painter,
+        rect,
+        color,
+        &[(0.05, 0.82), (0.05, 0.18), (0.38, 0.18), (0.48, 0.3), (0.92, 0.3), (0.92, 0.5)],
+    );
+    polyline(painter, rect, color, &[(0.05, 0.82), (0.5, 0.82)]);
+    plus_badge(painter, rect, color);
+}
+
+/// Новый файл: лист с загнутым углом и плюс.
+pub fn new_file(painter: &Painter, rect: Rect, color: Color32) {
+    polyline(
+        painter,
+        rect,
+        color,
+        &[(0.5, 0.94), (0.14, 0.94), (0.14, 0.06), (0.56, 0.06), (0.78, 0.28), (0.78, 0.5)],
+    );
+    polyline(painter, rect, color, &[(0.56, 0.06), (0.56, 0.28), (0.78, 0.28)]);
+    plus_badge(painter, rect, color);
+}
+
 /// Шестерёнка — настройки MH Files.
 pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
     let center = rect.center();

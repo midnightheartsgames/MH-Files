@@ -116,6 +116,8 @@ pub enum Event {
     },
     DriveRoots(Vec<(PathBuf, DriveKind)>),
     Drive(DriveInfo),
+    /// Сколько в корзине; `None` — не узнать.
+    RecycleBin(Option<mh_files_platform::recycle::BinInfo>),
     KnownFolders(Vec<(KnownFolder, PathBuf)>),
     Image {
         key: ImageKey,
@@ -389,6 +391,13 @@ impl Workers {
                 })
                 .collect();
             workers.send(Event::ThumbnailTypes(types));
+        });
+    }
+
+    /// Узнать, сколько в корзине: она заглядывает в каждый диск — не для потока UI.
+    pub fn recycle_bin(&self) {
+        self.spawn("recycle-bin", |workers| {
+            workers.send(Event::RecycleBin(mh_files_platform::recycle::query()));
         });
     }
 
