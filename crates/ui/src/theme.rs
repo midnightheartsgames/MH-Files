@@ -156,3 +156,9 @@ pub fn age_color(new: [u8; 3], old: [u8; 3], t: f32) -> Color32 {
     let lerp = |x: f32, y: f32| x + (y - x) * t;
     Color32::from(Hsva::new(h, lerp(a.s, b.s), lerp(a.v, b.v), 1.0))
 }
+
+/// Цвет метки файла по номеру (см. `mh_files_core::labels`).
+pub fn label_color(index: u8) -> Color32 {
+    let [r, g, b] = mh_files_core::labels::RGB[index as usize % mh_files_core::labels::RGB.len()];
+    Color32::from_rgb(r, g, b)
+}

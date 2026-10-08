@@ -13,6 +13,7 @@ pub mod fuzzy;
 pub mod goto;
 pub mod history;
 pub mod index;
+pub mod labels;
 pub mod layout;
 pub mod listing;
 pub mod location;

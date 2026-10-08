@@ -1073,6 +1073,8 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool, targets:
         menu_item(ui, app, CommandId::CopyPath);
         menu_item(ui, app, CommandId::CopyName);
     });
+    let current = targets.first().and_then(|path| app.labels.get(path));
+    label_menu(ui, app, current);
     ui.separator();
     menu_item(ui, app, if many { CommandId::BatchRename } else { CommandId::Rename });
     menu_item(ui, app, CommandId::Delete);
@@ -1606,7 +1608,7 @@ fn display_name(entry: &Entry, show_extensions: bool) -> String {
     }
 }
 
-fn paint_texture(ui: &Ui, texture: &TextureHandle, rect: Rect, dim: bool) {
+fn paint_texture(ui: &Ui, texture: &TextureHandle, rect: Rect, dim: bool) -> Rect {
     let size = texture.size_vec2();
     let scale = (rect.width() / size.x).min(rect.height() / size.y).min(if size.x <= 64.0 {
         1.0
@@ -1623,6 +1625,57 @@ fn paint_texture(ui: &Ui, texture: &TextureHandle, rect: Rect, dim: bool) {
         Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
         tint,
     );
+    fitted
+}
+
+/// Цвет метки объекта, если он отмечен.
+pub(crate) fn label_color(app: &FilesApp, entry: &Entry) -> Option<Color32> {
+    app.labels.get(&entry.path()).map(theme::label_color)
+}
+
+/// Тонкая рамка цвета метки вокруг значка или эскиза.
+pub(crate) fn label_frame(ui: &Ui, rect: Rect, color: Color32) {
+    let width = if rect.width() < 40.0 { 1.5 } else { 2.0 };
+    let radius = if rect.width() < 40.0 { 3 } else { 5 };
+    ui.painter().rect_stroke(
+        rect.expand(width + 1.0),
+        CornerRadius::same(radius),
+        Stroke::new(width, color),
+        egui::StrokeKind::Inside,
+    );
+}
+
+/// Подменю «Цвет»: шесть кружков и «Убрать цвет». Отмечает выбранные объекты.
+fn label_menu(ui: &mut Ui, app: &mut FilesApp, current: Option<u8>) {
+    if !app.available_cached(CommandId::LabelRed) {
+        return;
+    }
+    ui.menu_button("Цвет", |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for (index, command) in CommandId::LABELS.into_iter().enumerate() {
+                let (rect, response) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+                let color = theme::label_color(index as u8);
+                let radius = if response.hovered() { 9.0 } else { 8.0 };
+                ui.painter().circle_filled(rect.center(), radius, color);
+                if current == Some(index as u8) {
+                    ui.painter().circle_stroke(
+                        rect.center(),
+                        radius + 2.5,
+                        Stroke::new(1.5, theme::TEXT_PRIMARY),
+                    );
+                }
+                let name = mh_files_core::labels::NAMES[index];
+                if response.on_hover_text(name).clicked() {
+                    app.actions.push(Action::Run(command));
+                    ui.close();
+                }
+            }
+        });
+        if current.is_some() {
+            menu_item(ui, app, CommandId::LabelClear);
+        }
+    });
 }
 
 /// Значок объекта: системный, если есть, иначе свой.
@@ -1630,8 +1683,16 @@ pub(crate) fn paint_icon(ui: &Ui, app: &mut FilesApp, entry: &Entry, rect: Rect,
     let pixels = rect.width() * ui.ctx().pixels_per_point();
     if let Some(texture) = app.images.icon(&app.workers, entry, pixels) {
         paint_texture(ui, &texture, rect, dim);
-        return;
+    } else {
+        paint_own_icon(ui, entry, rect, dim);
     }
+    // Цветная метка — рамка вокруг значка.
+    if let Some(color) = label_color(app, entry) {
+        label_frame(ui, rect, color);
+    }
+}
+
+fn paint_own_icon(ui: &Ui, entry: &Entry, rect: Rect, dim: bool) {
     let painter = ui.painter();
     if entry.is_dir() {
         let color = if dim {
@@ -1649,7 +1710,11 @@ pub(crate) fn paint_icon(ui: &Ui, app: &mut FilesApp, entry: &Entry, rect: Rect,
 fn paint_preview(ui: &Ui, app: &mut FilesApp, entry: &Entry, rect: Rect, dim: bool) {
     let pixels = rect.width().max(rect.height()) * ui.ctx().pixels_per_point();
     if let Some(texture) = app.images.thumbnail(&app.workers, entry, pixels) {
-        paint_texture(ui, &texture, rect, dim);
+        let drawn = paint_texture(ui, &texture, rect, dim);
+        // Цветная метка — рамка вокруг эскиза.
+        if let Some(color) = label_color(app, entry) {
+            label_frame(ui, drawn, color);
+        }
         return;
     }
     let side = rect.width().min(rect.height()) * 0.62;

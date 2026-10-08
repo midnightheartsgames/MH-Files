@@ -33,6 +33,8 @@ pub struct Startup {
     pub repaint: Arc<OnceLock<egui::Context>>,
     /// Сервер единственной копии: живёт, пока живёт окно.
     pub keepalive: Option<Box<dyn std::any::Any>>,
+    /// Цветные метки файлов (`labels.json`).
+    pub labels: mh_files_core::labels::Labels,
 }
 
 /// Абсолютные пути и признак «папка». Несуществующие — отдельно.

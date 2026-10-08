@@ -362,7 +362,8 @@ impl FilesApp {
             // Архив только для чтения; его записей нет на диске.
             Cut | Delete | DeletePermanent | Rename | BatchRename | MoveToOtherPane
             | Properties | OpenWith | RevealInExplorer | WindowsMenu | AddFavorite
-            | FolderSizes
+            | FolderSizes | LabelRed | LabelOrange | LabelYellow | LabelGreen | LabelBlue
+            | LabelPurple | LabelClear
                 if in_archive =>
             {
                 false
@@ -636,6 +637,14 @@ impl FilesApp {
                 }
             }
             RevealInExplorer => workers.shell(ShellJob::Reveal(targets[0].clone())),
+            LabelRed | LabelOrange | LabelYellow | LabelGreen | LabelBlue | LabelPurple
+            | LabelClear => {
+                if let Some(color) = command.label()
+                    && self.labels.set(&targets, color)
+                {
+                    self.save_labels();
+                }
+            }
             AddFavorite => {
                 let tab = self.tab();
                 let dirs: Vec<PathBuf> = targets

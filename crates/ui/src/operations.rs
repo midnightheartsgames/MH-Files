@@ -188,6 +188,7 @@ impl FilesApp {
                         if !undoing && let Some(inverse) = op.inverse(outcome) {
                             self.operations.record(op.describe(), UndoEntry::Ops(inverse));
                         }
+                        self.labels_follow(&op, outcome);
                         self.after_op(followup, created.first().cloned());
                     }
                     Ok(OpOutcome::Aborted) => self.set_status("операция отменена", Level::Info),
@@ -195,6 +196,22 @@ impl FilesApp {
                 }
                 self.reload_dirs(&op.affected_dirs());
             }
+        }
+    }
+
+    /// Цветная метка переименованного или перемещённого объекта — за ним.
+    fn labels_follow(&mut self, op: &FileOp, outcome: &OpOutcome) {
+        let (FileOp::Rename { .. } | FileOp::Move { .. }, OpOutcome::Done { pairs, .. }) =
+            (op, outcome)
+        else {
+            return;
+        };
+        let mut changed = false;
+        for (from, to) in pairs {
+            changed |= self.labels.moved(from, to);
+        }
+        if changed {
+            self.save_labels();
         }
     }
 

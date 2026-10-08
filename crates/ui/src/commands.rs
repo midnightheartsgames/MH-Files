@@ -82,6 +82,13 @@ commands! {
     OpenTerminal => "Открыть терминал здесь", ["terminal", "console", "powershell"], ["Ctrl+Shift+T"];
     RevealInExplorer => "Показать в Проводнике", ["explorer", "reveal"], [];
     AddFavorite => "Добавить в избранное", ["favorite", "bookmark"], ["Ctrl+D"];
+    LabelRed => "Цвет: красный", ["метка", "label", "color", "выделить цветом"], [];
+    LabelOrange => "Цвет: оранжевый", ["метка", "label", "color", "выделить цветом"], [];
+    LabelYellow => "Цвет: жёлтый", ["метка", "label", "color", "выделить цветом"], [];
+    LabelGreen => "Цвет: зелёный", ["метка", "label", "color", "выделить цветом"], [];
+    LabelBlue => "Цвет: синий", ["метка", "label", "color", "выделить цветом"], [];
+    LabelPurple => "Цвет: фиолетовый", ["метка", "label", "color", "выделить цветом"], [];
+    LabelClear => "Убрать цвет", ["метка", "label", "color", "снять цвет"], [];
     SelectAll => "Выделить всё", ["select all"], ["Ctrl+A"];
     InvertSelection => "Обратить выделение", ["invert"], ["Ctrl+I"];
     ClearSelection => "Снять выделение", ["deselect"], [];
@@ -136,8 +143,40 @@ impl CommandId {
                 | Properties
                 | RevealInExplorer
                 | QuickLook
+                | LabelRed
+                | LabelOrange
+                | LabelYellow
+                | LabelGreen
+                | LabelBlue
+                | LabelPurple
+                | LabelClear
         )
     }
+
+    /// Цвет метки, которую ставит команда: `Some(None)` — снять, `None` — не про метки.
+    pub fn label(self) -> Option<Option<u8>> {
+        use CommandId::*;
+        Some(match self {
+            LabelRed => Some(0),
+            LabelOrange => Some(1),
+            LabelYellow => Some(2),
+            LabelGreen => Some(3),
+            LabelBlue => Some(4),
+            LabelPurple => Some(5),
+            LabelClear => None,
+            _ => return None,
+        })
+    }
+
+    /// Команды меток по номеру цвета.
+    pub const LABELS: [CommandId; 6] = [
+        CommandId::LabelRed,
+        CommandId::LabelOrange,
+        CommandId::LabelYellow,
+        CommandId::LabelGreen,
+        CommandId::LabelBlue,
+        CommandId::LabelPurple,
+    ];
 }
 
 /// Разбирает `Ctrl+Shift+P`. Регистр и пробелы не важны.

@@ -269,6 +269,8 @@ pub struct FilesApp {
     pub drop_zones: Vec<DropZone>,
     /// Куда бросят, если отпустить сейчас (по прошлому кадру) — для подсветки.
     pub drop_hover: Option<PathBuf>,
+    /// Цветные метки файлов и папок.
+    pub labels: mh_files_core::labels::Labels,
     /// Файлы из другой программы тянут правой кнопкой: при броске — меню.
     pub external_right: bool,
     pub crumb_menu: Option<CrumbMenu>,
@@ -368,6 +370,7 @@ impl FilesApp {
             actions: Vec::new(),
             drop_zones: Vec::new(),
             drop_hover: None,
+            labels: startup.labels.clone(),
             external_right: false,
             crumb_menu: None,
             drop_menu: None,
@@ -1541,6 +1544,14 @@ impl FilesApp {
         } else {
             std::thread::spawn(write);
         }
+    }
+
+    /// Цветные метки — в фоне, через временный файл.
+    pub fn save_labels(&self) {
+        let json = self.labels.to_json();
+        std::thread::spawn(move || {
+            let _ = storage::write_atomic(&storage::labels_path(), &json);
+        });
     }
 
     pub fn save_settings(&self) {

@@ -121,6 +121,20 @@ pub fn load_settings() -> (Settings, Option<String>) {
     }
 }
 
+pub fn labels_path() -> PathBuf {
+    config_dir().join("labels.json")
+}
+
+/// Цветные метки файлов. Испорченный файл сохраняется рядом как `.broken`, меток нет.
+pub fn load_labels() -> mh_files_core::labels::Labels {
+    let path = labels_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return Default::default() };
+    mh_files_core::labels::Labels::parse(&text).unwrap_or_else(|| {
+        let _ = std::fs::copy(&path, path.with_extension("json.broken"));
+        Default::default()
+    })
+}
+
 pub fn load_session() -> Option<Session> {
     Session::parse(&std::fs::read_to_string(session_path()).ok()?)
 }
