@@ -108,6 +108,15 @@ pub fn load(request: &PreviewRequest, cancel: &CancelToken) -> Preview {
             Err(error) => Preview::Error(error),
         };
     }
+    if crate::font::is_font(&ext) {
+        return match read_limited(&request.path, crate::font::FONT_LIMIT).and_then(|data| {
+            let languages = mh_files_platform::locale::keyboard_languages();
+            crate::font::preview(data, request.max_side, &languages)
+        }) {
+            Ok(preview) => preview,
+            Err(error) => Preview::Error(error),
+        };
+    }
     if ext == "pdf"
         && let Ok(preview) = pdf_page(request)
     {
@@ -220,6 +229,15 @@ fn in_archive(request: &PreviewRequest, archive: &Path, inner: &str) -> Preview 
             Ok(bitmap) => {
                 Preview::Image { bitmap, dimensions: None, pages: None, info: Vec::new() }
             }
+            Err(error) => Preview::Error(error),
+        };
+    }
+    if crate::font::is_font(&ext) {
+        return match archive::read(archive, inner, crate::font::FONT_LIMIT).and_then(|data| {
+            let languages = mh_files_platform::locale::keyboard_languages();
+            crate::font::preview(data, request.max_side, &languages)
+        }) {
+            Ok(preview) => preview,
             Err(error) => Preview::Error(error),
         };
     }
@@ -380,6 +398,15 @@ pub fn decode_text(bytes: &[u8]) -> (String, &'static str) {
             (text.into_owned(), "Windows-1251")
         }
     }
+}
+
+/// Файл целиком, если он не больше `limit` байт.
+fn read_limited(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    if size > limit {
+        return Err("слишком большой файл для предпросмотра".into());
+    }
+    std::fs::read(path).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

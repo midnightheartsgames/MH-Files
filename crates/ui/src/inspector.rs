@@ -135,6 +135,7 @@ fn wants_handler(app: &mut FilesApp, path: &std::path::Path, is_dir: bool) -> bo
         || ext == "pdf"
         || mh_files_fs::images::decodable(&ext)
         || mh_files_fs::preview::text_like(&ext)
+        || mh_files_fs::font::is_font(&ext)
         || mh_files_fs::archive::is_archive_ext(&ext);
     // Внутри архива файла на диске нет — обработчику нечего открыть.
     if own || matches!(app.tab().location, Location::Archive { .. }) {

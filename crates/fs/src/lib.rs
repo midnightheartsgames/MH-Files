@@ -24,6 +24,7 @@ use mh_files_platform::shell::{MenuChoice, ShellMenuItem};
 pub mod archive;
 mod archive_tool;
 pub mod duplicates;
+pub mod font;
 pub mod images;
 pub mod indexer;
 pub mod listing;
