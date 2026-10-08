@@ -120,6 +120,8 @@ pub enum Event {
         key: ImageKey,
         result: ImageResult,
     },
+    /// Есть ли у расширений обработчики эскизов Windows ([`Workers::thumbnail_types`]).
+    ThumbnailTypes(Vec<(String, bool)>),
     /// Итог действия Shell; ошибку показать пользователю.
     Shell {
         what: String,
@@ -370,6 +372,22 @@ impl Workers {
                 }
                 std::thread::sleep(DRIVES_POLL);
             }
+        });
+    }
+
+    /// Узнать, у каких расширений (без точки) в Windows есть обработчик эскизов: реестр —
+    /// не для потока UI.
+    pub fn thumbnail_types(&self, exts: Vec<String>) {
+        self.spawn("thumbnail-types", move |workers| {
+            let _com = mh_files_platform::thumbs::init_worker_thread();
+            let types = exts
+                .into_iter()
+                .map(|ext| {
+                    let has = mh_files_platform::thumbs::has_thumbnail_provider(&ext);
+                    (ext, has)
+                })
+                .collect();
+            workers.send(Event::ThumbnailTypes(types));
         });
     }
 

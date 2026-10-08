@@ -21,6 +21,21 @@ pub enum ImageMode {
     Icon,
 }
 
+/// Зарегистрирован ли в Windows обработчик эскизов для расширения (без точки) — так их
+/// регистрируют программы: Blender для `.blend`, Affinity, CAD. Читает реестр — только из
+/// фоновых потоков, результат кэшировать.
+pub fn has_thumbnail_provider(ext: &str) -> bool {
+    #[cfg(windows)]
+    {
+        crate::win::thumbs::has_thumbnail_provider(ext)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = ext;
+        false
+    }
+}
+
 /// Подготовка потока к вызовам Shell (COM STA). Держать, пока поток работает.
 pub struct ThreadGuard {
     #[cfg(windows)]

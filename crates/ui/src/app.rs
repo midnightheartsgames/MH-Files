@@ -760,6 +760,7 @@ impl FilesApp {
             }
             Event::KnownFolders(places) => self.places = places,
             Event::Image { key, result } => self.images.on_result(ctx, key, result),
+            Event::ThumbnailTypes(types) => self.images.on_types(types),
             Event::Shell { what, result } => {
                 if let Err(error) = result {
                     self.set_status(format!("{what}: {error}"), Level::Error);
