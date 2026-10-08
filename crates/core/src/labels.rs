@@ -83,12 +83,16 @@ impl Labels {
     /// `true` — что-то изменилось.
     pub fn moved(&mut self, from: &Path, to: &Path) -> bool {
         let (from, to) = (key(from), key(to));
-        let separator = std::path::MAIN_SEPARATOR;
-        let inside = format!("{}{separator}", from.trim_end_matches(separator));
+        let from = from.trim_end_matches(['/', '\\']).to_string();
+        // Сам объект или что-то внутри: дальше — разделитель (в Windows бывают оба).
+        let below = |path: &str| {
+            path.strip_prefix(from.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
+        };
         let moved: Vec<(String, u8)> = self
             .labels
             .iter()
-            .filter(|(path, _)| **path == from || path.starts_with(&inside))
+            .filter(|(path, _)| below(path))
             .map(|(path, color)| (path.clone(), *color))
             .collect();
         for (path, color) in &moved {
