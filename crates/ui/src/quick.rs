@@ -401,10 +401,8 @@ fn equalizer(
     let dt = ui.input(|i| i.stable_dt).min(0.1);
     // Быстрый подъём, плавный спад; пики опускаются чуть больше чем за секунду.
     let (attack, release) = (1.0 - (-dt / 0.03).exp(), 1.0 - (-dt / 0.18).exp());
-    for i in 0..BANDS {
-        let (bar, target) = (&mut quick.bars[i], levels[i]);
+    for ((bar, peak), target) in quick.bars.iter_mut().zip(&mut quick.peaks).zip(levels) {
         *bar += (target - *bar) * if target > *bar { attack } else { release };
-        let peak = &mut quick.peaks[i];
         *peak = if *bar > *peak { *bar } else { (*peak - 0.7 * dt).max(*bar) };
     }
     let (rect, _) = ui.allocate_exact_size(area, egui::Sense::hover());
