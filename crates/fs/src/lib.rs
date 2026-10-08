@@ -30,6 +30,7 @@ pub mod indexer;
 pub mod listing;
 pub mod preview;
 pub mod read;
+pub mod recycle;
 pub mod rename;
 pub mod search;
 pub mod shell;
@@ -37,6 +38,7 @@ pub mod sizes;
 pub mod sorting;
 pub mod transfer;
 pub mod watch;
+pub mod zip_write;
 
 pub use duplicates::{DuplicateOptions, DuplicateProgress, LinkReport};
 pub use images::{ImageKey, ImageKind, ImageResult};
@@ -118,6 +120,16 @@ pub enum Event {
     Drive(DriveInfo),
     /// Сколько в корзине; `None` — не узнать.
     RecycleBin(Option<mh_files_platform::recycle::BinInfo>),
+    /// Файлы дописаны в zip (или нет).
+    ZipAdded {
+        archive: PathBuf,
+        result: Result<zip_write::Added, String>,
+    },
+    /// Содержимое корзины для её вкладки; за ним — `ListingDone`.
+    RecycleListing {
+        ticket: Ticket,
+        items: Vec<recycle::Recycled>,
+    },
     KnownFolders(Vec<(KnownFolder, PathBuf)>),
     Image {
         key: ImageKey,
@@ -392,6 +404,35 @@ impl Workers {
                 .collect();
             workers.send(Event::ThumbnailTypes(types));
         });
+    }
+
+    /// Дописать `sources` в папку `inner` zip-архива `archive`.
+    pub fn add_to_zip(&self, archive: PathBuf, inner: String, sources: Vec<PathBuf>) {
+        self.spawn("zip-add", move |workers| {
+            let result = zip_write::add(&archive, &inner, &sources, &CancelToken::default());
+            workers.send(Event::ZipAdded { archive, result });
+        });
+    }
+
+    /// Содержимое корзины всех дисков для вкладки «Корзина».
+    pub fn list_recycle_bin(&self, ticket: Ticket) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("recycle-list", move |workers| {
+            let dirs = mh_files_platform::recycle::bin_dirs();
+            let items = recycle::scan(&dirs, &token);
+            if token.is_cancelled() {
+                return;
+            }
+            workers.send(Event::RecycleListing { ticket, items });
+            let result = if cfg!(windows) || !dirs.is_empty() {
+                Ok(())
+            } else {
+                Err("корзина есть только в Windows".into())
+            };
+            workers.send(Event::ListingDone { ticket, result });
+        });
+        cancel
     }
 
     /// Узнать, сколько в корзине: она заглядывает в каждый диск — не для потока UI.

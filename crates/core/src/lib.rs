@@ -18,6 +18,7 @@ pub mod layout;
 pub mod listing;
 pub mod location;
 pub mod names;
+pub mod recycle;
 pub mod rename;
 pub mod selection;
 pub mod session;

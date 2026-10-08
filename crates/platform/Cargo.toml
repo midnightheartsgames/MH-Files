@@ -28,6 +28,7 @@ features = [
     "Win32_NetworkManagement_WNet",
     "Win32_Networking_WinHttp",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_EnhancedStorage",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",

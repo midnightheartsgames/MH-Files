@@ -151,6 +151,7 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             Location::Archive { .. } => icons::archive(&painter, icon, theme::accent()),
             Location::Duplicates { .. } => icons::duplicates(&painter, icon, theme::accent()),
             Location::Sort { .. } => icons::sort(&painter, icon, theme::accent()),
+            Location::RecycleBin => icons::trash(&painter, icon, theme::accent(), false),
             Location::Dir(_) => icons::folder(&painter, icon, theme::accent().gamma_multiply(0.8)),
         }
         let close_rect =
@@ -380,6 +381,7 @@ fn breadcrumbs(
                         });
                         let path_text = dir.display().to_string();
                         response.context_menu(|ui| {
+                            crate::popup::compact(ui.style_mut());
                             if ui.button("Открыть в новой вкладке").clicked() {
                                 app.actions.push(Action::Open {
                                     location: crumb.location.clone(),
@@ -932,7 +934,7 @@ fn list_view(
     if let Some(dir) = tab.dir() {
         crate::shell_menu::prefetch_on_press(app, &background, || MenuTarget::Background(dir));
     }
-    background.context_menu(|ui| background_menu(ui, app, tab));
+    crate::popup::context_menu(&background, "background", |ui| background_menu(ui, app, tab));
     if ui.rect_contains_pointer(area) {
         app.wheel_resize(ui.ctx(), tab.view);
     }
@@ -972,6 +974,9 @@ fn list_view(
                 let done = tab.search.as_ref().is_some_and(|s| s.done);
                 done.then(|| ("Ничего не найдено".to_string(), theme::TEXT_SECONDARY))
             }
+            LoadState::Done if tab.location == Location::RecycleBin => {
+                Some(("Корзина пуста".to_string(), theme::TEXT_DISABLED))
+            }
             LoadState::Done => Some(("Папка пуста".to_string(), theme::TEXT_DISABLED)),
         };
         let center = area.center() - vec2(0.0, area.height() * 0.15);
@@ -996,11 +1001,17 @@ fn list_view(
 /// Контекстное меню пустого места.
 fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
     ui.set_min_width(250.0);
+    if tab.location == Location::RecycleBin {
+        menu_item(ui, app, CommandId::EmptyRecycleBin);
+        menu_item(ui, app, CommandId::Refresh);
+        menu_item(ui, app, CommandId::SelectAll);
+        return;
+    }
     for command in [CommandId::Paste, CommandId::NewFolder, CommandId::NewFile] {
         menu_item(ui, app, command);
     }
     ui.separator();
-    ui.menu_button("Вид", |ui| {
+    crate::popup::submenu(ui, "Вид", None, |ui| {
         for (view, title) in [
             (ViewMode::Details, "Таблица"),
             (ViewMode::Grid, "Плитки"),
@@ -1012,7 +1023,7 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
             }
         }
     });
-    ui.menu_button("Сортировка", |ui| {
+    crate::popup::submenu(ui, "Сортировка", None, |ui| {
         let order = tab.options.sort;
         let index = matches!(tab.location, Location::Index { .. });
         let columns = [
@@ -1059,6 +1070,18 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
     menu_item(ui, app, CommandId::Properties);
 }
 
+/// Меню удалённых объектов во вкладке корзины.
+fn recycled_menu(ui: &mut Ui, app: &mut FilesApp) {
+    ui.set_min_width(230.0);
+    menu_item(ui, app, CommandId::Restore);
+    menu_item(ui, app, CommandId::DeletePermanent);
+    ui.separator();
+    menu_item(ui, app, CommandId::CopyPath);
+    menu_item(ui, app, CommandId::CopyName);
+    ui.separator();
+    menu_item(ui, app, CommandId::EmptyRecycleBin);
+}
+
 /// Контекстное меню объектов: свои команды, ниже — пункты Windows для `targets`.
 fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool, targets: Vec<PathBuf>) {
     ui.set_min_width(270.0);
@@ -1082,7 +1105,7 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool, targets:
     {
         menu_item(ui, app, command);
     }
-    ui.menu_button("Копировать как текст", |ui| {
+    crate::popup::submenu(ui, "Копировать как текст", None, |ui| {
         menu_item(ui, app, CommandId::CopyPath);
         menu_item(ui, app, CommandId::CopyName);
     });
@@ -1218,10 +1241,22 @@ fn header(
     painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::CARD_STROKE));
     let layout = column_layout(app, rect.left(), rect.width() - 12.0, search);
     let order = tab.listing.options().sort;
+    let recycle = tab.location == Location::RecycleBin;
     let columns = [
         (SortColumn::Name, Some(layout.name), "Имя", false),
-        (SortColumn::Modified, layout.modified, "Изменён", false),
-        (SortColumn::Type, layout.kind, if search { "Папка" } else { "Тип" }, false),
+        (SortColumn::Modified, layout.modified, if recycle { "Удалён" } else { "Изменён" }, false),
+        (
+            SortColumn::Type,
+            layout.kind,
+            if recycle {
+                "Откуда"
+            } else if search {
+                "Папка"
+            } else {
+                "Тип"
+            },
+            false,
+        ),
         (SortColumn::Size, Some(layout.size), "Размер", true),
     ];
     for (index, (column, span, title, right)) in columns.into_iter().enumerate() {
@@ -1595,8 +1630,9 @@ pub(crate) fn item(
             kind: ZoneKind::Folder,
         });
     }
-    // В архиве объектов нет на диске — и меню Windows для них нет.
-    if !matches!(tab.location, Location::Archive { .. }) {
+    // В архиве объектов нет на диске, в корзине они не на своих местах — меню Windows нет.
+    let in_recycle = tab.location == Location::RecycleBin;
+    if !matches!(tab.location, Location::Archive { .. }) && !in_recycle {
         crate::shell_menu::prefetch_on_press(app, &response, || {
             // Невыделенный объект при щелчке станет единственным выделенным.
             MenuTarget::Items(if selected { tab.targets() } else { vec![path.clone()] })
@@ -1604,7 +1640,13 @@ pub(crate) fn item(
     }
     let many = tab.selection.len() > 1;
     let is_dir = entry.is_dir();
-    response.context_menu(|ui| item_menu(ui, app, is_dir, many, tab.targets()));
+    if in_recycle {
+        crate::popup::context_menu(&response, "recycled", |ui| recycled_menu(ui, app));
+        return;
+    }
+    crate::popup::context_menu(&response, "items", |ui| {
+        item_menu(ui, app, is_dir, many, tab.targets())
+    });
 }
 
 /// Цвет кружка давности для даты; `None` — кружки выключены в настройках.
@@ -1667,7 +1709,7 @@ fn label_menu(ui: &mut Ui, app: &mut FilesApp, current: Option<u8>) {
     if !app.available_cached(CommandId::LabelRed) {
         return;
     }
-    ui.menu_button("Цвет", |ui| {
+    crate::popup::submenu(ui, "Цвет", None, |ui| {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             for (index, command) in CommandId::LABELS.into_iter().enumerate() {
@@ -2043,6 +2085,7 @@ fn drive_card(
     }
     let root = drive.root.clone();
     response.context_menu(|ui| {
+        crate::popup::compact(ui.style_mut());
         if ui.button("Открыть в новой вкладке").clicked() {
             app.actions.push(Action::Open {
                 location: Location::Dir(root.clone()),

@@ -190,7 +190,8 @@ pub fn section(ui: &mut Ui, app: &mut FilesApp, target: MenuTarget) -> bool {
     }
     let current = app.shell_menu.as_ref().is_some_and(|menu| menu.target == target);
     if !current {
-        let extended = ui.input(|i| i.modifiers.shift);
+        // Shift при щелчке — в окне программы: меню рисуется своим окном.
+        let extended = ui.ctx().input_for(egui::ViewportId::ROOT, |i| i.modifiers.shift);
         let prefetched = app.shell_prefetch.take().filter(|menu| {
             menu.target == target
                 && menu.extended == extended
@@ -220,7 +221,7 @@ pub fn section(ui: &mut Ui, app: &mut FilesApp, target: MenuTarget) -> bool {
                 };
                 ui.label(RichText::new(text).color(theme::TEXT_DISABLED));
             });
-            ui.ctx().request_repaint_after(Duration::from_millis(250));
+            ui.ctx().request_repaint_after_for(Duration::from_millis(250), egui::ViewportId::ROOT);
         }
         State::Failed(error) => {
             ui.separator();
@@ -289,10 +290,12 @@ fn show_items(
                             show_items(ui, items, *inner, blank, complete, chosen);
                         }
                     };
-                    match image(icon.as_ref(), icons, blank) {
-                        Some(image) => ui.menu_image_text_button(image, label.as_str(), add),
-                        None => ui.menu_button(label.as_str(), add),
-                    }
+                    crate::popup::submenu(
+                        ui,
+                        label.as_str(),
+                        image(icon.as_ref(), icons, blank),
+                        add,
+                    );
                 });
             }
         }

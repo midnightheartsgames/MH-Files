@@ -195,8 +195,9 @@ impl FilesApp {
                     Err(error) => self.set_status(error.clone(), Level::Error),
                 }
                 self.reload_dirs(&op.affected_dirs());
-                if matches!(op, FileOp::Delete { permanent: false, .. } | FileOp::Restore { .. }) {
+                if matches!(op, FileOp::Delete { .. } | FileOp::Restore { .. }) {
                     self.workers.recycle_bin();
+                    self.reload_recycle_tabs();
                 }
             }
         }

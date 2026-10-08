@@ -1,12 +1,28 @@
 //! Мониторы, перехват сочетаний, Snap Layouts для своего заголовка окна.
 
 use windows::Win32::Foundation::POINT;
-use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
+};
 
 pub fn point_on_screen(x: i32, y: i32) -> bool {
     // SAFETY: функция только читает раскладку мониторов.
     let monitor = unsafe { MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONULL) };
     !monitor.is_invalid()
+}
+
+pub fn work_area(x: i32, y: i32) -> Option<[i32; 4]> {
+    // SAFETY: функции только читают раскладку мониторов; структура живёт до конца вызова.
+    unsafe {
+        let monitor = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+        let mut info =
+            MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return None;
+        }
+        let r = info.rcWork;
+        Some([r.left, r.top, r.right, r.bottom])
+    }
 }
 
 /// Перехватчик сообщений цикла winit: замечает сочетания, которые egui забирает себе раньше

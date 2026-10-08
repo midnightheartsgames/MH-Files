@@ -811,7 +811,20 @@ impl FilesApp {
                 }
             }
             Event::KnownFolders(places) => self.places = places,
-            Event::RecycleBin(info) => self.recycle_bin = info,
+            Event::RecycleBin(info) => {
+                // Корзина изменилась (удалили, восстановили, очистили — здесь или в Проводнике):
+                // её вкладки перечитываются.
+                if info != self.recycle_bin {
+                    self.reload_recycle_tabs();
+                }
+                self.recycle_bin = info;
+            }
+            Event::ZipAdded { archive, result } => self.on_zip_added(archive, result),
+            Event::RecycleListing { ticket, items } => {
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    tab.on_recycled(ticket, items);
+                }
+            }
             Event::Image { key, result } => self.images.on_result(ctx, key, result),
             Event::ThumbnailTypes(types) => self.images.on_types(types),
             Event::Shell { what, result } => {
@@ -1027,6 +1040,7 @@ impl FilesApp {
             self.workers.recycle_bin();
         }
         self.was_focused = focused;
+        crate::popup::begin_frame(&ctx);
         self.handle_keys(&ctx);
         self.run_actions(&ctx);
         self.drop_zones.clear();
@@ -1105,6 +1119,7 @@ impl FilesApp {
         }
         settings_window::show(&ctx, self);
         crate::shell_menu::end_frame(self);
+        crate::popup::end_frame(&ctx);
         crate::shell_menu::warm_up(&ctx, self);
 
         self.handle_drops(&ctx);
@@ -1675,6 +1690,15 @@ impl FilesApp {
         std::thread::spawn(move || {
             let _ = storage::write_atomic(&storage::labels_path(), &json);
         });
+    }
+
+    /// Перечитать вкладки корзины: в ней что-то удалили, восстановили или стёрли.
+    pub fn reload_recycle_tabs(&mut self) {
+        for tab in self.panes.iter_mut().flat_map(|p| p.tabs.iter_mut()) {
+            if tab.location == Location::RecycleBin {
+                tab.reload(&self.workers, true);
+            }
+        }
     }
 
     pub fn save_settings(&self) {

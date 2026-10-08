@@ -120,7 +120,7 @@ fn request_size(app: &mut FilesApp) {
     let Some(path) = app.inspector.path.clone() else { return };
     if !app.inspector.is_dir
         || !app.settings.preview.inspector_folder_size
-        || matches!(app.tab().location, Location::Archive { .. })
+        || matches!(app.tab().location, Location::Archive { .. } | Location::RecycleBin)
         // Корень диска — это весь диск: его занятое место видно и так.
         || path.parent().is_none()
     {
@@ -166,6 +166,12 @@ fn request(app: &mut FilesApp) {
     state.generation += 1;
     state.preview = None;
     state.texture = None;
+    // В корзине объект лежит не по своему пути: показать нечего, кроме сведений.
+    if app.tab().location == Location::RecycleBin {
+        app.inspector.preview = Some(Preview::Info(Vec::new()));
+        return;
+    }
+    let state = &mut app.inspector;
     let request = PreviewRequest {
         path,
         is_dir: state.is_dir,
@@ -193,7 +199,7 @@ fn wants_handler(app: &mut FilesApp, path: &std::path::Path, is_dir: bool) -> bo
         || mh_files_fs::font::is_font(&ext)
         || mh_files_fs::archive::is_archive_ext(&ext);
     // Внутри архива файла на диске нет — обработчику нечего открыть.
-    if own || matches!(app.tab().location, Location::Archive { .. }) {
+    if own || matches!(app.tab().location, Location::Archive { .. } | Location::RecycleBin) {
         return false;
     }
     *app.inspector.handlers.entry(ext.clone()).or_insert_with(|| has_handler(&ext))
@@ -314,7 +320,12 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             }
             if let Some(time) = entry.modified {
                 let dot = crate::pane_view::age_dot_color(app, time);
-                dated_field(ui, "Изменён", &format::date_full(time), dot);
+                let title = if app.tab().location == Location::RecycleBin {
+                    "Удалён"
+                } else {
+                    "Изменён"
+                };
+                dated_field(ui, title, &format::date_full(time), dot);
             }
             if let Some(time) = entry.created {
                 let dot = crate::pane_view::age_dot_color(app, time);
@@ -338,7 +349,8 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             }
         }
         // Папка: размер целиком — по запросу, обход может быть долгим.
-        let in_archive = matches!(app.tab().location, Location::Archive { .. });
+        let in_archive =
+            matches!(app.tab().location, Location::Archive { .. } | Location::RecycleBin);
         if entry.as_ref().is_none_or(Entry::is_dir) && !in_archive {
             folder_size(ui, app, &path);
         }

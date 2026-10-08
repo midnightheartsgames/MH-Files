@@ -1,6 +1,7 @@
 //! Вкладки и панели во время работы: модель из `mh-files-core` плюс то, что связывает её с
 //! воркерами — поколение запроса, отмена, наблюдатель, ход поиска.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -159,6 +160,8 @@ pub struct Tab {
     pub band: Option<Band>,
     /// Выделить этот объект, когда он появится (папка, из которой поднялись).
     pub pending_select: Option<PathBuf>,
+    /// Вкладка корзины: путь записи (прежнее место) → где объект лежит в корзине.
+    pub recycled: Option<HashMap<PathBuf, mh_files_fs::recycle::Recycled>>,
     generation: u64,
     watch_generation: u64,
     cancel: Option<CancelToken>,
@@ -197,6 +200,7 @@ impl Tab {
             duplicates: None,
             duplicate_options: DuplicateOptions::default(),
             sort: None,
+            recycled: None,
             columns_shown: Vec::new(),
             select_first: false,
             load_started: Instant::now(),
@@ -367,6 +371,18 @@ impl Tab {
                     None => self.sort = Some(Box::new(crate::sorter::SortView::new())),
                 }
             }
+            Location::RecycleBin => {
+                self.watch = None;
+                // Мягко, как папка: прежний список виден, пока не придёт новый.
+                if soft && self.listing.state != LoadState::Loading {
+                    self.staging = Some(Vec::new());
+                } else {
+                    self.staging = None;
+                    self.listing.reset();
+                }
+                self.recycled = Some(HashMap::new());
+                self.cancel = Some(workers.list_recycle_bin(ticket));
+            }
             Location::Index { query } => {
                 // Сам поиск запускает окно в конце кадра: у вкладки нет доступа к индексу.
                 self.watch = None;
@@ -392,6 +408,9 @@ impl Tab {
         }
         if !matches!(self.location, Location::Sort { .. }) {
             self.sort = None;
+        }
+        if self.location != Location::RecycleBin {
+            self.recycled = None;
         }
     }
 
@@ -561,6 +580,23 @@ impl Tab {
                 self.dirty = true;
             }
         }
+    }
+
+    /// Содержимое корзины: записи — в список, их места в корзине — в `recycled`.
+    pub fn on_recycled(&mut self, ticket: Ticket, items: Vec<mh_files_fs::recycle::Recycled>) {
+        if !self.current(ticket) {
+            return;
+        }
+        let map = self.recycled.get_or_insert_with(HashMap::new);
+        let entries = items
+            .into_iter()
+            .map(|item| {
+                let entry = item.entry.clone();
+                map.insert(entry.path(), item);
+                entry
+            })
+            .collect();
+        self.on_batch(ticket, entries);
     }
 
     pub fn on_done(&mut self, ticket: Ticket, result: Result<(), String>) {

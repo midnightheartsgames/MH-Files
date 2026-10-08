@@ -354,6 +354,7 @@ impl FilesApp {
         let has_targets = !tab.targets().is_empty();
         let has_dir = tab.dir().is_some();
         let in_archive = matches!(tab.location, Location::Archive { .. });
+        let in_recycle = tab.location == Location::RecycleBin;
         let archive_selected = tab.targets().iter().any(|p| {
             p.file_name()
                 .is_some_and(|n| mh_files_fs::archive::is_archive_name(&n.to_string_lossy()))
@@ -368,6 +369,18 @@ impl FilesApp {
             {
                 false
             }
+            // В корзине объекты — не на своих местах: их можно вернуть или стереть, не больше.
+            Restore => in_recycle && has_targets,
+            FindDuplicates | SortFolder | AddFavorite | WindowsMenu | FolderSizes | Extract
+            | ExtractHere
+                if in_recycle =>
+            {
+                false
+            }
+            _ if in_recycle && command.needs_targets() => {
+                has_targets && matches!(command, Delete | DeletePermanent | CopyPath | CopyName)
+            }
+            OpenRecycleBin | EmptyRecycleBin => cfg!(windows),
             Extract => in_archive || archive_selected,
             ExtractHere => archive_selected && !in_archive,
             FindDuplicates => has_dir || has_targets && !in_archive,
@@ -603,6 +616,27 @@ impl FilesApp {
                 let siblings = batch::siblings(tab);
                 self.batch = Some(batch::State::new(items, siblings));
             }
+            // Из корзины удаляют только насовсем: и объект, и его сведения.
+            Delete | DeletePermanent if self.tab().location == Location::RecycleBin => {
+                let (shown, files) = self.recycled_files(&targets);
+                if !files.is_empty() {
+                    self.dialog = Some(dialogs::Dialog::delete_recycled(shown, files));
+                }
+            }
+            Restore => {
+                let items: Vec<(PathBuf, PathBuf)> = self
+                    .tab()
+                    .recycled
+                    .iter()
+                    .flat_map(|map| targets.iter().filter_map(|path| map.get(path)))
+                    .map(|item| (item.data.clone(), item.original.clone()))
+                    .collect();
+                if !items.is_empty() {
+                    self.submit(FileOp::Restore { items }, None);
+                }
+            }
+            OpenRecycleBin => self.open_location(Location::RecycleBin, Target::Current),
+            EmptyRecycleBin => workers.shell(ShellJob::EmptyRecycleBin),
             Delete => {
                 if self.settings.files.confirm_recycle {
                     self.dialog = Some(dialogs::Dialog::delete(targets, false));
@@ -767,6 +801,10 @@ impl FilesApp {
         if self.open_in_archive(targets, target) {
             return;
         }
+        if self.tab().location == Location::RecycleBin {
+            self.set_status("из корзины не открыть — сначала «Восстановить»", Level::Info);
+            return;
+        }
         let tab = self.tab();
         let mut places = Vec::new();
         let mut files = Vec::new();
@@ -847,9 +885,29 @@ impl FilesApp {
     }
 
     fn close_tab(&mut self, pane_id: mh_files_core::layout::PaneId, index: usize) {
+        let alone = self.panes.len() == 1;
         let Some(pane) = self.pane_mut(pane_id) else { return };
-        if pane.tabs.len() == 1 {
+        if pane.tabs.len() == 1 && !alone {
             self.close_pane(pane_id);
+            return;
+        }
+        // Последняя вкладка последней панели: окно не пустеет — на её месте «Этот компьютер».
+        if pane.tabs.len() == 1 {
+            if pane.tabs[0].location == Location::Computer {
+                return;
+            }
+            let view = pane.tabs[0].view;
+            let computer =
+                TabSession { location: Location::Computer, view, sort: Default::default() };
+            let fresh = self.make_tab(&computer);
+            let Some(pane) = self.pane_mut(pane_id) else { return };
+            let mut tab = std::mem::replace(&mut pane.tabs[0], fresh);
+            pane.active = 0;
+            tab.stop();
+            self.closed.push(tab.session());
+            if self.closed.len() > 32 {
+                self.closed.remove(0);
+            }
             return;
         }
         let mut tab = pane.tabs.remove(index);
@@ -955,16 +1013,60 @@ impl FilesApp {
         self.start_transfer(Transfer { sources, dest, copy }, None);
     }
 
+    /// Удалённые объекты вкладки корзины: прежние пути (для вопроса) и файлы в корзине —
+    /// сам объект и его сведения.
+    fn recycled_files(&self, targets: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let Some(map) = &self.tab().recycled else { return Default::default() };
+        let mut shown = Vec::new();
+        let mut files = Vec::new();
+        for item in targets.iter().filter_map(|path| map.get(path)) {
+            shown.push(item.original.clone());
+            files.push(item.data.clone());
+            files.push(item.info.clone());
+        }
+        (shown, files)
+    }
+
     /// Бросок в zip: копирование в «сжатую папку» Проводника (`IFileOperation`) — Windows
     /// сама дописывает архив и спрашивает про занятые имена. Своего кода записи в архив нет.
     fn add_to_zip(&mut self, sources: Vec<PathBuf>, dest: PathBuf) {
-        if !cfg!(windows) {
-            self.set_status("запись в архив есть только в Windows", Level::Error);
-            return;
+        let Some((archive, inner)) = Location::containing_archive(&dest) else { return };
+        let name = mh_files_core::location::path_label(&archive);
+        self.set_status(format!("дописываю в «{name}»…"), Level::Info);
+        self.workers.add_to_zip(archive, inner, sources);
+    }
+
+    /// Файлы дописаны в zip: сказать, что вышло, и перечитать архив и его папку.
+    pub fn on_zip_added(
+        &mut self,
+        archive: PathBuf,
+        result: Result<mh_files_fs::zip_write::Added, String>,
+    ) {
+        let name = mh_files_core::location::path_label(&archive);
+        match result {
+            Ok(added) => {
+                let mut text =
+                    format!("в «{name}» добавлено: {}", mh_files_core::format::items(added.files));
+                if let Some((was, now)) = added.renamed.first() {
+                    let more = added.renamed.len() - 1;
+                    text += &format!("; имя занято — «{was}» лёг как «{now}»");
+                    if more > 0 {
+                        text += &format!(" и ещё {more}");
+                    }
+                }
+                self.set_status(text, Level::Info);
+            }
+            Err(error) => self.set_status(format!("«{name}»: {error}"), Level::Error),
         }
-        let op =
-            FileOp::Copy { sources, dest, on_conflict: mh_files_platform::ops::OnConflict::Ask };
-        self.submit(op, None);
+        let workers = self.workers.clone();
+        for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+            if matches!(&tab.location, Location::Archive { archive: a, .. } if *a == archive) {
+                tab.reload(&workers, true);
+            }
+        }
+        if let Some(parent) = archive.parent() {
+            self.reload_dirs(&[parent.to_path_buf()]);
+        }
     }
 
     fn add_favorites(&mut self, group: usize, paths: Vec<PathBuf>) {
