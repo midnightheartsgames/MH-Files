@@ -264,6 +264,8 @@ pub struct FilesApp {
     pub drop_zones: Vec<DropZone>,
     /// Куда бросят, если отпустить сейчас (по прошлому кадру) — для подсветки.
     pub drop_hover: Option<PathBuf>,
+    /// Файлы из другой программы тянут правой кнопкой: при броске — меню.
+    pub external_right: bool,
     pub crumb_menu: Option<CrumbMenu>,
     pub drop_menu: Option<DropMenu>,
     pub columns: Columns,
@@ -359,6 +361,7 @@ impl FilesApp {
             actions: Vec::new(),
             drop_zones: Vec::new(),
             drop_hover: None,
+            external_right: false,
             crumb_menu: None,
             drop_menu: None,
             columns: Columns::default(),
@@ -1175,13 +1178,10 @@ impl FilesApp {
         if dragging && self.drag_left_window(ctx) {
             return;
         }
-        let external = ctx.input(|i| !i.raw.hovered_files.is_empty());
-        self.drop_hover = if dragging || external {
-            pointer.and_then(|pos| self.zone_at(pos)).map(|zone| zone.dir.clone())
-        } else {
-            None
-        };
-        // Файлы из Проводника и других программ.
+        // Файлы из Проводника и других программ. Пока их тянут, мышь захвачена источником:
+        // окну не приходят ни движения мыши, ни клавиши — где курсор и что нажато,
+        // спрашивается у системы.
+        let hovering = ctx.input(|i| !i.raw.hovered_files.is_empty());
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
                 .dropped_files
@@ -1190,12 +1190,41 @@ impl FilesApp {
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect()
         });
+        let external = !dragging && (hovering || !dropped.is_empty());
+        let outside_pointer = if external {
+            let ppp = ctx.pixels_per_point();
+            mh_files_platform::window::cursor_in_window()
+                .map(|(x, y)| egui::pos2(x / ppp, y / ppp))
+                .or(pointer)
+        } else {
+            None
+        };
+        if hovering {
+            // Пока тянут, событий нет — подсветка цели следит за курсором сама.
+            ctx.request_repaint_after(std::time::Duration::from_millis(30));
+            let keys = mh_files_platform::window::drag_keys();
+            // Правая кнопка к моменту броска уже отпущена — запомнить, пока тянут.
+            self.external_right |= keys.right;
+        }
+        let at = if external { outside_pointer } else { pointer };
+        self.drop_hover = if dragging || hovering {
+            at.and_then(|pos| self.zone_at(pos)).map(|zone| zone.dir.clone())
+        } else {
+            None
+        };
         if !dropped.is_empty() {
-            let at = pointer.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
-            match at.and_then(|pos| self.zone_at(pos)).cloned() {
-                Some(zone) => self.drop_on(zone, dropped, ctx),
+            let right = std::mem::take(&mut self.external_right);
+            let at = at.or_else(|| ctx.input(|i| i.pointer.latest_pos()));
+            match at.and_then(|pos| self.zone_at(pos).cloned().map(|zone| (pos, zone))) {
+                Some((pos, zone)) if right && zone.favorite_group.is_none() => {
+                    self.drop_menu =
+                        Some(DropMenu { paths: dropped, dest: zone.dir, archive: None, at: pos });
+                }
+                Some((_, zone)) => self.drop_on(zone, dropped, ctx),
                 None => self.set_status("бросьте файлы на папку или панель", Level::Info),
             }
+        } else if !hovering {
+            self.external_right = false;
         }
         if dragging && ctx.input(|i| i.pointer.any_released()) {
             let payload = egui::DragAndDrop::take_payload::<DragFiles>(ctx);
@@ -1412,10 +1441,18 @@ impl FilesApp {
             self.actions.push(Action::AddFavorites { group, paths });
             return;
         }
+        // Окно без фокуса (файлы тянули из Проводника) не знает о клавишах — спросить систему.
+        let keys = mh_files_platform::window::drag_keys();
         let modifiers = ctx.input(|i| i.modifiers);
-        let copy = if modifiers.ctrl {
+        let (ctrl, shift) = (modifiers.ctrl || keys.ctrl, modifiers.shift || keys.shift);
+        let copy = if ctrl && shift || keys.alt {
+            // Ctrl+Shift или Alt — ярлыки, как в Проводнике.
+            self.workers
+                .shell(mh_files_fs::ShellJob::CreateShortcuts { targets: paths, dest: zone.dir });
+            return;
+        } else if ctrl {
             Some(true)
-        } else if modifiers.shift {
+        } else if shift {
             Some(false)
         } else {
             None

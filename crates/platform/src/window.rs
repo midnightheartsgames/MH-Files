@@ -14,6 +14,43 @@ pub fn owner_window() -> isize {
     OWNER.load(Ordering::Relaxed)
 }
 
+/// Клавиши и правая кнопка во время перетаскивания извне: окно тогда без фокуса и без
+/// сообщений мыши, их состояние спрашивается у системы.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DragKeys {
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    /// Тянут правой кнопкой.
+    pub right: bool,
+}
+
+/// Курсор в клиентских координатах главного окна (физические пиксели). Нужен, пока файлы
+/// тянут из Проводника: мышь тогда захвачена Проводником, и окно не знает, где курсор.
+/// `None` — не Windows или окна нет.
+pub fn cursor_in_window() -> Option<(f32, f32)> {
+    #[cfg(windows)]
+    {
+        crate::win::window::cursor_in_window()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// Ctrl, Shift, Alt и правая кнопка прямо сейчас (см. [`DragKeys`]).
+pub fn drag_keys() -> DragKeys {
+    #[cfg(windows)]
+    {
+        crate::win::window::drag_keys()
+    }
+    #[cfg(not(windows))]
+    {
+        DragKeys::default()
+    }
+}
+
 /// Время двойного щелчка из настроек Windows (по умолчанию 500 мс).
 pub fn double_click_time() -> std::time::Duration {
     #[cfg(windows)]
