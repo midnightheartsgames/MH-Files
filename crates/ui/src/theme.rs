@@ -137,3 +137,22 @@ pub fn refresh_accent(ctx: &egui::Context) {
         style.visuals.hyperlink_color = accent;
     });
 }
+
+/// Цвет давности даты: `t` от 0 (только что, `new`) до 1 (давно, `old`). Оттенок идёт по
+/// кругу кратчайшим путём — между красным и зелёным получаются оранжевый и жёлтый, а не
+/// бурый, как при смешивании RGB.
+pub fn age_color(new: [u8; 3], old: [u8; 3], t: f32) -> Color32 {
+    use eframe::egui::ecolor::Hsva;
+    let a = Hsva::from(Color32::from_rgb(new[0], new[1], new[2]));
+    let b = Hsva::from(Color32::from_rgb(old[0], old[1], old[2]));
+    let t = t.clamp(0.0, 1.0);
+    let mut dh = b.h - a.h;
+    if dh > 0.5 {
+        dh -= 1.0;
+    } else if dh < -0.5 {
+        dh += 1.0;
+    }
+    let h = (a.h + dh * t).rem_euclid(1.0);
+    let lerp = |x: f32, y: f32| x + (y - x) * t;
+    Color32::from(Hsva::new(h, lerp(a.s, b.s), lerp(a.v, b.v), 1.0))
+}

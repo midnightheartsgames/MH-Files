@@ -194,6 +194,12 @@ pub struct Appearance {
     pub system_icons: bool,
     /// Свой заголовок окна со вкладками вместо системного.
     pub custom_title_bar: bool,
+    /// Цветной кружок у даты изменения: давность от «только что» до «давно».
+    pub age_dots: bool,
+    /// Цвет только что изменённого.
+    pub age_new: [u8; 3],
+    /// Цвет изменённого давно (год и больше).
+    pub age_old: [u8; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -262,6 +268,9 @@ pub struct Favorite {
 }
 
 pub const ACCENT: [u8; 3] = [0x3F, 0xD0, 0xD8];
+/// Давность даты по умолчанию: только что — красный, давно — зелёный.
+pub const AGE_NEW: [u8; 3] = [0xE8, 0x5C, 0x5C];
+pub const AGE_OLD: [u8; 3] = [0x4C, 0xC3, 0x8A];
 
 impl Default for Settings {
     fn default() -> Settings {
@@ -297,6 +306,9 @@ impl Default for Appearance {
             animations: true,
             system_icons: true,
             custom_title_bar: true,
+            age_dots: true,
+            age_new: AGE_NEW,
+            age_old: AGE_OLD,
         }
     }
 }

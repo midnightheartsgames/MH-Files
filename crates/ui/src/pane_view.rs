@@ -1372,9 +1372,16 @@ pub(crate) fn item(
                 } else {
                     format::date_full(modified)
                 };
-                let galley = elided(ui, &text, font.clone(), secondary, x1 - x0 - 12.0);
+                // Кружок давности: красный — только что, зелёный — давно.
+                let mut left = x0 + 8.0;
+                if let Some(color) = age_dot_color(app, modified) {
+                    let radius = (row_icon(app, rect.height()) * 0.2).clamp(3.0, 5.0);
+                    painter.circle_filled(pos2(left + radius, rect.center().y), radius, color);
+                    left += radius * 2.0 + 6.0;
+                }
+                let galley = elided(ui, &text, font.clone(), secondary, x1 - left - 4.0);
                 painter.galley(
-                    pos2(x0 + 8.0, rect.center().y - galley.size().y / 2.0),
+                    pos2(left, rect.center().y - galley.size().y / 2.0),
                     galley,
                     secondary,
                 );
@@ -1579,6 +1586,15 @@ pub(crate) fn item(
     let many = tab.selection.len() > 1;
     let is_dir = entry.is_dir();
     response.context_menu(|ui| item_menu(ui, app, is_dir, many, tab.targets()));
+}
+
+/// Цвет кружка давности для даты; `None` — кружки выключены в настройках.
+pub(crate) fn age_dot_color(app: &FilesApp, time: std::time::SystemTime) -> Option<Color32> {
+    let look = &app.settings.appearance;
+    look.age_dots.then(|| {
+        let t = format::age(time, std::time::SystemTime::now());
+        theme::age_color(look.age_new, look.age_old, t)
+    })
 }
 
 /// Имя для показа: без расширения, если так настроено.

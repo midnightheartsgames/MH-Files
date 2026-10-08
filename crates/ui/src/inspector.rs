@@ -257,10 +257,12 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
                 );
             }
             if let Some(time) = entry.modified {
-                field(ui, "Изменён", &format::date_full(time));
+                let dot = crate::pane_view::age_dot_color(app, time);
+                dated_field(ui, "Изменён", &format::date_full(time), dot);
             }
             if let Some(time) = entry.created {
-                field(ui, "Создан", &format::date_full(time));
+                let dot = crate::pane_view::age_dot_color(app, time);
+                dated_field(ui, "Создан", &format::date_full(time), dot);
             }
             let mut attributes = Vec::new();
             if entry.attributes.readonly() {
@@ -309,6 +311,27 @@ fn field(ui: &mut Ui, label: &str, value: &str) {
         )
         .wrap(),
     );
+    ui.add_space(4.0);
+}
+
+/// Поле с датой и кружком давности слева от неё.
+fn dated_field(ui: &mut Ui, label: &str, value: &str, dot: Option<egui::Color32>) {
+    let Some(color) = dot else {
+        field(ui, label, value);
+        return;
+    };
+    ui.label(RichText::new(label).font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 16.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 4.0, color);
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(value).font(theme::regular(14.0)).color(theme::TEXT_PRIMARY),
+            )
+            .wrap(),
+        );
+    });
     ui.add_space(4.0);
 }
 
