@@ -27,7 +27,7 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
 
     // Фон — первым: кнопки и поле поиска лежат поверх и забирают свои щелчки.
     let background = ui.interact(rect, Id::new("titlebar"), Sense::click_and_drag());
-    if background.double_clicked() {
+    if crate::widgets::double_clicked(&background) {
         ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
     } else if background.drag_started_by(egui::PointerButton::Primary) {
         ctx.send_viewport_cmd(ViewportCommand::StartDrag);

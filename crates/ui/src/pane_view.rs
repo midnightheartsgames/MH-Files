@@ -1571,7 +1571,9 @@ pub(crate) fn item(
         }
         tab.selection.click(&tab.listing, row, mods);
     }
-    if response.double_clicked()
+    let double = widgets::double_clicked(&response);
+    // Тройной у egui — просто быстрый щелчок вслед: переименование он не начинает.
+    if double
         || response.triple_clicked()
         || response.drag_started()
         || response.secondary_clicked()
@@ -1585,7 +1587,7 @@ pub(crate) fn item(
         slow.due = Some(std::time::Instant::now() + double_click_time());
         ui.ctx().request_repaint_after(double_click_time());
     }
-    if response.double_clicked() && !renaming {
+    if double && !renaming {
         tab.selection.select_only(path.clone());
         app.actions.push(Action::FocusPane(pane));
         app.actions.push(Action::Run(CommandId::Open));

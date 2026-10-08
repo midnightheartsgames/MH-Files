@@ -1783,6 +1783,7 @@ fn set_owner_window(cc: &eframe::CreationContext<'_>) {
 
 impl eframe::App for FilesApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        crate::widgets::track_double_click(ui.ctx());
         self.frame(ui);
         if ui.ctx().input(|i| i.viewport().close_requested()) {
             self.save_session_if_changed(true);
