@@ -19,6 +19,7 @@ mod inspector;
 mod operations;
 mod palette;
 mod pane_view;
+mod popup;
 mod preview_ui;
 mod quick;
 mod settings_window;

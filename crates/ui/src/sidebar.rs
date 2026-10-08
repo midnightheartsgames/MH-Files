@@ -165,6 +165,7 @@ fn saved_searches(ui: &mut Ui, app: &mut FilesApp) {
             app.actions.push(Action::Open { location: location.clone(), target: Target::NewTab });
         }
         response.on_hover_text(&saved.query).context_menu(|ui| {
+            crate::popup::compact(ui.style_mut());
             ui.set_min_width(200.0);
             if ui.button("Открыть в новой вкладке").clicked() {
                 app.actions.push(Action::Open { location, target: Target::NewTab });
@@ -285,14 +286,16 @@ fn drive_row(
 /// Место, на которое бросают файлы, чтобы удалить их в корзину (путём не бывает).
 pub const RECYCLE_BIN: &str = "::recycle-bin";
 
-/// Корзина под дисками: сколько в ней; щелчок открывает её окно, бросок — удаляет туда.
+/// Корзина под дисками: сколько в ней; щелчок открывает её во вкладке, бросок — удаляет туда.
 fn recycle_row(ui: &mut Ui, app: &mut FilesApp) {
     let bin = app.recycle_bin;
     let full = bin.is_some_and(|b| b.items > 0);
     let right =
         bin.map(|b| if b.items == 0 { "пусто".to_string() } else { format::size(b.bytes) });
     let hover = app.drop_hover.as_deref() == Some(Path::new(RECYCLE_BIN));
-    let response = row(ui, |p, r, c| icons::trash(p, r, c, full), "Корзина", right, false, hover);
+    let selected = app.tab().location == Location::RecycleBin;
+    let response =
+        row(ui, |p, r, c| icons::trash(p, r, c, full), "Корзина", right, selected, hover);
     app.drop_zones.push(DropZone {
         rect: response.rect,
         dir: PathBuf::from(RECYCLE_BIN),
@@ -300,21 +303,25 @@ fn recycle_row(ui: &mut Ui, app: &mut FilesApp) {
         kind: ZoneKind::RecycleBin,
     });
     if response.clicked() {
-        app.actions.push(Action::Shell(mh_files_fs::ShellJob::OpenRecycleBin));
+        app.actions.push(Action::Open { location: Location::RecycleBin, target: Target::Current });
+    } else if response.middle_clicked() {
+        app.actions.push(Action::Open { location: Location::RecycleBin, target: Target::NewTab });
     }
     let tip = match bin {
         Some(b) if b.items > 0 => {
-            format!(
-                "{} · {} — открыть в Проводнике",
-                format::items(b.items as usize),
-                format::size(b.bytes)
-            )
+            format!("{} · {}", format::items(b.items as usize), format::size(b.bytes))
         }
         Some(_) => "Корзина пуста".to_string(),
         None => "Корзина Windows".to_string(),
     };
     response.on_hover_text(tip).context_menu(|ui| {
+        crate::popup::compact(ui.style_mut());
         ui.set_min_width(200.0);
+        if ui.button("Открыть в новой вкладке").clicked() {
+            app.actions
+                .push(Action::Open { location: Location::RecycleBin, target: Target::NewTab });
+            ui.close();
+        }
         if ui.button("Открыть в Проводнике").clicked() {
             app.actions.push(Action::Shell(mh_files_fs::ShellJob::OpenRecycleBin));
             ui.close();
@@ -376,6 +383,7 @@ fn location_menu(
     let path: PathBuf = path.to_path_buf();
     crate::shell_menu::prefetch_on_press(app, response, || MenuTarget::Items(vec![path.clone()]));
     response.context_menu(|ui| {
+        crate::popup::compact(ui.style_mut());
         ui.set_min_width(220.0);
         let location = Location::Dir(path.clone());
         if ui.button("Открыть в новой вкладке").clicked() {
@@ -499,6 +507,7 @@ fn group(ui: &mut Ui, app: &mut FilesApp, g: usize, current: Option<&Path>) {
             app.actions.push(Action::Sidebar(Edit::ToggleGroup(g)));
         }
         response.context_menu(|ui| {
+            crate::popup::compact(ui.style_mut());
             ui.set_min_width(200.0);
             if ui.button("Переименовать группу").clicked() {
                 set_renaming(

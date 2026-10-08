@@ -30,6 +30,7 @@ pub mod indexer;
 pub mod listing;
 pub mod preview;
 pub mod read;
+pub mod recycle;
 pub mod rename;
 pub mod search;
 pub mod shell;
@@ -118,6 +119,11 @@ pub enum Event {
     Drive(DriveInfo),
     /// Сколько в корзине; `None` — не узнать.
     RecycleBin(Option<mh_files_platform::recycle::BinInfo>),
+    /// Содержимое корзины для её вкладки; за ним — `ListingDone`.
+    RecycleListing {
+        ticket: Ticket,
+        items: Vec<recycle::Recycled>,
+    },
     KnownFolders(Vec<(KnownFolder, PathBuf)>),
     Image {
         key: ImageKey,
@@ -392,6 +398,27 @@ impl Workers {
                 .collect();
             workers.send(Event::ThumbnailTypes(types));
         });
+    }
+
+    /// Содержимое корзины всех дисков для вкладки «Корзина».
+    pub fn list_recycle_bin(&self, ticket: Ticket) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        self.spawn("recycle-list", move |workers| {
+            let dirs = mh_files_platform::recycle::bin_dirs();
+            let items = recycle::scan(&dirs, &token);
+            if token.is_cancelled() {
+                return;
+            }
+            workers.send(Event::RecycleListing { ticket, items });
+            let result = if cfg!(windows) || !dirs.is_empty() {
+                Ok(())
+            } else {
+                Err("корзина есть только в Windows".into())
+            };
+            workers.send(Event::ListingDone { ticket, result });
+        });
+        cancel
     }
 
     /// Узнать, сколько в корзине: она заглядывает в каждый диск — не для потока UI.

@@ -74,6 +74,9 @@ commands! {
     BatchRename => "Пакетное переименование", ["batch rename", "mass rename"], ["Ctrl+Shift+R"];
     Delete => "Удалить в корзину", ["delete", "trash", "recycle"], ["Delete"];
     DeletePermanent => "Удалить насовсем", ["delete permanently", "shred"], ["Shift+Delete"];
+    Restore => "Восстановить", ["restore", "undelete", "вернуть из корзины"], [];
+    OpenRecycleBin => "Корзина", ["recycle bin", "trash", "удалённые"], [];
+    EmptyRecycleBin => "Очистить корзину", ["empty recycle bin", "empty trash"], [];
     NewFolder => "Новая папка", ["new folder", "mkdir"], ["Ctrl+Shift+N"];
     NewFile => "Новый текстовый файл", ["new file", "touch", "text document"], ["Ctrl+Alt+N"];
     Properties => "Свойства", ["properties"], ["Alt+Enter"];
@@ -141,6 +144,7 @@ impl CommandId {
                 | BatchRename
                 | Delete
                 | DeletePermanent
+                | Restore
                 | Properties
                 | RevealInExplorer
                 | QuickLook

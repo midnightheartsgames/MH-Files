@@ -354,6 +354,7 @@ impl FilesApp {
         let has_targets = !tab.targets().is_empty();
         let has_dir = tab.dir().is_some();
         let in_archive = matches!(tab.location, Location::Archive { .. });
+        let in_recycle = tab.location == Location::RecycleBin;
         let archive_selected = tab.targets().iter().any(|p| {
             p.file_name()
                 .is_some_and(|n| mh_files_fs::archive::is_archive_name(&n.to_string_lossy()))
@@ -368,6 +369,18 @@ impl FilesApp {
             {
                 false
             }
+            // В корзине объекты — не на своих местах: их можно вернуть или стереть, не больше.
+            Restore => in_recycle && has_targets,
+            FindDuplicates | SortFolder | AddFavorite | WindowsMenu | FolderSizes | Extract
+            | ExtractHere
+                if in_recycle =>
+            {
+                false
+            }
+            _ if in_recycle && command.needs_targets() => {
+                has_targets && matches!(command, Delete | DeletePermanent | CopyPath | CopyName)
+            }
+            OpenRecycleBin | EmptyRecycleBin => cfg!(windows),
             Extract => in_archive || archive_selected,
             ExtractHere => archive_selected && !in_archive,
             FindDuplicates => has_dir || has_targets && !in_archive,
@@ -603,6 +616,27 @@ impl FilesApp {
                 let siblings = batch::siblings(tab);
                 self.batch = Some(batch::State::new(items, siblings));
             }
+            // Из корзины удаляют только насовсем: и объект, и его сведения.
+            Delete | DeletePermanent if self.tab().location == Location::RecycleBin => {
+                let (shown, files) = self.recycled_files(&targets);
+                if !files.is_empty() {
+                    self.dialog = Some(dialogs::Dialog::delete_recycled(shown, files));
+                }
+            }
+            Restore => {
+                let items: Vec<(PathBuf, PathBuf)> = self
+                    .tab()
+                    .recycled
+                    .iter()
+                    .flat_map(|map| targets.iter().filter_map(|path| map.get(path)))
+                    .map(|item| (item.data.clone(), item.original.clone()))
+                    .collect();
+                if !items.is_empty() {
+                    self.submit(FileOp::Restore { items }, None);
+                }
+            }
+            OpenRecycleBin => self.open_location(Location::RecycleBin, Target::Current),
+            EmptyRecycleBin => workers.shell(ShellJob::EmptyRecycleBin),
             Delete => {
                 if self.settings.files.confirm_recycle {
                     self.dialog = Some(dialogs::Dialog::delete(targets, false));
@@ -765,6 +799,10 @@ impl FilesApp {
     /// Открыть объекты: папки — переходом, файлы — программой по умолчанию.
     fn open_targets(&mut self, targets: &[PathBuf], target: Target) {
         if self.open_in_archive(targets, target) {
+            return;
+        }
+        if self.tab().location == Location::RecycleBin {
+            self.set_status("из корзины не открыть — сначала «Восстановить»", Level::Info);
             return;
         }
         let tab = self.tab();
@@ -953,6 +991,20 @@ impl FilesApp {
         // Как в Проводнике: на тот же диск — перемещение, на другой — копирование.
         let copy = copy.unwrap_or_else(|| sources.iter().any(|p| root_of(p) != root_of(&dest)));
         self.start_transfer(Transfer { sources, dest, copy }, None);
+    }
+
+    /// Удалённые объекты вкладки корзины: прежние пути (для вопроса) и файлы в корзине —
+    /// сам объект и его сведения.
+    fn recycled_files(&self, targets: &[PathBuf]) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let Some(map) = &self.tab().recycled else { return Default::default() };
+        let mut shown = Vec::new();
+        let mut files = Vec::new();
+        for item in targets.iter().filter_map(|path| map.get(path)) {
+            shown.push(item.original.clone());
+            files.push(item.data.clone());
+            files.push(item.info.clone());
+        }
+        (shown, files)
     }
 
     /// Бросок в zip: копирование в «сжатую папку» Проводника (`IFileOperation`) — Windows

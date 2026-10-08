@@ -16,6 +16,8 @@ pub enum Dialog {
     Delete {
         paths: Vec<PathBuf>,
         permanent: bool,
+        /// Что удаляется на самом деле, если не `paths`: файлы объектов в корзине.
+        files: Option<Vec<PathBuf>>,
     },
     Conflicts {
         transfer: Transfer,
@@ -24,15 +26,17 @@ pub enum Dialog {
         followup: Option<Followup>,
     },
     /// Заменить лишние копии жёсткими ссылками: `(оставляемая, лишняя, размер)`.
-    HardLinks {
-        tab: u64,
-        pairs: Vec<(PathBuf, mh_files_core::duplicates::Member, u64)>,
-    },
+    HardLinks { tab: u64, pairs: Vec<(PathBuf, mh_files_core::duplicates::Member, u64)> },
 }
 
 impl Dialog {
     pub fn delete(paths: Vec<PathBuf>, permanent: bool) -> Dialog {
-        Dialog::Delete { paths, permanent }
+        Dialog::Delete { paths, permanent, files: None }
+    }
+
+    /// Стереть из корзины: в вопросе — прежние пути, удаляются `files` в корзине.
+    pub fn delete_recycled(shown: Vec<PathBuf>, files: Vec<PathBuf>) -> Dialog {
+        Dialog::Delete { paths: shown, permanent: true, files: Some(files) }
     }
 
     /// По умолчанию — «Заменить», как в первом вопросе Проводника.
@@ -59,8 +63,8 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
 }
 
 fn delete(ctx: &egui::Context, app: &mut FilesApp) {
-    let Some(Dialog::Delete { paths, permanent }) = &app.dialog else { return };
-    let (paths, permanent) = (paths.clone(), *permanent);
+    let Some(Dialog::Delete { paths, permanent, files }) = &app.dialog else { return };
+    let (paths, permanent, files) = (paths.clone(), *permanent, files.clone());
     let mut result: Option<bool> = None;
     let modal = egui::Modal::new(Id::new("confirm-delete")).show(ctx, |ui| {
         ui.set_width(520.0);
@@ -112,6 +116,7 @@ fn delete(ctx: &egui::Context, app: &mut FilesApp) {
     if let Some(confirmed) = result {
         app.dialog = None;
         if confirmed {
+            let paths = files.unwrap_or(paths);
             app.submit(FileOp::Delete { paths, permanent }, None);
         }
     }

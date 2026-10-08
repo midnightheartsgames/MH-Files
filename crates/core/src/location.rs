@@ -33,6 +33,8 @@ pub enum Location {
     Sort {
         root: PathBuf,
     },
+    /// Корзина Windows: удалённое со всех дисков, с прежними папками.
+    RecycleBin,
 }
 
 /// Звено строки пути.
@@ -46,6 +48,7 @@ pub const COMPUTER_TITLE: &str = "Этот компьютер";
 pub const INDEX_TITLE: &str = "Поиск по дискам";
 pub const DUPLICATES_TITLE: &str = "Дубликаты";
 pub const SORT_TITLE: &str = "Разложить";
+pub const RECYCLE_BIN_TITLE: &str = "Корзина";
 
 impl Location {
     /// Папка, в которую можно вставлять и создавать. У поиска, архива и «Этого компьютера»
@@ -61,7 +64,10 @@ impl Location {
     pub fn is_search(&self) -> bool {
         matches!(
             self,
-            Location::Search { .. } | Location::Index { .. } | Location::Duplicates { .. }
+            Location::Search { .. }
+                | Location::Index { .. }
+                | Location::Duplicates { .. }
+                | Location::RecycleBin
         )
     }
 
@@ -148,6 +154,7 @@ impl Location {
                 _ => DUPLICATES_TITLE.to_string(),
             },
             Location::Sort { root } => format!("{SORT_TITLE}: {}", path_label(root)),
+            Location::RecycleBin => RECYCLE_BIN_TITLE.to_string(),
         }
     }
 
@@ -173,6 +180,7 @@ impl Location {
                 _ => Some(Location::Computer),
             },
             Location::Sort { root } => Some(Location::Dir(root.clone())),
+            Location::RecycleBin => Some(Location::Computer),
         }
     }
 
@@ -196,6 +204,10 @@ impl Location {
                 archive.parent().unwrap_or(archive)
             }
             Location::Sort { root } => root,
+            Location::RecycleBin => {
+                crumbs.push(Crumb { label: RECYCLE_BIN_TITLE.into(), location: self.clone() });
+                return crumbs;
+            }
             Location::Duplicates { roots } => match roots.as_slice() {
                 [root] => root,
                 _ => {

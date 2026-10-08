@@ -21,6 +21,19 @@ pub fn query() -> Option<BinInfo> {
     }
 }
 
+/// Папки корзины текущего пользователя на дисках: `X:\$Recycle.Bin\<SID>`. Каждый диск
+/// спрашивается, есть ли она там, — только из фонового потока.
+pub fn bin_dirs() -> Vec<std::path::PathBuf> {
+    #[cfg(windows)]
+    {
+        crate::win::recycle::bin_dirs()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 /// Окно корзины в Проводнике: там её содержимое и «Восстановить».
 pub fn open() -> Result<(), String> {
     #[cfg(windows)]

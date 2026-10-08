@@ -19,6 +19,51 @@ pub fn query() -> Option<BinInfo> {
     Some(BinInfo { items: info.i64NumItems.max(0) as u64, bytes: info.i64Size.max(0) as u64 })
 }
 
+pub fn bin_dirs() -> Vec<std::path::PathBuf> {
+    use crate::drives::DriveKind;
+    let Some(sid) = user_sid() else { return Vec::new() };
+    crate::drives::drive_roots()
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, DriveKind::Fixed | DriveKind::Removable))
+        .map(|(root, _)| root.join("$Recycle.Bin").join(&sid))
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
+/// SID пользователя процесса строкой (`S-1-5-21-…`): так называется его папка в корзине.
+fn user_sid() -> Option<String> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows::core::PWSTR;
+
+    // SAFETY: маркер закрывается в конце; буфер живёт, пока читается SID из него; строку SID
+    // выделяет система — она освобождается LocalFree.
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).ok()?;
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(8)];
+        let read = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        read.ok()?;
+        let user = &*(buffer.as_ptr() as *const TOKEN_USER);
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut text).ok()?;
+        let sid = text.to_string().ok();
+        let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+        sid
+    }
+}
+
 pub fn open() -> Result<(), String> {
     let _com = Apartment::sta();
     let mut info = SHELLEXECUTEINFOW {
