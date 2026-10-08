@@ -35,9 +35,18 @@ pub struct State {
     host: PreviewHost,
     /// Где в этом кадре должен стоять обработчик: путь и место в точках.
     handler_rect: Option<(PathBuf, egui::Rect)>,
+    /// Размер выбранной папки считается сам: какой папки и как отменить.
+    sizing: Option<(PathBuf, CancelToken)>,
 }
 
 impl State {
+    /// Размер папки посчитан.
+    pub fn size_done(&mut self, path: &std::path::Path) {
+        if self.sizing.as_ref().is_some_and(|(p, _)| p == path) {
+            self.sizing = None;
+        }
+    }
+
     pub fn on_preview(
         &mut self,
         ctx: &egui::Context,
@@ -99,6 +108,52 @@ pub fn follow(app: &mut FilesApp) {
     state.is_dir = is_dir;
     state.page = 0;
     request(app);
+    request_size(app);
+}
+
+/// Размер выбранной папки — сразу: из индекса поиска мгновенно, иначе обходом на своих
+/// дисках. На сетевых дисках и приводах обхода нет — там остаётся кнопка.
+fn request_size(app: &mut FilesApp) {
+    if let Some((_, cancel)) = app.inspector.sizing.take() {
+        cancel.cancel();
+    }
+    let Some(path) = app.inspector.path.clone() else { return };
+    if !app.inspector.is_dir
+        || !app.settings.preview.inspector_folder_size
+        || matches!(app.tab().location, Location::Archive { .. })
+        // Корень диска — это весь диск: его занятое место видно и так.
+        || path.parent().is_none()
+    {
+        return;
+    }
+    let network = path.components().next().is_some_and(|c| {
+        matches!(
+            c,
+            std::path::Component::Prefix(p)
+                if matches!(p.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..))
+        )
+    });
+    let local = !network
+        && app
+            .drives
+            .iter()
+            .filter(|d| path.starts_with(&d.root))
+            .max_by_key(|d| d.root.as_os_str().len())
+            .is_none_or(|d| {
+                d.ready
+                    && matches!(
+                        d.kind,
+                        mh_files_platform::drives::DriveKind::Fixed
+                            | mh_files_platform::drives::DriveKind::Removable
+                            | mh_files_platform::drives::DriveKind::Ram
+                    )
+            });
+    let ticket = Ticket { owner: crate::app::OWNER_INSPECTOR_SIZE, generation: 0 };
+    let cancel = app.indexer.folder_sizes(ticket, vec![path.clone()], local);
+    // Без обхода ответа может и не быть (тома нет в индексе) — тогда остаётся кнопка.
+    if local {
+        app.inspector.sizing = Some((path, cancel));
+    }
 }
 
 /// Попросить предпросмотр того, что выбрано, с текущей страницей.
@@ -359,7 +414,9 @@ fn folder_size(ui: &mut Ui, app: &mut FilesApp, path: &std::path::Path) {
             size.dirs
         );
         field(ui, "Размер целиком", &text);
-    } else if app.sizes_pending.contains(path) {
+    } else if app.sizes_pending.contains(path)
+        || app.inspector.sizing.as_ref().is_some_and(|(p, _)| p == path)
+    {
         field(ui, "Размер целиком", "считается…");
     } else if ui.button("Посчитать размер").clicked() {
         app.actions.push(Action::FolderSizes(vec![path.to_path_buf()]));

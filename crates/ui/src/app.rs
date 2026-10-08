@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use eframe::egui::{self, Color32, CornerRadius, Id, Rect, Sense, Stroke, UiBuilder, vec2};
+use mh_files_core::Entry;
 use mh_files_core::layout::{LayoutNode, MAX_RATIO, MIN_RATIO, PaneId, SplitDirection};
 use mh_files_core::listing::LoadState;
 use mh_files_core::listing::ViewOptions;
@@ -39,6 +40,10 @@ pub const OWNER_CRUMBS: u64 = u64::MAX - 4;
 pub const OWNER_BATCH: u64 = u64::MAX - 5;
 pub const OWNER_SIZES: u64 = u64::MAX - 6;
 pub const OWNER_COLUMNS: u64 = u64::MAX - 7;
+/// Размеры вложенных папок в списке — сами, из индекса.
+pub const OWNER_AUTO_SIZES: u64 = u64::MAX - 10;
+/// Размер выбранной папки в Инспекторе — сам.
+pub const OWNER_INSPECTOR_SIZE: u64 = u64::MAX - 11;
 
 /// Как долго ждать второй шаг последовательности (`Alt+G` → `D`).
 const CHORD_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -285,6 +290,8 @@ pub struct FilesApp {
     pub folder_sizes: HashMap<PathBuf, DirSize>,
     pub sizes_pending: HashSet<PathBuf>,
     sizes_cancel: Option<CancelToken>,
+    /// Размеры вложенных папок открытой папки — из индекса.
+    auto_sizes_cancel: Option<CancelToken>,
     sizes_generation: u64,
     pub pane_regions: Vec<PaneRegion>,
     /// Доступность команд на начало кадра: меню рисуются, пока панель вынута из списка.
@@ -375,6 +382,7 @@ impl FilesApp {
             folder_sizes: HashMap::new(),
             sizes_pending: HashSet::new(),
             sizes_cancel: None,
+            auto_sizes_cancel: None,
             sizes_generation: 0,
             pane_regions: Vec::new(),
             availability: HashMap::new(),
@@ -689,6 +697,24 @@ impl FilesApp {
                         self.indexer.observe(&dir, tab.listing.all());
                         let took = tab.load_started.elapsed();
                         self.diag.listing(dir, tab.listing.total_len(), took);
+                        // Размеры вложенных папок — из индекса, без обращения к диску.
+                        if self.settings.files.auto_folder_sizes {
+                            let dirs: Vec<PathBuf> = tab
+                                .listing
+                                .all()
+                                .iter()
+                                .filter(|e| e.is_dir() && !e.attributes.reparse())
+                                .map(Entry::path)
+                                .collect();
+                            if !dirs.is_empty() {
+                                let ticket = Ticket { owner: OWNER_AUTO_SIZES, generation: 0 };
+                                if let Some(cancel) = self.auto_sizes_cancel.take() {
+                                    cancel.cancel();
+                                }
+                                self.auto_sizes_cancel =
+                                    Some(self.indexer.folder_sizes(ticket, dirs, false));
+                            }
+                        }
                     }
                 }
             }
@@ -901,15 +927,20 @@ impl FilesApp {
         self.sizes_cancel = Some(self.workers.folder_sizes(ticket, dirs));
     }
 
+    /// Размер папки посчитан — по Ctrl+Shift+S, сам из индекса для списка или для
+    /// Инспектора. Размер верен в любом случае; поколение важно только для «считается…».
     fn on_folder_size(&mut self, ticket: Ticket, path: PathBuf, size: DirSize) {
-        if ticket.generation != self.sizes_generation {
-            return;
+        if ticket.owner == OWNER_SIZES && ticket.generation == self.sizes_generation {
+            self.sizes_pending.remove(&path);
         }
-        self.sizes_pending.remove(&path);
+        if ticket.owner == OWNER_INSPECTOR_SIZE {
+            self.inspector.size_done(&path);
+        }
         self.folder_sizes.insert(path.clone(), size);
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             if tab.listing.set_dir_size(&path, size.bytes) {
-                tab.listing.refresh();
+                // Пачка размеров из индекса — пересортировка одна, в ближайший такт.
+                tab.mark_dirty();
             }
         }
     }

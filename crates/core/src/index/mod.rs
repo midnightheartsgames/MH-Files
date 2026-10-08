@@ -218,6 +218,25 @@ impl VolumeIndex {
         self.children(parent).find(|&c| self.lower_name(c) == lower.as_bytes())
     }
 
+    /// Сумма поддерева узла: байты, файлы, папки (сам узел не в счёт). Ссылки и junction в
+    /// индекс не попадают — их содержимое не считается дважды.
+    pub fn subtree_size(&self, node: u32) -> (u64, u64, u64) {
+        let (mut bytes, mut files, mut dirs) = (0u64, 0u64, 0u64);
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            for child in self.children(current) {
+                if self.is_dir(child) {
+                    dirs += 1;
+                    stack.push(child);
+                } else {
+                    files += 1;
+                    bytes += self.size[child as usize];
+                }
+            }
+        }
+        (bytes, files, dirs)
+    }
+
     /// Узел по полному пути; `None` — путь не на этом томе или его нет в индексе.
     pub fn lookup(&self, path: &Path) -> Option<u32> {
         let relative = path.strip_prefix(&self.root).ok()?;
@@ -652,6 +671,16 @@ pub(crate) mod tests {
         index.add(photos, "secret.png", hidden);
         index.add(ROOT, "notes.txt", file(10, 1_000));
         index
+    }
+
+    #[test]
+    fn subtree_sizes_sum_files_below() {
+        let index = sample();
+        let models = index.lookup(Path::new("/d/Models")).unwrap();
+        assert_eq!(index.subtree_size(models), ((4 << 30) + (7 << 30), 2, 1));
+        let (bytes, files, dirs) = index.subtree_size(ROOT);
+        assert_eq!((files, dirs), (5, 3));
+        assert_eq!(bytes, (4 << 30) + (7 << 30) + (2 << 20) + 1 + 10);
     }
 
     fn names(index: &VolumeIndex, text: &str) -> Vec<String> {

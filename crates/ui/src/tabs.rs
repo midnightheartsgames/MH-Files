@@ -636,6 +636,11 @@ impl Tab {
     }
 
     /// Досортировать загружаемый список не чаще раза в REFRESH_EVERY.
+    /// Список изменился (например, размер папки): пересортировать в ближайший такт.
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
     pub fn tick(&mut self) -> bool {
         if self.dirty && self.last_refresh.elapsed() >= REFRESH_EVERY.max(self.refresh_cost * 8) {
             let started = Instant::now();

@@ -257,6 +257,36 @@ impl Indexer {
         request_sync(&self.shared);
     }
 
+    /// Размеры папок: из индекса сразу и без обращения к диску, если том проиндексирован;
+    /// иначе, при `walk`, — обходом папки (в фоне, с низким приоритетом). Ответы —
+    /// [`Event::FolderSize`]; папку, которую не посчитать, пропускает.
+    pub fn folder_sizes(&self, ticket: Ticket, dirs: Vec<PathBuf>, walk: bool) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        let shared = self.shared.clone();
+        self.shared.workers.clone().spawn("folder-sizes", move |workers| {
+            let mut background = false;
+            for path in dirs {
+                if token.is_cancelled() {
+                    return;
+                }
+                let size = match from_index(&shared, &path) {
+                    Some(size) => size,
+                    None if walk => {
+                        if !std::mem::replace(&mut background, true) {
+                            volume::background_thread();
+                        }
+                        let Some(size) = crate::sizes::dir_size(&path, &token) else { return };
+                        size
+                    }
+                    None => continue,
+                };
+                workers.send(Event::FolderSize { ticket, path, size });
+            }
+        });
+        cancel
+    }
+
     /// Обойти все тома заново.
     pub fn rescan(&self) {
         for volume in self.shared.state.lock().volumes.iter() {
@@ -858,6 +888,32 @@ fn run(shared: &Arc<Shared>, volume: &Arc<Volume>, jobs: &Receiver<Job>, rescan_
             }
         }
     }
+}
+
+/// Размер папки по индексу тома: том готов, папка в индексе и не исключена. Исключённое
+/// внутри неё не посчитано — размер помечается неполным.
+fn from_index(shared: &Shared, path: &Path) -> Option<crate::sizes::DirSize> {
+    let volume = {
+        let state = shared.state.lock();
+        state
+            .volumes
+            .iter()
+            .filter(|v| path.starts_with(&v.root))
+            .max_by_key(|v| v.root.as_os_str().len())
+            .cloned()?
+    };
+    if !matches!(volume.status.lock().state, VolumeState::Ready) || volume.excluded(path) {
+        return None;
+    }
+    let key = lower(path);
+    let partial = volume.exclude.iter().any(|e| e.starts_with(&key));
+    let index = volume.index.read();
+    let node = index.lookup(path)?;
+    if !index.is_dir(node) {
+        return None;
+    }
+    let (bytes, files, dirs) = index.subtree_size(node);
+    Some(crate::sizes::DirSize { bytes, files, dirs, partial })
 }
 
 fn search(

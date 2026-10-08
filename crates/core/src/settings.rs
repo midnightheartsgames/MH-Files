@@ -215,6 +215,8 @@ pub struct Files {
     pub relative_dates: bool,
     /// Пункты меню Проводника (7-Zip, Git, «Отправить»…) прямо в своём контекстном меню.
     pub windows_menu_items: bool,
+    /// Размеры вложенных папок в списке — сразу, из индекса поиска по дискам.
+    pub auto_folder_sizes: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -250,6 +252,8 @@ pub struct Preview {
     pub handlers: bool,
     /// Видео и звук играют прямо в быстром просмотре (Media Foundation).
     pub media: bool,
+    /// Размер выбранной папки в Инспекторе — сразу, без кнопки.
+    pub inspector_folder_size: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -323,6 +327,7 @@ impl Default for Files {
             confirm_recycle: false,
             relative_dates: true,
             windows_menu_items: true,
+            auto_folder_sizes: true,
         }
     }
 }
@@ -348,6 +353,7 @@ impl Default for Preview {
             image_limit_mb: 64,
             handlers: true,
             media: true,
+            inspector_folder_size: true,
         }
     }
 }

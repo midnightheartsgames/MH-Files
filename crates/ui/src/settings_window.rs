@@ -527,6 +527,17 @@ fn files(ui: &mut Ui, s: &mut Settings) {
         switch_row(ui, "Папки первыми", None, &mut s.files.folders_first);
         switch_row(ui, "Даты «Сегодня», «Вчера»", None, &mut s.files.relative_dates);
     });
+    card(ui, "Размеры папок", |ui| {
+        switch_row(
+            ui,
+            "Размеры папок в списке сразу",
+            Some(
+                "Из индекса поиска по дискам — мгновенно и без обращения к диску. Где индекса \
+                 нет — по Ctrl+Shift+S.",
+            ),
+            &mut s.files.auto_folder_sizes,
+        );
+    });
     card(ui, "Контекстное меню", |ui| {
         switch_row(
             ui,
@@ -555,6 +566,17 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
             "Эскизы картинок и видео",
             Some("Из кэша эскизов Windows; не тормозят переход по папкам."),
             &mut s.preview.thumbnails,
+        );
+    });
+    card(ui, "Инспектор", |ui| {
+        switch_row(
+            ui,
+            "Размер выбранной папки сразу",
+            Some(
+                "Из индекса поиска, иначе подсчётом на своих дисках. На сетевых дисках — по \
+                 кнопке.",
+            ),
+            &mut s.preview.inspector_folder_size,
         );
     });
     card(ui, "Обработчики Windows", |ui| {
