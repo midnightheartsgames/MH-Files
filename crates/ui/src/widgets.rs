@@ -204,3 +204,107 @@ pub fn section_label(ui: &mut Ui, text: &str) {
             .extra_letter_spacing(1.2),
     );
 }
+
+/// Учёт щелчков для [`double_clicked`]: последний непарный щелчок и пара ли в этом кадре.
+#[derive(Clone, Copy, Default)]
+struct ClickPairs {
+    last: Option<(f64, egui::Pos2)>,
+    double: bool,
+}
+
+/// Считает щелчки левой кнопкой — раз в кадр, до интерфейса.
+///
+/// egui считает щелчки до трёх: щелчок вскоре после двойного (и щелчок в пределах двух
+/// интервалов двойного щелчка от позапрошлого) — «тройной», и `Response::double_clicked` на нём
+/// ложно. Выделить объект и тут же дважды щёлкнуть по нему или быстро идти вглубь папок —
+/// и открытие мышью молча не срабатывало. Здесь щелчки идут парами, как в Windows: второй
+/// щелчок рядом и вовремя — двойной, следующий снова первый.
+pub fn track_double_click(ctx: &egui::Context) {
+    let id = egui::Id::new("click-pairs");
+    let (delay, distance) =
+        ctx.options(|o| (o.input_options.max_double_click_delay, o.input_options.max_click_dist));
+    let (time, clicks) = ctx.input(|i| {
+        let clicks: Vec<egui::Pos2> = if i.pointer.button_clicked(egui::PointerButton::Primary) {
+            i.events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } => Some(*pos),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (i.time, clicks)
+    });
+    ctx.data_mut(|d| {
+        let state = d.get_temp_mut_or_default::<ClickPairs>(id);
+        state.double = false;
+        for pos in clicks {
+            let paired = state
+                .last
+                .is_some_and(|(at, from)| time - at < delay && from.distance(pos) <= distance);
+            state.double = paired;
+            state.last = if paired { None } else { Some((time, pos)) };
+        }
+    });
+}
+
+/// Двойной щелчок левой кнопкой по виджету (см. [`track_double_click`]); вместо
+/// `Response::double_clicked`, которое на третьем быстром щелчке подряд ложно.
+pub fn double_clicked(response: &Response) -> bool {
+    response.clicked_by(egui::PointerButton::Primary)
+        && response.ctx.data(|d| {
+            d.get_temp::<ClickPairs>(egui::Id::new("click-pairs")).is_some_and(|s| s.double)
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Щелчки в момент `time` в одной точке; возвращает, какие из них двойные.
+    fn pairs(times: &[f64]) -> Vec<bool> {
+        let ctx = egui::Context::default();
+        ctx.options_mut(|o| o.input_options.max_double_click_delay = 0.5);
+        let pos = egui::pos2(10.0, 10.0);
+        let mut doubles = Vec::new();
+        for &time in times {
+            for (offset, pressed) in [(0.0, true), (0.05, false)] {
+                let input = egui::RawInput {
+                    time: Some(time + offset),
+                    events: vec![egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    }],
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, |ui| track_double_click(ui.ctx()));
+                output.textures_delta.clear();
+            }
+            doubles.push(ctx.data(|d| {
+                d.get_temp::<ClickPairs>(egui::Id::new("click-pairs")).is_some_and(|s| s.double)
+            }));
+        }
+        doubles
+    }
+
+    #[test]
+    fn select_then_double_click_opens() {
+        // Выделить, чуть подождать и дважды щёлкнуть: у egui второй щелчок пары — «тройной».
+        assert_eq!(pairs(&[0.0, 0.6, 0.8]), [false, false, true]);
+    }
+
+    #[test]
+    fn clicks_go_in_pairs() {
+        assert_eq!(pairs(&[0.0, 0.2, 0.4, 0.6]), [false, true, false, true]);
+        assert_eq!(pairs(&[0.0, 1.0]), [false, false]);
+    }
+}

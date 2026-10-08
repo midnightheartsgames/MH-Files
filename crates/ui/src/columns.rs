@@ -306,7 +306,7 @@ fn side_column(
                 };
                 app.actions.push(action);
             }
-            if response.double_clicked() && !entry.is_dir() {
+            if crate::widgets::double_clicked(&response) && !entry.is_dir() {
                 app.actions.push(Action::Run(crate::commands::CommandId::Open));
             }
             response.on_hover_text(&entry.name);
