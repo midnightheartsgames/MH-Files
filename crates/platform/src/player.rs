@@ -4,11 +4,13 @@
 //! Вне Windows воспроизведения нет — состояние сразу с ошибкой.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Sender, unbounded};
 
 use crate::Waker;
+use crate::spectrum::Spectrum;
 
 /// Кадр видео, уже уменьшенный до нужного размера.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +49,10 @@ pub(crate) enum Command {
 pub(crate) struct Shared {
     pub(crate) state: Mutex<PlayerState>,
     pub(crate) frame: Mutex<Option<Frame>>,
+    /// Спектр звука для эквалайзера — раскладывается своим потоком.
+    pub(crate) spectrum: Mutex<Spectrum>,
+    /// Проигрыватель закрыт: фоновым потокам пора заканчивать.
+    pub(crate) stop: AtomicBool,
 }
 
 /// Проигрыватель одного файла. Останавливается и освобождает всё при уничтожении.
@@ -57,11 +63,18 @@ pub struct Player {
 
 impl Player {
     /// Открыть и сразу начать воспроизведение. `max_side` — предел стороны кадра в пикселях.
-    pub fn open(path: &Path, max_side: u32, waker: Waker) -> Player {
+    /// `spectrum` — ещё и разложить звук для эквалайзера ([`Player::levels`]).
+    pub fn open(path: &Path, max_side: u32, spectrum: bool, waker: Waker) -> Player {
         let shared = Arc::new(Shared::default());
         let (commands, receiver) = unbounded();
         #[cfg(windows)]
         {
+            if spectrum {
+                let (path, thread_shared) = (path.to_path_buf(), shared.clone());
+                let _ = std::thread::Builder::new()
+                    .name("player-spectrum".into())
+                    .spawn(move || crate::win::player::spectrum(&path, &thread_shared));
+            }
             let (path, thread_shared) = (path.to_path_buf(), shared.clone());
             let started = std::thread::Builder::new().name("player".into()).spawn(move || {
                 crate::win::player::run(&path, max_side, &thread_shared, &receiver, &waker)
@@ -72,7 +85,7 @@ impl Player {
         }
         #[cfg(not(windows))]
         {
-            let _ = (path, max_side, waker, receiver);
+            let _ = (path, max_side, spectrum, waker, receiver);
             shared.state.lock().unwrap().error =
                 Some("воспроизведение есть только в Windows".into());
         }
@@ -81,6 +94,17 @@ impl Player {
 
     pub fn state(&self) -> PlayerState {
         self.shared.state.lock().map(|state| state.clone()).unwrap_or_default()
+    }
+
+    /// Полосы эквалайзера (0..1, длиной [`crate::spectrum::BANDS`]) на секунде `seconds`;
+    /// `false` — до этого места звук ещё не разложен или разложить не вышло.
+    pub fn levels(&self, seconds: f64, out: &mut [f32]) -> bool {
+        self.shared.spectrum.lock().is_ok_and(|spectrum| spectrum.levels(seconds, out))
+    }
+
+    /// Звук разложен до конца — больше данных не будет.
+    pub fn spectrum_done(&self) -> bool {
+        self.shared.spectrum.lock().is_ok_and(|spectrum| spectrum.done)
     }
 
     /// Новый кадр с прошлого вызова.
@@ -104,5 +128,13 @@ impl Player {
     /// Громкость 0..1.
     pub fn set_volume(&self, volume: f64) {
         let _ = self.commands.send(Command::Volume(volume.clamp(0.0, 1.0)));
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        // Поток проигрывателя кончается сам, когда закрывается канал команд; разбор спектра
+        // смотрит на этот флаг.
+        self.shared.stop.store(true, Ordering::Relaxed);
     }
 }

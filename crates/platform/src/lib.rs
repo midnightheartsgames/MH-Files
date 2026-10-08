@@ -24,6 +24,7 @@ pub mod pdf;
 pub mod player;
 pub mod preview_handler;
 pub mod shell;
+pub mod spectrum;
 pub mod thumbs;
 pub mod volume;
 pub mod watch;
