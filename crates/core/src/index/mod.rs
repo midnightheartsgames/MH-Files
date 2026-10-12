@@ -558,6 +558,17 @@ impl<'a> Matcher<'a> {
                 return None;
             }
         }
+        let kind_exts = query.category.extensions();
+        if !kind_exts.is_empty() {
+            if is_dir {
+                return None;
+            }
+            let ext =
+                memchr::memrchr(b'.', name).filter(|&dot| dot > 0).map(|dot| &name[dot + 1..])?;
+            if !kind_exts.iter().any(|e| e.as_bytes() == ext) {
+                return None;
+            }
+        }
         if let Some((min, max)) = query.size
             && (is_dir || index.size[i] < min || index.size[i] > max)
         {

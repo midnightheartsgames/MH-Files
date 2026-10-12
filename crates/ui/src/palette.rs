@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Id, Key, RichText, Sense, Stroke, text::LayoutJob, vec2,
 };
+use mh_files_core::category::Category;
 use mh_files_core::fuzzy::Fuzzy;
 use mh_files_core::goto::{self, Candidate, Source};
 use mh_files_core::location::{Location, path_label};
@@ -20,7 +21,7 @@ const ROWS: usize = 12;
 pub enum Mode {
     Commands,
     GoTo { candidates: Vec<Candidate> },
-    Search { root: PathBuf, content: bool },
+    Search { root: PathBuf, content: bool, category: Category },
 }
 
 pub struct State {
@@ -58,12 +59,12 @@ impl State {
     }
 
     pub fn search(root: PathBuf) -> State {
-        State::new(Mode::Search { root, content: false })
+        State::new(Mode::Search { root, content: false, category: Category::All })
     }
 
     /// Поиск слов внутри файлов папки и вложенных.
     pub fn search_content(root: PathBuf) -> State {
-        State::new(Mode::Search { root, content: true })
+        State::new(Mode::Search { root, content: true, category: Category::All })
     }
 
     /// GoTo: кандидаты собираются один раз при открытии из того, что уже известно.
@@ -202,6 +203,10 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp, state: &mut State) -> bool 
     if down && state.selected + 1 < rows.len() {
         state.selected += 1;
     }
+    // Tab в поиске — следующая категория.
+    if tab_key && let Mode::Search { content, category, .. } = &mut state.mode {
+        *category = next_category(*category, *content);
+    }
     // Tab в GoTo — дописать путь выбранного кандидата.
     if tab_key && let Some(Row::Place(candidate)) = rows.get(state.selected) {
         state.query = format!("{}{}", candidate.path.display(), std::path::MAIN_SEPARATOR);
@@ -271,6 +276,17 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp, state: &mut State) -> bool 
                     if response.changed() {
                         state.selected = 0;
                     }
+                    if let Mode::Search { content, category, .. } = &mut state.mode {
+                        ui.add_space(6.0);
+                        let picked = ui
+                            .horizontal(|ui| {
+                                crate::widgets::category_chips(ui, *category, !*content)
+                            })
+                            .inner;
+                        if let Some(picked) = picked {
+                            *category = picked;
+                        }
+                    }
                     ui.add_space(6.0);
                     let first = state.selected.saturating_sub(ROWS - 1);
                     for (index, row) in rows.iter().enumerate().skip(first).take(ROWS) {
@@ -302,13 +318,14 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp, state: &mut State) -> bool 
                     .push(Action::Open { location: Location::Dir(candidate.path.clone()), target });
             }
             Row::SearchHere => {
-                if let Mode::Search { root, content } = &state.mode
-                    && !state.query.trim().is_empty()
+                if let Mode::Search { root, content, category } = &state.mode
+                    && (!state.query.trim().is_empty() || (*category != Category::All && !*content))
                 {
                     let location = Location::Search {
                         root: root.clone(),
                         query: state.query.trim().to_string(),
                         content: *content,
+                        category: *category,
                     };
                     app.actions.push(Action::Open { location, target: Target::Current });
                 } else {
@@ -385,17 +402,31 @@ fn row_ui(
             );
         }
         Row::SearchHere => {
-            let (root, content) = match &state.mode {
-                Mode::Search { root, content } => (root.display().to_string(), *content),
-                _ => (String::new(), false),
+            let (root, content, category) = match &state.mode {
+                Mode::Search { root, content, category } => {
+                    (root.display().to_string(), *content, *category)
+                }
+                _ => (String::new(), false, Category::All),
             };
-            let text = match (state.query.trim(), content) {
-                ("", false) => format!("Введите запрос — поиск в «{root}» и всех вложенных папках"),
-                ("", true) => {
+            let among = match category {
+                Category::All => String::new(),
+                category => format!(" · {}", category.title().to_lowercase()),
+            };
+            let text = match (state.query.trim(), content, category) {
+                ("", false, Category::All) => {
+                    format!("Введите запрос — поиск в «{root}» и всех вложенных папках")
+                }
+                ("", false, category) => {
+                    format!(
+                        "Все {} в {root} — или уточните запрос",
+                        category.title().to_lowercase()
+                    )
+                }
+                ("", true, _) => {
                     format!("Введите слова — поиск в текстовых файлах «{root}» и вложенных папок")
                 }
-                (query, false) => format!("Искать «{query}» в {root}"),
-                (query, true) => format!("Искать текст «{query}» в файлах {root}"),
+                (query, false, _) => format!("Искать «{query}»{among} в {root}"),
+                (query, true, _) => format!("Искать текст «{query}»{among} в файлах {root}"),
             };
             painter.text(
                 left,
@@ -429,4 +460,12 @@ fn highlighted(text: &str, matched: &[usize], color: Color32) -> LayoutJob {
         job.append(&c.to_string(), 0.0, format);
     }
     job
+}
+
+/// Категория после `current` по кругу; без «Папок» при поиске по тексту.
+fn next_category(current: Category, content: bool) -> Category {
+    let all: Vec<Category> =
+        Category::ALL.into_iter().filter(|&c| !(content && c == Category::Folders)).collect();
+    let at = all.iter().position(|&c| c == current).unwrap_or(0);
+    all[(at + 1) % all.len()]
 }
