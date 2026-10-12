@@ -32,8 +32,6 @@ use self::extract::Item;
 use self::server::{EmbedError, Server};
 use crate::{CancelToken, Event, Ticket, Workers};
 
-/// Найденного показывается не больше: дальше сходство уже случайное.
-pub const RESULT_LIMIT: usize = 300;
 /// Модель выгружается из памяти после стольких минут без запросов.
 const IDLE_UNLOAD: Duration = Duration::from_secs(5 * 60);
 /// Папки пересматриваются так часто, пока программа открыта.
@@ -216,7 +214,16 @@ impl Semantic {
             if current.as_ref() == Some(settings) {
                 return;
             }
+            let same_index =
+                current.as_ref().is_some_and(|c| c.for_index() == settings.for_index());
             *current = Some(settings.clone());
+            // Отбор и число найденного — только для поиска: индекс не перестраивается, а
+            // открытая выдача обновляется.
+            if same_index {
+                drop(current);
+                self.shared.notify(true, true);
+                return;
+            }
         }
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
         let _ = self.shared.jobs.send(Job::Configure);
@@ -337,8 +344,9 @@ impl Shared {
             mmproj: paths.mmproj.clone(),
             port: 0,
             gpu: settings.gpu,
-            // Половина ядер: индексация в фоне не должна отнимать компьютер.
-            threads: (threads / 2).max(1),
+            // Все ядра, кроме одного: процесс модели и так с пониженным приоритетом, а на
+            // половине ядер картинка на процессоре считалась ~11 с.
+            threads: threads.saturating_sub(1).max(1),
         };
         let log = self.dir.join("llama-server.log");
         let server = Server::start(&paths.exe, &config, &log)?;
@@ -478,7 +486,20 @@ fn activate(
         shared.set_state(SemanticState::Failed(error));
         return (None, false);
     }
-    let media = paths.mmproj.is_some() && !shared.status.lock().media_fallback;
+    let mut media = paths.mmproj.is_some() && !shared.status.lock().media_fallback;
+    if media {
+        match images_work(shared) {
+            Ok(true) => {}
+            Ok(false) => {
+                media = false;
+                shared.update(|s| s.media_fallback = true);
+            }
+            Err(error) => {
+                shared.set_state(SemanticState::Failed(error));
+                return (None, false);
+            }
+        }
+    }
     // Векторы зависят от модели и от того, что из файлов берётся.
     let file =
         paths.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -520,6 +541,33 @@ fn activate(
             shared.set_state(SemanticState::Failed(error));
             (None, false)
         }
+    }
+}
+
+/// Самопроверка кодировщика картинок: две совсем разные картинки должны дать разные векторы.
+/// Иначе llama.cpp молча считает картинку пустой (так бывало — ggml-org/llama.cpp#30082), и
+/// все картинки «похожи» на любой запрос одинаково. `Ok(false)` — картинки не работают.
+fn images_work(shared: &Shared) -> Result<bool, String> {
+    use mh_files_platform::thumbs::Bitmap;
+    let picture = |pixel: &dyn Fn(u32, u32) -> [u8; 4]| {
+        let rgba = (0..64 * 64).flat_map(|i| pixel(i % 64, i / 64)).collect();
+        extract::jpeg(&Bitmap { width: 64, height: 64, rgba })
+    };
+    let (Some(red), Some(chess)) = (
+        picture(&|_, _| [220, 30, 30, 255]),
+        picture(&|x, y| {
+            if (x / 8 + y / 8) % 2 == 0 { [0, 0, 0, 255] } else { [250, 250, 250, 255] }
+        }),
+    ) else {
+        return Ok(true);
+    };
+    match shared.embed(&[red, chess]) {
+        Ok(vectors) if vectors.len() == 2 => {
+            let cosine: f32 = vectors[0].iter().zip(&vectors[1]).map(|(a, b)| a * b).sum();
+            Ok(cosine < 0.995)
+        }
+        Ok(_) | Err(EmbedError::Refused(_)) => Ok(false),
+        Err(EmbedError::Unreachable(error)) => Err(error),
     }
 }
 
@@ -739,14 +787,17 @@ fn search(shared: &Shared, text: &str, cancel: &CancelToken) -> Result<SemanticR
         .filter(|w| w.chars().count() >= 2)
         .map(String::from)
         .collect();
-    let hits = shared.store.read().search(&vector, &words, RESULT_LIMIT * 2, |path| {
-        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        category.matches(&name, false)
-    });
+    let settings = shared.settings().unwrap_or_default();
+    let limit = settings.max_results as usize;
+    let hits =
+        shared.store.read().search(&vector, &words, settings.min_rank(), limit * 2, |path| {
+            let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            category.matches(&name, false)
+        });
     let mut entries = Vec::new();
     let mut reasons = HashMap::new();
     for hit in hits {
-        if entries.len() >= RESULT_LIMIT || cancel.is_cancelled() {
+        if entries.len() >= limit || cancel.is_cancelled() {
             break;
         }
         // Удалённое с прошлого прохода не показывается.
@@ -823,6 +874,38 @@ mod tests {
         drop(fake);
     }
 
+    /// Поддельный сервер отвечает на любую картинку одним вектором — как llama.cpp, который
+    /// молча не видит картинку. Самопроверка это замечает: картинки не берутся, поиск — по
+    /// тексту и именам.
+    #[test]
+    fn images_that_all_look_alike_are_switched_off() {
+        let (port, _) = server::tests::fake_server();
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let photos = dir.path().join("photos");
+        std::fs::create_dir_all(&photos).unwrap();
+        image::RgbImage::from_pixel(32, 32, image::Rgb([200, 40, 40]))
+            .save(photos.join("кот.png"))
+            .unwrap();
+        let (workers, _events) = Workers::new(mh_files_platform::no_waker());
+        let semantic = Semantic::new(workers, data.clone());
+        let settings = SemanticSettings {
+            enabled: true,
+            folders: vec![photos.clone()],
+            ..SemanticSettings::default()
+        };
+        let fake = FakeRuntime::with_mmproj(&data, &settings, port, true);
+        semantic.configure(&settings);
+        let status = wait(&semantic, |s| {
+            s.state == SemanticState::Ready || matches!(s.state, SemanticState::Failed(_))
+        });
+        assert_eq!(status.state, SemanticState::Ready, "{status:?}");
+        assert!(status.media_fallback, "картинки не различаются — выключены");
+        assert_eq!((status.files, status.parts), (1, 1), "у картинки — только имя");
+        semantic.shutdown(Duration::from_secs(5));
+        drop(fake);
+    }
+
     #[test]
     fn disabled_search_explains_itself() {
         let (workers, events) = Workers::new(mh_files_platform::no_waker());
@@ -853,17 +936,27 @@ mod tests {
 
     /// «Установленная» модель и llama-server-заглушка, которая только ждёт: настоящий сервер
     /// — поддельный, на `port`, его подставляет переменная окружения в `Server::start`.
-    struct FakeRuntime;
+    struct FakeRuntime(PathBuf);
 
     impl FakeRuntime {
         fn new(data: &Path, settings: &SemanticSettings, port: u16) -> FakeRuntime {
+            FakeRuntime::with_mmproj(data, settings, port, false)
+        }
+
+        fn with_mmproj(
+            data: &Path,
+            settings: &SemanticSettings,
+            port: u16,
+            mmproj: bool,
+        ) -> FakeRuntime {
             std::fs::create_dir_all(data.join("models")).unwrap();
             std::fs::write(data.join("models/m.gguf"), "m").unwrap();
+            std::fs::write(data.join("models/p.gguf"), "p").unwrap();
             let installed = setup::Installed {
                 repo: settings.model_repo.clone(),
                 quant: settings.quant.clone(),
                 model: "m.gguf".into(),
-                mmproj: None,
+                mmproj: mmproj.then(|| "p.gguf".to_string()),
                 runtime: Some("fake".into()),
             };
             std::fs::write(data.join("installed.json"), serde_json::to_string(&installed).unwrap())
@@ -871,14 +964,14 @@ mod tests {
             let exe = installed.runtime_exe(data).unwrap();
             std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
             std::fs::write(&exe, "").unwrap();
-            server::set_test_port(Some((exe, port)));
-            FakeRuntime
+            server::set_test_port(&exe, Some(port));
+            FakeRuntime(exe)
         }
     }
 
     impl Drop for FakeRuntime {
         fn drop(&mut self) {
-            server::set_test_port(None);
+            server::set_test_port(&self.0, None);
         }
     }
 }

@@ -182,12 +182,38 @@ pub struct SemanticSettings {
     pub gpu: bool,
     /// Файлы больше, МБ, — только по имени.
     pub max_file_mb: u32,
+    /// Отбор: насколько файл должен выделяться среди остальных, в десятых долях стандартного
+    /// отклонения (20 = 2,0). Меньше — больше находок, больше — только очевидное.
+    pub strictness: u32,
+    /// Сколько найденного показывать.
+    pub max_results: u32,
     /// Репозиторий модели на Hugging Face.
     pub model_repo: String,
     /// Квантование модели: Q8_0, Q4_K_M, BF16…
     pub quant: String,
     /// Свой `llama-server`; пусто — скачанный MH Files.
     pub server: PathBuf,
+}
+
+impl SemanticSettings {
+    /// Отбор в стандартных отклонениях.
+    pub fn min_rank(&self) -> f32 {
+        self.strictness as f32 / 10.0
+    }
+
+    /// Настройки без того, что влияет только на поиск: их смена индекс не трогает.
+    pub fn for_index(&self) -> SemanticSettings {
+        SemanticSettings { strictness: 0, max_results: 0, ..self.clone() }
+    }
+
+    /// Готовые уровни отбора: десятые доли отклонения и подпись.
+    pub const STRICTNESS: [(u32, &'static str); 5] = [
+        (10, "Всё хоть немного похожее"),
+        (15, "Мягко"),
+        (20, "Обычно"),
+        (25, "Строго"),
+        (30, "Только очевидное"),
+    ];
 }
 
 impl Default for SemanticSettings {
@@ -207,6 +233,8 @@ impl Default for SemanticSettings {
             audio: true,
             gpu: true,
             max_file_mb: 64,
+            strictness: 20,
+            max_results: 300,
             model_repo: crate::semantic::model::DEFAULT_REPO.into(),
             quant: crate::semantic::model::DEFAULT_QUANT.into(),
             server: PathBuf::new(),
@@ -460,6 +488,8 @@ impl Settings {
         self.preview.image_limit_mb = self.preview.image_limit_mb.clamp(1, 1024);
         let semantic = &mut self.semantic;
         semantic.max_file_mb = semantic.max_file_mb.clamp(1, 4096);
+        semantic.strictness = semantic.strictness.clamp(0, 60);
+        semantic.max_results = semantic.max_results.clamp(10, 5000);
         if semantic.model_repo.trim().is_empty() {
             semantic.model_repo = crate::semantic::model::DEFAULT_REPO.into();
         }
@@ -587,6 +617,13 @@ mod tests {
         );
         assert!(s.semantic.enabled && !s.semantic.gpu);
         assert_eq!(s.semantic.max_file_mb, 1);
+        assert_eq!(
+            (s.semantic.strictness, s.semantic.max_results),
+            (20, 300),
+            "1.2.2: по умолчанию"
+        );
+        let (s, _) = Settings::parse(r#"{"semantic": {"strictness": 999, "max_results": 1}}"#);
+        assert_eq!((s.semantic.strictness, s.semantic.max_results), (60, 10));
         assert_eq!(s.semantic.quant, "Q8_0");
     }
 }
