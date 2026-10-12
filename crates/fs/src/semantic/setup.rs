@@ -92,7 +92,7 @@ pub fn ensure(
 ) -> Result<Paths, String> {
     let mut installed = Installed::load(dir);
     if let Some(paths) = installed.paths(dir, settings) {
-        return Ok(paths);
+        return checked(&installed, dir, paths);
     }
     std::fs::create_dir_all(dir.join("models"))
         .map_err(|e| format!("папка модели не создана: {e}"))?;
@@ -170,7 +170,22 @@ pub fn ensure(
         installed.runtime = Some(tag);
         installed.save(dir)?;
     }
-    installed.paths(dir, settings).ok_or_else(|| "файлы модели не найдены после скачивания".into())
+    let paths = installed
+        .paths(dir, settings)
+        .ok_or_else(|| "файлы модели не найдены после скачивания".to_string())?;
+    checked(&installed, dir, paths)
+}
+
+/// Чужой llama.cpp (свой путь или `PATH` вне Windows) — заранее проверить, знает ли он
+/// EmbeddingGemma 2: иначе модель «не загрузится» без внятной причины.
+fn checked(installed: &Installed, dir: &Path, paths: Paths) -> Result<Paths, String> {
+    if installed.runtime_exe(dir).as_ref() != Some(&paths.exe)
+        && let Some(build) = super::server::exe_build(&paths.exe)
+        && build < model::MIN_BUILD
+    {
+        return Err(model::too_old(Some(build)));
+    }
+    Ok(paths)
 }
 
 fn fetch(
