@@ -98,17 +98,29 @@ pub fn kind(ext: &str, is_dir: bool) -> String {
     }
 }
 
-/// Давность даты от 0 (только что) до 1 (год и старше) — для цвета кружка у даты. Шкала
-/// логарифмическая: минуты, часы, дни и месяцы различимы одинаково хорошо. Дата из будущего —
-/// как «только что».
+/// Давность даты от 0 (только что) до 1 (год и старше) — для цвета кружка у даты. Шкала по
+/// привычным отметкам: последний час — чисто красный, к суткам — оранжевый, к неделе —
+/// жёлтый, к месяцу — жёлто-зелёный, к году — зелёный. Между отметками —
+/// плавно по логарифму. Дата из будущего — как «только что».
 pub fn age(time: SystemTime, now: SystemTime) -> f32 {
-    const NEWEST: f64 = 60.0; // минута
-    const OLDEST: f64 = 365.0 * 24.0 * 3600.0; // год
+    const HOUR: f64 = 3600.0;
+    const DAY: f64 = 24.0 * HOUR;
+    /// Отметки: давность в секундах и доля шкалы. Доли подобраны под цвета по умолчанию
+    /// (красный → бирюзово-зелёный): сутки — оранжевый, неделя — жёлтый.
+    const MARKS: [(f64, f64); 5] =
+        [(HOUR, 0.0), (DAY, 0.2), (7.0 * DAY, 0.4), (30.0 * DAY, 0.65), (365.0 * DAY, 1.0)];
     let seconds = now.duration_since(time).map_or(0.0, |d| d.as_secs_f64());
-    if seconds <= NEWEST {
+    if seconds <= MARKS[0].0 {
         return 0.0;
     }
-    ((seconds / NEWEST).ln() / (OLDEST / NEWEST).ln()).clamp(0.0, 1.0) as f32
+    for pair in MARKS.windows(2) {
+        let ((from, a), (to, b)) = (pair[0], pair[1]);
+        if seconds <= to {
+            let k = (seconds / from).ln() / (to / from).ln();
+            return (a + (b - a) * k) as f32;
+        }
+    }
+    1.0
 }
 
 #[cfg(test)]
@@ -121,10 +133,16 @@ mod tests {
         use std::time::Duration;
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
         let ago = |secs: u64| age(now - Duration::from_secs(secs), now);
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-4;
         assert_eq!(ago(10), 0.0);
+        assert_eq!(ago(50 * 60), 0.0, "последний час — красный");
         assert_eq!(age(now + Duration::from_secs(60), now), 0.0, "из будущего — новое");
-        let (hour, day, month) = (ago(3600), ago(86_400), ago(30 * 86_400));
-        assert!(0.0 < hour && hour < day && day < month && month < 1.0, "{hour} {day} {month}");
+        assert!(close(ago(86_400), 0.2), "сутки — оранжевый");
+        assert!(close(ago(7 * 86_400), 0.4), "неделя — жёлтый");
+        assert!(close(ago(30 * 86_400), 0.65), "месяц");
+        let (hours, days) = (ago(6 * 3600), ago(3 * 86_400));
+        assert!(0.0 < hours && hours < 0.2 && 0.2 < days && days < 0.4, "{hours} {days}");
+        assert_eq!(ago(365 * 86_400), 1.0);
         assert_eq!(ago(3 * 365 * 86_400), 1.0);
     }
 
