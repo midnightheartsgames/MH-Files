@@ -337,6 +337,33 @@ mod tests {
         assert!(choose_model_files("не json", DEFAULT_REPO, "Q8_0").is_err());
     }
 
+    /// Список файлов `unsloth/embeddinggemma-2-GGUF` как есть (октябрь 2026).
+    #[test]
+    fn model_files_of_the_real_repository() {
+        let json = r#"{"siblings":[
+            {"rfilename":".gitattributes","size":2265},{"rfilename":"README.md","size":22681},
+            {"rfilename":"embeddinggemma-2-BF16.gguf","size":557950240},
+            {"rfilename":"embeddinggemma-2-F16.gguf","size":557950240},
+            {"rfilename":"embeddinggemma-2-Q8_0.gguf","size":309855520},
+            {"rfilename":"embeddinggemma-2-UD-Q4_K_XL.gguf","size":175673856},
+            {"rfilename":"embeddinggemma-2-UD-Q5_K_XL.gguf","size":210055680},
+            {"rfilename":"embeddinggemma-2-UD-Q6_K_XL.gguf","size":248812032},
+            {"rfilename":"mmproj-BF16.gguf","size":982074880},
+            {"rfilename":"mmproj-F16.gguf","size":980895232},
+            {"rfilename":"mmproj-Q8_0.gguf","size":554821120}]}"#;
+        let pick = |quant| {
+            let files = choose_model_files(json, DEFAULT_REPO, quant).unwrap();
+            (files.model.name, files.mmproj.unwrap().name)
+        };
+        assert_eq!(pick("Q8_0"), ("embeddinggemma-2-Q8_0.gguf".into(), "mmproj-Q8_0.gguf".into()));
+        assert_eq!(
+            pick("UD-Q4_K_XL"),
+            ("embeddinggemma-2-UD-Q4_K_XL.gguf".into(), "mmproj-Q8_0.gguf".into())
+        );
+        assert_eq!(pick("BF16"), ("embeddinggemma-2-BF16.gguf".into(), "mmproj-BF16.gguf".into()));
+        assert_eq!(pick("F16"), ("embeddinggemma-2-F16.gguf".into(), "mmproj-F16.gguf".into()));
+    }
+
     #[test]
     fn model_files_of_other_naming() {
         // Как у ggml-org: mmproj с именем модели, файлы в папке.
