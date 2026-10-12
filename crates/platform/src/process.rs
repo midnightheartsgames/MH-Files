@@ -76,6 +76,55 @@ impl Drop for Background {
     }
 }
 
+/// Запустить `program` с `args` и дождаться вывода (stdout и stderr вместе) — для коротких
+/// вопросов вроде `--version`. Дольше `timeout` — процесс снимается.
+pub fn capture(
+    program: &Path,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    let mut command = Command::new(program);
+    command.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(crate::win::process::CREATION_FLAGS);
+    }
+    let mut child =
+        command.spawn().map_err(|error| format!("{} не запущен: {error}", program.display()))?;
+    // Вывод читается в своих потоках: полный канал иначе остановил бы процесс.
+    let read = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let mut bytes = Vec::new();
+                let _ = pipe.read_to_end(&mut bytes);
+                text = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            text
+        })
+    };
+    let stdout = read(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let stderr = read(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("{} не ответил", program.display()));
+            }
+        }
+    }
+    let out = stdout.join().unwrap_or_default();
+    let err = stderr.join().unwrap_or_default();
+    Ok(format!("{out}{err}"))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -104,6 +153,15 @@ mod tests {
         drop(slow);
         assert!(!Path::new(&format!("/proc/{pid}")).exists(), "завершён и прибран");
         assert!(Background::spawn(&dir.join("нет такой программы"), &[], None).is_err());
+        let both = capture(
+            Path::new("/bin/sh"),
+            &["-c", "echo один; echo два >&2"],
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(both.contains("один") && both.contains("два"), "{both}");
+        let slow = capture(Path::new("/bin/sleep"), &["30"], std::time::Duration::from_millis(200));
+        assert!(slow.is_err(), "долгий процесс снимается");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

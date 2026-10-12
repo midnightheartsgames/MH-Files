@@ -871,7 +871,7 @@ mod tests {
             let exe = installed.runtime_exe(data).unwrap();
             std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
             std::fs::write(&exe, "").unwrap();
-            server::set_test_port(Some(port));
+            server::set_test_port(Some((exe, port)));
             FakeRuntime
         }
     }

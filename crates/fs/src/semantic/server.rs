@@ -64,7 +64,8 @@ impl Server {
     /// журнал всех попыток — в `log`, ошибка — с причиной из журнала первой и последней.
     pub fn start(exe: &Path, config: &ServerConfig, log: &Path) -> Result<Server, String> {
         #[cfg(test)]
-        if let Some(port) = *TEST_PORT.lock() {
+        if let Some((_, port)) = TEST_PORT.lock().as_ref().filter(|(path, _)| path == exe) {
+            let port = *port;
             return Ok(Server { process: None, port, gpu_fallback: false, media_fallback: false });
         }
         let _ = std::fs::write(log, "");
@@ -75,6 +76,10 @@ impl Server {
                     server.gpu_fallback = attempt.gpu_fallback;
                     server.media_fallback = attempt.media_fallback;
                     return Ok(server);
+                }
+                // Сборка не знает модель — остальные попытки не помогут.
+                Err(reason) if reason.contains("unknown model architecture") => {
+                    return Err(format!("{} ({reason})", model::too_old(exe_build(exe))));
                 }
                 Err(reason) => {
                     if !reasons.contains(&reason) {
@@ -133,13 +138,14 @@ impl Server {
     }
 }
 
-/// Порт поддельного сервера вместо запуска `llama-server` — для тестов службы.
+/// Порт поддельного сервера вместо запуска этого `llama-server` — для тестов службы.
+/// Подмена — только для своего пути: тесты идут параллельно.
 #[cfg(test)]
-static TEST_PORT: parking_lot::Mutex<Option<u16>> = parking_lot::Mutex::new(None);
+static TEST_PORT: parking_lot::Mutex<Option<(PathBuf, u16)>> = parking_lot::Mutex::new(None);
 
 #[cfg(test)]
-pub fn set_test_port(port: Option<u16>) {
-    *TEST_PORT.lock() = port;
+pub fn set_test_port(fake: Option<(PathBuf, u16)>) {
+    *TEST_PORT.lock() = fake;
 }
 
 /// Почему не вышло посчитать векторы.
@@ -329,8 +335,9 @@ fn parse_response(bytes: &[u8]) -> Result<(u16, String), String> {
     Ok((status, String::from_utf8_lossy(&body).into_owned()))
 }
 
-/// Где лежит `llama-server`: свой путь из настроек, скачанный MH Files или найденный в
-/// `PATH` (вне Windows — для разработки).
+/// Где лежит `llama-server`: свой путь из настроек или скачанный MH Files. Вне Windows
+/// (разработка) — ещё и найденный в `PATH`. В Windows `PATH` не смотрится: там часто
+/// стоит свой llama.cpp (WinGet, Scoop), и старая сборка не знает EmbeddingGemma 2.
 pub fn find_exe(custom: &Path, downloaded: Option<PathBuf>) -> Option<PathBuf> {
     if !custom.as_os_str().is_empty() {
         return custom.is_file().then(|| custom.to_path_buf());
@@ -338,12 +345,23 @@ pub fn find_exe(custom: &Path, downloaded: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(path) = downloaded.filter(|p| p.is_file()) {
         return Some(path);
     }
-    let name = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+    if cfg!(windows) {
+        return None;
+    }
     std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).map(|dir| dir.join(name)).collect::<Vec<_>>())
+        .map(|paths| {
+            std::env::split_paths(&paths).map(|dir| dir.join("llama-server")).collect::<Vec<_>>()
+        })
         .unwrap_or_default()
         .into_iter()
         .find(|p| p.is_file())
+}
+
+/// Номер сборки llama.cpp у `exe` (`--version`); `None` — не узнать.
+pub fn exe_build(exe: &Path) -> Option<u32> {
+    let text =
+        mh_files_platform::process::capture(exe, &["--version"], Duration::from_secs(15)).ok()?;
+    model::parse_build(&text)
 }
 
 #[cfg(test)]
@@ -543,6 +561,25 @@ pub mod tests {
         assert!(error.contains(&log.display().to_string()), "путь к журналу: {error}");
         let text = std::fs::read_to_string(&log).unwrap();
         assert_eq!(text.matches(ATTEMPT_MARK).count(), 2, "как просили и на процессоре: {text}");
+        // Старая сборка: не знает архитектуру — сразу понятный ответ, без лишних попыток.
+        let old = dir.path().join("old-llama-server");
+        std::fs::write(
+            &old,
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 'version: 6123 (b92761a51)' >&2; exit 0; fi\necho \"0.5 E llama_model_load: error loading model: unknown model architecture: 'gemma-embedding2'\" >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let with_mmproj =
+            ServerConfig { mmproj: Some(dir.path().join("p.gguf")), ..config.clone() };
+        let error = Server::start(&old, &with_mmproj, &log).err().unwrap();
+        assert!(error.contains("b6123") && error.contains("b11452"), "{error}");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.matches(ATTEMPT_MARK).count(), 1, "одна попытка: {text}");
+        assert_eq!(exe_build(&old), Some(6123));
         assert_eq!(find_exe(&exe, None), Some(exe.clone()));
         assert_eq!(find_exe(&dir.path().join("нет"), Some(exe.clone())), None, "свой путь важнее");
         assert_eq!(find_exe(Path::new(""), Some(exe.clone())), Some(exe));

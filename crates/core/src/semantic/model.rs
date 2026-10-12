@@ -279,6 +279,24 @@ pub fn parse_embeddings(body: &str, expected: usize) -> Result<Vec<Vec<f32>>, St
         .ok_or_else(|| format!("модель вернула {} векторов из {expected}", data.len()))
 }
 
+/// Номер сборки llama.cpp из вывода `llama-server --version`: новые сборки пишут
+/// «version: 1.2.3 (build 11539, commit 10a60cf)», старые — «version: 11539 (10a60cf)».
+pub fn parse_build(text: &str) -> Option<u32> {
+    let line = text.lines().find_map(|l| l.trim().strip_prefix("version:"))?;
+    if let Some(rest) = line.split("(build ").nth(1) {
+        return rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok();
+    }
+    line.split_whitespace().next()?.parse().ok()
+}
+
+/// Объяснение для людей, если llama.cpp не знает EmbeddingGemma 2.
+pub fn too_old(build: Option<u32>) -> String {
+    let which = build.map_or_else(String::new, |b| format!(" (сборка b{b})"));
+    format!(
+        "llama.cpp{which} слишком старый для EmbeddingGemma 2 — нужна сборка b{MIN_BUILD} или новее. Очистите поле «Свой llama-server», и MH Files скачает свежую, или обновите свой llama.cpp"
+    )
+}
+
 /// Ошибка сервера о слишком длинном входе: такой вход повторять бесполезно.
 pub fn too_large(message: &str) -> bool {
     message.contains("too large to process") || message.contains("larger than the max context")
@@ -437,6 +455,17 @@ mod tests {
         let short = r#"{"data":[{"index":0,"embedding":[1.0,2.0]}]}"#;
         assert!(parse_embeddings(short, 1).is_err(), "короче DIMS");
         assert!(parse_embeddings("<html>", 1).is_err());
+    }
+
+    #[test]
+    fn build_numbers_of_both_formats() {
+        let new = "version: 1.2.3 (build 11539, commit 10a60cf30)\nbuilt with MSVC for x64";
+        assert_eq!(parse_build(new), Some(11539));
+        let old =
+            "ggml_vulkan: Found 1 Vulkan devices\nversion: 6123 (b92761a51)\nbuilt with clang";
+        assert_eq!(parse_build(old), Some(6123));
+        assert_eq!(parse_build("нет версии"), None);
+        assert!(too_old(Some(6123)).contains("b6123") && too_old(None).contains("b11452"));
     }
 
     #[test]
