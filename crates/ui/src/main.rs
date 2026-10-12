@@ -70,6 +70,7 @@ fn main() -> eframe::Result {
     let upgraded_from = storage::backup_on_upgrade();
     let session = storage::load_session();
     let labels = storage::load_labels();
+    let folder_views = storage::load_folder_views();
     let startup = startup::Startup {
         started,
         open,
@@ -81,6 +82,7 @@ fn main() -> eframe::Result {
         repaint,
         keepalive,
         labels,
+        folder_views,
     };
 
     let mut viewport = ViewportBuilder::default()

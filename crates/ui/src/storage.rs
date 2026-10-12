@@ -88,7 +88,7 @@ pub fn backup_on_upgrade() -> Option<String> {
     if let Some(old) = &previous {
         let backup = dir.join("backup").join(old);
         if std::fs::create_dir_all(&backup).is_ok() {
-            for name in ["settings.json", "session.json", "categories.json"] {
+            for name in ["settings.json", "session.json", "categories.json", "folder_views.json"] {
                 let _ = std::fs::copy(dir.join(name), backup.join(name));
             }
         }
@@ -130,6 +130,20 @@ pub fn load_labels() -> mh_files_core::labels::Labels {
     let path = labels_path();
     let Ok(text) = std::fs::read_to_string(&path) else { return Default::default() };
     mh_files_core::labels::Labels::parse(&text).unwrap_or_else(|| {
+        let _ = std::fs::copy(&path, path.with_extension("json.broken"));
+        Default::default()
+    })
+}
+
+pub fn folder_views_path() -> PathBuf {
+    config_dir().join("folder_views.json")
+}
+
+/// Запомненный вид папок. Испорченный файл сохраняется рядом как `.broken`.
+pub fn load_folder_views() -> mh_files_core::folder_views::FolderViews {
+    let path = folder_views_path();
+    let Ok(text) = std::fs::read_to_string(&path) else { return Default::default() };
+    mh_files_core::folder_views::FolderViews::parse(&text).unwrap_or_else(|| {
         let _ = std::fs::copy(&path, path.with_extension("json.broken"));
         Default::default()
     })

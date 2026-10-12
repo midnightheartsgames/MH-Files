@@ -118,6 +118,9 @@ pub struct Tab {
     pub listing: Listing,
     pub selection: Selection,
     pub view: ViewMode,
+    /// Место и вид, сверенные с запомненным видом папок в прошлом кадре: другой вид на том же
+    /// месте выбран пользователем, другое место — пора вернуть его вид.
+    pub view_synced: Option<(Location, ViewMode)>,
     pub filter: String,
     pub filter_open: bool,
     pub focus_filter: bool,
@@ -190,6 +193,7 @@ impl Tab {
             options,
             selection: Selection::default(),
             view,
+            view_synced: None,
             filter: String::new(),
             filter_open: false,
             focus_filter: false,
