@@ -297,6 +297,14 @@ pub fn new_file(painter: &Painter, rect: Rect, color: Color32) {
     plus_badge(painter, rect, color);
 }
 
+/// Терминал: окно с приглашением `>` и курсором.
+pub fn terminal(painter: &Painter, rect: Rect, color: Color32) {
+    let window = Rect::from_min_max(p(rect, 0.05, 0.14), p(rect, 0.95, 0.86));
+    painter.rect_stroke(window, CornerRadius::same(2), stroke(rect, color), egui_inside());
+    polyline(painter, rect, color, &[(0.24, 0.36), (0.42, 0.5), (0.24, 0.64)]);
+    polyline(painter, rect, color, &[(0.5, 0.66), (0.74, 0.66)]);
+}
+
 /// Шестерёнка — настройки MH Files.
 pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
     let center = rect.center();
