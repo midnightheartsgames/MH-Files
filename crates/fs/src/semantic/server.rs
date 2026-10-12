@@ -64,8 +64,7 @@ impl Server {
     /// журнал всех попыток — в `log`, ошибка — с причиной из журнала первой и последней.
     pub fn start(exe: &Path, config: &ServerConfig, log: &Path) -> Result<Server, String> {
         #[cfg(test)]
-        if let Some((_, port)) = TEST_PORT.lock().as_ref().filter(|(path, _)| path == exe) {
-            let port = *port;
+        if let Some(port) = TEST_PORT.lock().iter().find(|(path, _)| path == exe).map(|f| f.1) {
             return Ok(Server { process: None, port, gpu_fallback: false, media_fallback: false });
         }
         let _ = std::fs::write(log, "");
@@ -141,11 +140,16 @@ impl Server {
 /// Порт поддельного сервера вместо запуска этого `llama-server` — для тестов службы.
 /// Подмена — только для своего пути: тесты идут параллельно.
 #[cfg(test)]
-static TEST_PORT: parking_lot::Mutex<Option<(PathBuf, u16)>> = parking_lot::Mutex::new(None);
+static TEST_PORT: parking_lot::Mutex<Vec<(PathBuf, u16)>> = parking_lot::Mutex::new(Vec::new());
 
+/// Подменить `exe` поддельным сервером на `port`; `None` — убрать подмену.
 #[cfg(test)]
-pub fn set_test_port(fake: Option<(PathBuf, u16)>) {
-    *TEST_PORT.lock() = fake;
+pub fn set_test_port(exe: &Path, port: Option<u16>) {
+    let mut fakes = TEST_PORT.lock();
+    fakes.retain(|(path, _)| path != exe);
+    if let Some(port) = port {
+        fakes.push((exe.to_path_buf(), port));
+    }
 }
 
 /// Почему не вышло посчитать векторы.

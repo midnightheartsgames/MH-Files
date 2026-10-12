@@ -1119,7 +1119,7 @@ fn semantic(ui: &mut Ui, state: &mut State, info: &SemanticInfo) -> Option<Seman
         if info.status.media_fallback {
             widgets::hint(
                 ui,
-                "Кодировщик картинок и звука (mmproj) не загрузился — ищется по тексту и именам. Причина — в журнале.",
+                "Кодировщик картинок и звука (mmproj) не загрузился или не различает картинки — ищется по тексту и именам. Подробности — в журнале.",
             );
         }
         if info.status.skipped > 0 {
@@ -1163,6 +1163,30 @@ fn semantic(ui: &mut Ui, state: &mut State, info: &SemanticInfo) -> Option<Seman
         row(ui, "Файлы больше", |ui| {
             ui.add(egui::DragValue::new(&mut s.max_file_mb).range(1..=4096).suffix(" МБ"));
             ui.label(RichText::new("— только по имени").color(theme::TEXT_SECONDARY));
+        });
+    });
+    card(ui, "Выдача", |ui| {
+        widgets::hint(
+            ui,
+            "Сходство у модели относительное: файл попадает в выдачу, если выделяется среди остальных файлов того же вида (имена, тексты, картинки). Мягче — больше находок, строже — только явное. Файл, в имени которого есть все слова запроса, виден всегда. Меняется без перестройки индекса.",
+        );
+        row(ui, "Отбор", |ui| {
+            use mh_files_core::settings::SemanticSettings;
+            let selected = SemanticSettings::STRICTNESS
+                .iter()
+                .find(|(value, _)| *value == s.strictness)
+                .map_or_else(|| format!("{:.1}", s.min_rank()), |(_, label)| label.to_string());
+            egui::ComboBox::from_id_salt("semantic-strictness")
+                .selected_text(selected)
+                .width(240.0)
+                .show_ui(ui, |ui| {
+                    for (value, label) in SemanticSettings::STRICTNESS {
+                        ui.selectable_value(&mut s.strictness, value, label);
+                    }
+                });
+        });
+        row(ui, "Показывать не больше", |ui| {
+            ui.add(egui::DragValue::new(&mut s.max_results).range(10..=5000).suffix(" файлов"));
         });
     });
     card(ui, "Папки", |ui| {
