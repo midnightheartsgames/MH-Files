@@ -1,12 +1,13 @@
 //! Действия Shell: `ShellExecuteExW`, «Открыть с помощью», свойства, терминал, Проводник.
 
+use std::os::windows::ffi::OsStringExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use windows::Win32::Foundation::ERROR_CANCELLED;
 use windows::Win32::System::Com::{
-    CLSCTX_INPROC_SERVER, CoCreateInstance, IDataObject, IPersistFile,
+    CLSCTX_INPROC_SERVER, CoCreateInstance, IDataObject, IPersistFile, STGM_READ,
 };
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
@@ -165,6 +166,25 @@ pub fn create_shortcut(target: &Path, link: &Path) -> Result<(), String> {
         let file: IPersistFile = shell_link.cast().map_err(|e| failed(&e))?;
         file.Save(PCWSTR(link_w.as_ptr()), true).map_err(|e| failed(&e))
     }
+}
+
+/// Куда ведёт ярлык `.lnk`: путь цели, если он есть в файловой системе. `None` — не ярлык,
+/// ярлык на объект без пути («Этот компьютер», приложение магазина) или ярлык не читается.
+/// Ярлык не «чинится» (`Resolve`): поиск пропавшей цели может долго ходить по дискам.
+pub fn link_target(link: &Path) -> Option<PathBuf> {
+    let _com = Apartment::sta();
+    let link_w = wide(link);
+    let mut buffer = vec![0u16; 32 * 1024];
+    // SAFETY: строки и буфер живут до конца вызовов; COM-объекты освобождаются при выходе.
+    unsafe {
+        let shell_link: IShellLinkW =
+            CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
+        let file: IPersistFile = shell_link.cast().ok()?;
+        file.Load(PCWSTR(link_w.as_ptr()), STGM_READ).ok()?;
+        shell_link.GetPath(&mut buffer, std::ptr::null_mut(), 0).ok()?;
+    }
+    let len = buffer.iter().position(|&unit| unit == 0).unwrap_or(buffer.len());
+    (len > 0).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])))
 }
 
 /// Отмена пользователем — не ошибка.

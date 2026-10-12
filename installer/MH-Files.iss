@@ -59,6 +59,7 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "Значок на рабочем столе"; Flags: unchecked
 Name: "explorermenu"; Description: "Пункт «Открыть в MH Files» в меню Проводника"
+Name: "defaultfolders"; Description: "Открывать папки в MH Files (двойной щелчок по папке на рабочем столе и в других программах)"; Flags: unchecked
 Name: "archives"; Description: "MH Files в «Открыть с помощью» для архивов zip, 7z, rar"; Flags: unchecked
 
 [Files]
@@ -73,15 +74,20 @@ Name: "{userdesktop}\MH Files"; Filename: "{app}\MH-Files.exe"; Tasks: desktopic
 ; Те же ключи, что пишет «Настройки → Система → Меню Проводника» (platform::integration):
 ; удаление программы убирает их в любом случае.
 [Registry]
-Root: HKCU; Subkey: "Software\Classes\Directory\shell\MHFiles"; ValueType: string; ValueData: "Открыть в MH Files"; Flags: uninsdeletekey; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Directory\shell\MHFiles"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\MH-Files.exe"",0"; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Directory\shell\MHFiles\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%V"""; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MHFiles"; ValueType: string; ValueData: "Открыть в MH Files"; Flags: uninsdeletekey; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MHFiles"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\MH-Files.exe"",0"; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MHFiles\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%V"""; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles"; ValueType: string; ValueData: "Открыть в MH Files"; Flags: uninsdeletekey; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\MH-Files.exe"",0"; Tasks: explorermenu
-Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%V"""; Tasks: explorermenu
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\MHFiles"; ValueType: string; ValueData: "Открыть в MH Files"; Flags: uninsdeletekey; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\MHFiles"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\MH-Files.exe"",0"; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\MHFiles\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%V"""; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MHFiles"; ValueType: string; ValueData: "Открыть в MH Files"; Flags: uninsdeletekey; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MHFiles"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\MH-Files.exe"",0"; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Directory\Background\shell\MHFiles\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%V"""; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles"; ValueType: string; ValueData: "Открыть в MH Files"; Flags: uninsdeletekey; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\MH-Files.exe"",0"; Tasks: explorermenu or defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Drive\shell\MHFiles\command"; ValueType: string; ValueData: """{app}\MH-Files.exe"" ""%V"""; Tasks: explorermenu or defaultfolders
+
+; Папки по умолчанию — как «Настройки → Система → Открывать папки в MH Files»: действие
+; MHFiles выше становится двойным щелчком. При удалении возвращается Проводнику (ниже, [Code]).
+Root: HKCU; Subkey: "Software\Classes\Directory\shell"; ValueType: string; ValueData: "MHFiles"; Tasks: defaultfolders
+Root: HKCU; Subkey: "Software\Classes\Drive\shell"; ValueType: string; ValueData: "MHFiles"; Tasks: defaultfolders
 
 ; Архивы: ProgID и его имя в OpenWithProgids — как «Настройки → Система → Архивы».
 Root: HKCU; Subkey: "Software\Classes\MHFiles.Archive"; ValueType: string; ValueData: "Архив"; Flags: uninsdeletekey; Tasks: archives

@@ -137,6 +137,11 @@ pub enum Event {
     },
     /// Есть ли у расширений обработчики эскизов Windows ([`Workers::thumbnail_types`]).
     ThumbnailTypes(Vec<(String, bool)>),
+    /// Открытый ярлык `link` ведёт на папку `dir`: перейти в неё.
+    OpenFolder {
+        link: PathBuf,
+        dir: PathBuf,
+    },
     /// Итог действия Shell; ошибку показать пользователю.
     Shell {
         what: String,

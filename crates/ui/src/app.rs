@@ -830,6 +830,14 @@ impl FilesApp {
             }
             Event::Image { key, result } => self.images.on_result(ctx, key, result),
             Event::ThumbnailTypes(types) => self.images.on_types(types),
+            Event::OpenFolder { link, dir } => {
+                // Пока ярлык читался, могли уйти в другую папку — тогда новой вкладкой.
+                let here = link
+                    .parent()
+                    .is_some_and(|parent| self.tab().location == Location::Dir(parent.into()));
+                let target = if here { Target::Current } else { Target::NewTab };
+                self.open_location(Location::Dir(dir), target);
+            }
             Event::Shell { what, result } => {
                 if let Err(error) = result {
                     self.set_status(format!("{what}: {error}"), Level::Error);

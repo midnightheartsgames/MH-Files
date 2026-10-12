@@ -88,6 +88,23 @@ pub fn ansi_code_page() -> u32 {
     }
 }
 
+/// Папка, на которую ведёт ярлык `.lnk` (на диске, в сети). `None` — не ярлык, ярлык на
+/// файл или на объект без пути. Может ждать сетевой диск — только из фонового потока.
+pub fn folder_link_target(path: &Path) -> Option<PathBuf> {
+    let is_link = path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"));
+    if !is_link {
+        return None;
+    }
+    #[cfg(windows)]
+    {
+        crate::win::shell::link_target(path).filter(|target| target.is_dir())
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// Ярлыки на `targets` в папке `dest` («имя - ярлык.lnk», занятые имена не трогаются).
 /// Вне Windows — символические ссылки. Возвращает пути созданных ярлыков.
 pub fn create_shortcuts(targets: &[PathBuf], dest: &Path) -> Result<Vec<PathBuf>, String> {
