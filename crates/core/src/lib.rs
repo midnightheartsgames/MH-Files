@@ -7,6 +7,7 @@ pub mod cli;
 pub mod duplicates;
 pub mod entry;
 pub mod filter;
+pub mod folder_views;
 pub mod font_samples;
 pub mod format;
 pub mod fuzzy;

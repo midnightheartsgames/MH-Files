@@ -291,6 +291,8 @@ pub struct FilesApp {
     pub drop_hover: Option<PathBuf>,
     /// Цветные метки файлов и папок.
     pub labels: mh_files_core::labels::Labels,
+    /// Вид, выбранный для каждой папки.
+    pub folder_views: mh_files_core::folder_views::FolderViews,
     /// Файлы из другой программы тянут правой кнопкой: при броске — меню.
     pub external_right: bool,
     pub crumb_menu: Option<CrumbMenu>,
@@ -393,6 +395,7 @@ impl FilesApp {
             drop_zones: Vec::new(),
             drop_hover: None,
             labels: startup.labels.clone(),
+            folder_views: startup.folder_views.clone(),
             external_right: false,
             crumb_menu: None,
             drop_menu: None,
@@ -1135,6 +1138,7 @@ impl FilesApp {
         for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
             busy |= tab.tick();
         }
+        self.sync_folder_views();
         if self.pending_chord.is_some() {
             ctx.request_repaint_after(CHORD_TIMEOUT);
         }
@@ -1682,6 +1686,45 @@ impl FilesApp {
         } else {
             std::thread::spawn(write);
         }
+    }
+
+    /// Вид папок: выбранный во вкладке вид запомнить для её папки, а при переходе в другую
+    /// папку вернуть запомненный для неё. Папка без своего вида открывается таблицей.
+    /// В «Колонках» вид при переходах не меняется: это способ ходить по папкам.
+    fn sync_folder_views(&mut self) {
+        use mh_files_core::folder_views::FolderViews;
+        let mut changed = false;
+        for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+            match &tab.view_synced {
+                Some((location, view)) if *location == tab.location => {
+                    if *view != tab.view {
+                        changed |= self.folder_views.set(&tab.location, tab.view);
+                    }
+                }
+                previous => {
+                    // Новая вкладка без запомненного вида сохраняет данный ей вид.
+                    let navigated = previous.is_some();
+                    if tab.view != ViewMode::Columns {
+                        if let Some(view) = self.folder_views.get(&tab.location) {
+                            tab.view = view;
+                        } else if navigated && FolderViews::applies(&tab.location) {
+                            tab.view = ViewMode::Details;
+                        }
+                    }
+                }
+            }
+            tab.view_synced = Some((tab.location.clone(), tab.view));
+        }
+        if changed {
+            self.save_folder_views();
+        }
+    }
+
+    fn save_folder_views(&self) {
+        let json = self.folder_views.to_json();
+        std::thread::spawn(move || {
+            let _ = storage::write_atomic(&storage::folder_views_path(), &json);
+        });
     }
 
     /// Цветные метки — в фоне, через временный файл.

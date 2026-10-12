@@ -35,6 +35,8 @@ pub struct Startup {
     pub keepalive: Option<Box<dyn std::any::Any>>,
     /// Цветные метки файлов (`labels.json`).
     pub labels: mh_files_core::labels::Labels,
+    /// Запомненный вид папок (`folder_views.json`).
+    pub folder_views: mh_files_core::folder_views::FolderViews,
 }
 
 /// Абсолютные пути и признак «папка». Несуществующие — отдельно.
