@@ -18,7 +18,7 @@ use mh_files_core::location::Location;
 use mh_files_core::session::{self, PaneSession, Session, TabSession, ViewMode, WindowGeometry};
 use mh_files_core::settings::Settings;
 use mh_files_core::sort::SortColumn;
-use mh_files_fs::{CancelToken, DirSize, Event, Indexer, Ticket, Workers};
+use mh_files_fs::{CancelToken, DirSize, Event, Indexer, Semantic, Ticket, Workers};
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
 use mh_files_platform::ops::{Executor, FileOp, OpEvent};
@@ -243,6 +243,8 @@ pub struct FilesApp {
     next_id: u64,
     pub workers: Workers,
     pub indexer: Indexer,
+    /// Поиск по смыслу (EmbeddingGemma 2).
+    pub semantic: Semantic,
     /// Замеры: запуск, чтение папок.
     pub diag: crate::diag::Diagnostics,
     /// Пути от следующих запусков программы.
@@ -349,6 +351,8 @@ impl FilesApp {
         let (keymap, key_errors) = Keymap::new(&settings.keys);
         let indexer = Indexer::new(workers.clone(), storage::index_dir());
         indexer.configure(&settings.index);
+        let semantic = Semantic::new(workers.clone(), storage::semantic_dir());
+        semantic.configure(&settings.semantic);
 
         let mut images = ImageCache::new();
         images.system_icons = settings.appearance.system_icons;
@@ -362,6 +366,7 @@ impl FilesApp {
             next_id: 1,
             workers,
             indexer,
+            semantic,
             column_cache: Default::default(),
             sorter: crate::sorter::Shared::load(&storage::config_dir()),
             diag: crate::diag::Diagnostics::new(startup.started),
@@ -867,6 +872,22 @@ impl FilesApp {
                     tab.on_index_results(ticket, result);
                 }
             }
+            Event::SemanticResults { ticket, result } => {
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    tab.on_semantic_results(ticket, result);
+                }
+            }
+            Event::SemanticChanged { content } => {
+                if content {
+                    for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+                        if matches!(tab.location, Location::Semantic { .. })
+                            && let Some(view) = &mut tab.index
+                        {
+                            view.stale = true;
+                        }
+                    }
+                }
+            }
             Event::ExtractProgress { id, done, total } => self.on_extract_progress(id, done, total),
             Event::SortScanProgress { ticket, files } => self.on_sort_scan_progress(ticket, files),
             Event::SortScanned { ticket, plan } => self.on_sort_scanned(ticket, plan),
@@ -930,7 +951,9 @@ impl FilesApp {
             Event::IndexChanged { content } => {
                 if content {
                     for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
-                        if let Some(view) = &mut tab.index {
+                        if matches!(tab.location, Location::Index { .. })
+                            && let Some(view) = &mut tab.index
+                        {
                             view.stale = true;
                         }
                     }
@@ -956,7 +979,7 @@ impl FilesApp {
                         waiting = true;
                     }
                 }
-                tab.start_index_search(&self.indexer, show_hidden);
+                tab.start_index_search(&self.indexer, &self.semantic, show_hidden);
             }
         }
         if waiting {
@@ -1772,6 +1795,7 @@ impl FilesApp {
         self.images.system_icons = settings.appearance.system_icons;
         self.images.thumbnails_enabled = settings.preview.thumbnails;
         self.indexer.configure(&settings.index);
+        self.semantic.configure(&settings.semantic);
         if settings.appearance.custom_title_bar != self.settings.appearance.custom_title_bar {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(
                 !settings.appearance.custom_title_bar,
@@ -1844,6 +1868,7 @@ impl eframe::App for FilesApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save_session_if_changed(true);
         self.indexer.shutdown(INDEX_SAVE_WAIT);
+        self.semantic.shutdown(INDEX_SAVE_WAIT);
         crate::crash::finish();
     }
 }

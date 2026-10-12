@@ -25,6 +25,7 @@ enum Page {
     Files,
     Preview,
     Index,
+    Semantic,
     Sorting,
     System,
     Keys,
@@ -32,12 +33,13 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 9] = [
+    const ALL: [Page; 10] = [
         Page::General,
         Page::Appearance,
         Page::Files,
         Page::Preview,
         Page::Index,
+        Page::Semantic,
         Page::Sorting,
         Page::System,
         Page::Keys,
@@ -51,6 +53,7 @@ impl Page {
             Page::Files => "Файлы и папки",
             Page::Preview => "Предпросмотр",
             Page::Index => "Поиск по дискам",
+            Page::Semantic => "Поиск по смыслу",
             Page::Sorting => "Сортировка",
             Page::System => "Система",
             Page::Keys => "Горячие клавиши",
@@ -73,6 +76,10 @@ pub struct State {
     /// Поля «добавить папку» на странице индекса.
     new_root: String,
     new_exclude: String,
+    /// Поле «добавить папку» поиска по смыслу.
+    new_semantic: String,
+    /// Исключения поиска по смыслу текстом, по одному на строку.
+    semantic_exclude: String,
 }
 
 impl State {
@@ -83,6 +90,7 @@ impl State {
             let (keymap, _) = Keymap::new(&settings.keys);
             self.keys = CommandId::ALL.iter().map(|&c| (c, keymap.text(c))).collect();
             self.status = None;
+            self.semantic_exclude = settings.semantic.exclude.join("\n");
         }
         self.open = true;
         self.focus = true;
@@ -98,12 +106,23 @@ impl State {
         self.page = Page::Sorting;
     }
 
+    /// Открыть сразу на странице поиска по смыслу (кнопка «Настроить…» во вкладке поиска).
+    pub fn open_semantic(
+        &mut self,
+        settings: &Settings,
+        categories: &mh_files_core::sorting::Config,
+    ) {
+        self.open(settings, categories);
+        self.page = Page::Semantic;
+    }
+
     /// Набранный, но не добавленный кнопкой путь индекса тоже идёт в список: иначе
     /// «Применить» молча его теряет.
     fn commit_pending_paths(&mut self) {
         for (list, text) in [
             (&mut self.draft.index.roots, &mut self.new_root),
             (&mut self.draft.index.exclude, &mut self.new_exclude),
+            (&mut self.draft.semantic.folders, &mut self.new_semantic),
         ] {
             add_path(list, text);
         }
@@ -164,6 +183,8 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     let index_status = app.indexer.status();
     let elevated = app.indexer.elevated();
     let mut rescan = false;
+    let semantic_status = app.semantic.status();
+    let mut semantic_action = None;
     let sort_info = SortInfo {
         path: app.sorter.path.clone(),
         history: app.sorter.history.clone(),
@@ -176,6 +197,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     let system_info = SystemInfo {
         config: dirs.config.clone(),
         index: dirs.index.clone(),
+        semantic: dirs.semantic.clone(),
         portable: dirs.portable,
         integration: app.integration,
         crashed: app.previous.crashed,
@@ -249,6 +271,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                     {
                         let groups = state.draft.groups.clone();
                         state.draft = Settings { groups, ..Settings::default() };
+                        state.semantic_exclude = state.draft.semantic.exclude.join("\n");
                         let (keymap, _) = Keymap::new(&BTreeMap::new());
                         state.keys = CommandId::ALL.iter().map(|&c| (c, keymap.text(c))).collect();
                         state.status =
@@ -275,6 +298,11 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             let info = IndexInfo { status: &index_status, elevated };
                             rescan |= index(ui, state, &info);
                         }
+                        Page::Semantic => {
+                            let info =
+                                SemanticInfo { status: &semantic_status, dir: &dirs.semantic };
+                            semantic_action = semantic(ui, state, &info);
+                        }
                         Page::Sorting => {
                             sort_action =
                                 sorting(ui, &mut state.draft, &mut state.categories, &sort_info)
@@ -296,6 +324,17 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     }
     if rescan {
         app.indexer.rescan();
+    }
+    match semantic_action {
+        Some(SemanticAction::Rescan) => app.semantic.rescan(),
+        Some(SemanticAction::Open(path)) => {
+            let _ = std::fs::create_dir_all(&path);
+            app.actions.push(crate::app::Action::Open {
+                location: mh_files_core::location::Location::Dir(path),
+                target: crate::app::Target::NewTab,
+            });
+        }
+        None => {}
     }
     match system_action {
         Some(SystemAction::Integration(feature, on)) => {
@@ -342,7 +381,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         }
         None => {}
     }
-    if app.settings_window.open && index_status.busy() {
+    if app.settings_window.open && (index_status.busy() || semantic_status.busy()) {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
     if close {
@@ -612,6 +651,7 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
 struct SystemInfo {
     config: std::path::PathBuf,
     index: std::path::PathBuf,
+    semantic: std::path::PathBuf,
     portable: bool,
     integration: Option<mh_files_platform::integration::Status>,
     crashed: bool,
@@ -693,6 +733,7 @@ fn system(ui: &mut Ui, s: &mut Settings, info: &SystemInfo) -> Option<SystemActi
             &format!("Настройки, сеанс, категории, журналы: {}", info.config.display()),
         );
         widgets::hint(ui, &format!("Индекс дисков: {}", info.index.display()));
+        widgets::hint(ui, &format!("Поиск по смыслу: {}", info.semantic.display()));
         if ui.button("Открыть папку данных").clicked() {
             action = Some(SystemAction::Open(info.config.clone()));
         }
@@ -990,6 +1031,188 @@ fn index(ui: &mut Ui, state: &mut State, info: &IndexInfo) -> bool {
         path_list(ui, &mut s.index.exclude, &mut state.new_exclude, "C:\\Windows\\WinSxS");
     });
     rescan
+}
+
+struct SemanticInfo<'a> {
+    status: &'a mh_files_fs::SemanticStatus,
+    dir: &'a std::path::Path,
+}
+
+enum SemanticAction {
+    Rescan,
+    Open(std::path::PathBuf),
+}
+
+/// Квантования модели: подпись и что это значит.
+const QUANTS: [(&str, &str); 4] = [
+    ("Q8_0", "Q8_0 — почти без потерь (по умолчанию)"),
+    ("Q4_K_M", "Q4_K_M — вдвое меньше, чуть хуже"),
+    ("BF16", "BF16 — без квантования, крупнее"),
+    ("F16", "F16 — без квантования, крупнее"),
+];
+
+/// Страница поиска по смыслу.
+fn semantic(ui: &mut Ui, state: &mut State, info: &SemanticInfo) -> Option<SemanticAction> {
+    let s = &mut state.draft.semantic;
+    let mut action = None;
+    card(ui, "Поиск по смыслу", |ui| {
+        widgets::hint(
+            ui,
+            "Модель EmbeddingGemma 2 от Google понимает текст, картинки и звук: «кошка на диване» найдёт фотографию кошки, «договор аренды» — скан договора, хоть файл и называется IMG_0412. Всё считается на этом компьютере: файлы никуда не отправляются.",
+        );
+        switch_row(
+            ui,
+            "Включить",
+            Some(
+                "При включении скачивается около гигабайта: модель с Hugging Face и llama.cpp с GitHub. Модель выгружается из памяти через пять минут без поиска.",
+            ),
+            &mut s.enabled,
+        );
+        row(ui, "Состояние", |ui| {
+            let status = info.status;
+            let mut text = format!(
+                "{} · {} · векторов {}",
+                status.describe(),
+                mh_files_core::format::items(status.files),
+                mh_files_core::format::count(status.parts)
+            );
+            if status.loaded {
+                text.push_str(" · модель в памяти");
+            }
+            let color = match status.state {
+                mh_files_fs::SemanticState::Failed(_) => theme::WARN,
+                _ => theme::TEXT_SECONDARY,
+            };
+            ui.add(egui::Label::new(RichText::new(text).color(color)).truncate());
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Пересканировать").clicked() {
+                action = Some(SemanticAction::Rescan);
+            }
+            if ui.button("Открыть папку модели").clicked() {
+                action = Some(SemanticAction::Open(info.dir.to_path_buf()));
+            }
+        });
+        if let Some(model) = &info.status.model {
+            widgets::hint(ui, &format!("Модель: {model}"));
+        }
+        if info.status.gpu_fallback {
+            widgets::hint(
+                ui,
+                "Видеокарта не подошла (нет Vulkan или драйвер отказал) — модель работает на процессоре.",
+            );
+        }
+        if info.status.skipped > 0 {
+            widgets::hint(
+                ui,
+                &format!(
+                    "Не прочитано файлов: {} — они ищутся только по имени.",
+                    info.status.skipped
+                ),
+            );
+        }
+    });
+    card(ui, "Что понимать", |ui| {
+        widgets::hint(ui, "Имена файлов понимаются всегда. Изменение — индекс строится заново.");
+        switch_row(
+            ui,
+            "Картинки и кадры видео",
+            Some("Что изображено: фото, скриншоты, рисунки; у видео — кадр, как в эскизе Windows."),
+            &mut s.images,
+        );
+        switch_row(
+            ui,
+            "Документы",
+            Some("Текст и код, Word, Excel, PowerPoint, OpenDocument и первые страницы PDF."),
+            &mut s.documents,
+        );
+        switch_row(
+            ui,
+            "Звук",
+            Some("Первые 30 секунд записей MP3 и WAV: речь, музыка, звуки."),
+            &mut s.audio,
+        );
+        switch_row(
+            ui,
+            "Видеокарта",
+            Some(
+                "Считать на видеокарте через Vulkan. Не запустилась — сама переключится на процессор.",
+            ),
+            &mut s.gpu,
+        );
+        row(ui, "Файлы больше", |ui| {
+            ui.add(egui::DragValue::new(&mut s.max_file_mb).range(1..=4096).suffix(" МБ"));
+            ui.label(RichText::new("— только по имени").color(theme::TEXT_SECONDARY));
+        });
+    });
+    card(ui, "Папки", |ui| {
+        widgets::hint(
+            ui,
+            "Пусто — Рабочий стол, Документы, Загрузки, Изображения, Видео и Музыка. Скрытые и системные файлы пропускаются.",
+        );
+        path_list(ui, &mut s.folders, &mut state.new_semantic, "D:\\Фото");
+        ui.add_space(6.0);
+        widgets::hint(
+            ui,
+            "Исключения — по одному на строку: имя (node_modules), маска (*.tmp) или полный путь папки.",
+        );
+        let edit = ui.add(
+            egui::TextEdit::multiline(&mut state.semantic_exclude)
+                .desired_rows(4)
+                .desired_width(360.0),
+        );
+        if edit.changed() {
+            s.exclude = state
+                .semantic_exclude
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(String::from)
+                .collect();
+        }
+    });
+    card(ui, "Модель", |ui| {
+        row(ui, "Репозиторий", |ui| {
+            ui.add(egui::TextEdit::singleline(&mut s.model_repo).desired_width(280.0));
+        });
+        row(ui, "Квантование", |ui| {
+            let selected = QUANTS
+                .iter()
+                .find(|(q, _)| q.eq_ignore_ascii_case(&s.quant))
+                .map_or(s.quant.clone(), |(_, label)| label.to_string());
+            egui::ComboBox::from_id_salt("semantic-quant")
+                .selected_text(selected)
+                .width(280.0)
+                .show_ui(ui, |ui| {
+                    for (quant, label) in QUANTS {
+                        if ui.selectable_label(s.quant.eq_ignore_ascii_case(quant), label).clicked()
+                        {
+                            s.quant = quant.to_string();
+                        }
+                    }
+                });
+        });
+        row(ui, "Свой llama-server", |ui| {
+            let mut text = s.server.display().to_string();
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("пусто — скачанный MH Files")
+                    .desired_width(280.0),
+            );
+            if edit.changed() {
+                s.server = std::path::PathBuf::from(text.trim().trim_matches('"'));
+            }
+        });
+        widgets::hint(
+            ui,
+            &format!(
+                "По умолчанию — {} с Hugging Face и сборка llama.cpp с Vulkan с GitHub. Файлы: {}",
+                mh_files_core::semantic::model::DEFAULT_REPO,
+                info.dir.display()
+            ),
+        );
+    });
+    action
 }
 
 /// Список путей с кнопками «убрать» и полем «добавить».

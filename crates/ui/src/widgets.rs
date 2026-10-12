@@ -287,7 +287,7 @@ pub fn category_chips(
 }
 
 /// Скруглённая плашка-переключатель.
-fn chip(ui: &mut Ui, text: &str, selected: bool) -> Response {
+pub fn chip(ui: &mut Ui, text: &str, selected: bool) -> Response {
     let color = if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
     let galley = ui.painter().layout_no_wrap(text.to_string(), theme::regular(12.5), color);
     let size = vec2(galley.size().x + 20.0, 22.0);

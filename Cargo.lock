@@ -1421,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "crossbeam-channel",
@@ -1440,7 +1440,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "chrono",
  "indexmap",
@@ -1454,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-fs"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "blake3",
  "chrono",
@@ -1466,6 +1466,7 @@ dependencies = [
  "mh-files-platform",
  "parking_lot",
  "resvg",
+ "serde",
  "serde_json",
  "sevenz-rust2",
  "skrifa",
@@ -1476,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "mh-files-platform"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "crossbeam-channel",
  "windows",

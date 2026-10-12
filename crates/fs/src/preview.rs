@@ -351,7 +351,7 @@ pub fn text_like(ext: &str) -> bool {
 }
 
 /// Похоже на текст: в первых килобайтах нет нулевых байтов (кроме UTF-16 с BOM).
-fn sniff_text(path: &Path) -> bool {
+pub(crate) fn sniff_text(path: &Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else { return false };
     let mut head = [0u8; 4096];
     let Ok(n) = file.read(&mut head) else { return false };

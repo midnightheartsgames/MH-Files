@@ -116,33 +116,33 @@ pub fn read(bytes: &[u8]) -> Result<VolumeIndex, String> {
     Ok(index)
 }
 
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
+pub(crate) struct Reader<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) at: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+    pub(crate) fn take(&mut self, n: usize) -> Option<&'a [u8]> {
         let slice = self.bytes.get(self.at..self.at.checked_add(n)?)?;
         self.at += n;
         Some(slice)
     }
-    fn u16(&mut self) -> Option<u16> {
+    pub(crate) fn u16(&mut self) -> Option<u16> {
         Some(u16::from_le_bytes(self.take(2)?.try_into().ok()?))
     }
-    fn u32(&mut self) -> Option<u32> {
+    pub(crate) fn u32(&mut self) -> Option<u32> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
-    fn u64(&mut self) -> Option<u64> {
+    pub(crate) fn u64(&mut self) -> Option<u64> {
         Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
-    fn i64(&mut self) -> Option<i64> {
+    pub(crate) fn i64(&mut self) -> Option<i64> {
         Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
     }
 }
 
 /// FNV-1a: ловит битый или недописанный файл, а не злоумышленника.
-fn fnv(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
         hash ^= u64::from(byte);

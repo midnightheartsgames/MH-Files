@@ -33,6 +33,7 @@ pub mod read;
 pub mod recycle;
 pub mod rename;
 pub mod search;
+pub mod semantic;
 pub mod shell;
 pub mod sizes;
 pub mod sorting;
@@ -45,6 +46,7 @@ pub use images::{ImageKey, ImageKind, ImageResult};
 pub use indexer::{IndexResults, IndexStatus, Indexer, VolumeState, VolumeStatus};
 pub use preview::{Preview, PreviewRequest};
 pub use search::SearchQuery;
+pub use semantic::{Semantic, SemanticResults, SemanticState, SemanticStatus};
 pub use shell::ShellJob;
 pub use sizes::DirSize;
 pub use transfer::{Conflict, Transfer};
@@ -189,6 +191,15 @@ pub enum Event {
     /// Индекс изменился: состояние (обход, число записей) и, если `content`, содержимое —
     /// открытые результаты стоит обновить.
     IndexChanged {
+        content: bool,
+    },
+    /// Итог поиска по смыслу.
+    SemanticResults {
+        ticket: Ticket,
+        result: Result<SemanticResults, String>,
+    },
+    /// Поиск по смыслу изменился: состояние (скачивание, индексация) и, если `content`, индекс.
+    SemanticChanged {
         content: bool,
     },
     /// Ход извлечения из архива.

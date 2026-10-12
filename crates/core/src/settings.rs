@@ -32,6 +32,8 @@ pub struct Settings {
     /// Команда терминала; `{dir}` — папка. Пусто — Windows Terminal или PowerShell.
     pub terminal: String,
     pub index: IndexSettings,
+    /// Поиск по смыслу (EmbeddingGemma 2).
+    pub semantic: SemanticSettings,
     /// Сохранённые поиски по дискам, показываются в боковой панели.
     pub saved_searches: Vec<SavedSearch>,
     pub sorting: SortSettings,
@@ -157,6 +159,59 @@ pub struct IndexSettings {
     /// То же для сетевых дисков с буквой. Изменения в сети видны не всегда сразу: сервер
     /// может не сообщать о них.
     pub network: bool,
+}
+
+/// Поиск по смыслу: модель EmbeddingGemma 2 в своём процессе `llama-server`, индекс выбранных
+/// папок.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SemanticSettings {
+    /// Выключено, пока пользователь не согласится скачать модель (около гигабайта).
+    pub enabled: bool,
+    /// Что индексировать. Пусто — Документы, Изображения, Рабочий стол и Загрузки.
+    pub folders: Vec<PathBuf>,
+    /// Что пропускать: имя (`node_modules`), маска (`*.tmp`) или полный путь папки.
+    pub exclude: Vec<String>,
+    /// Картинки — по тому, что на них.
+    pub images: bool,
+    /// Текст, документы Office и страницы PDF — по содержанию.
+    pub documents: bool,
+    /// Звук (MP3, WAV) — по первым секундам записи.
+    pub audio: bool,
+    /// Считать на видеокарте (Vulkan), если она есть.
+    pub gpu: bool,
+    /// Файлы больше, МБ, — только по имени.
+    pub max_file_mb: u32,
+    /// Репозиторий модели на Hugging Face.
+    pub model_repo: String,
+    /// Квантование модели: Q8_0, Q4_K_M, BF16…
+    pub quant: String,
+    /// Свой `llama-server`; пусто — скачанный MH Files.
+    pub server: PathBuf,
+}
+
+impl Default for SemanticSettings {
+    fn default() -> SemanticSettings {
+        SemanticSettings {
+            enabled: false,
+            folders: Vec::new(),
+            exclude: vec![
+                ".git".into(),
+                "node_modules".into(),
+                "$RECYCLE.BIN".into(),
+                "AppData".into(),
+                "*.tmp".into(),
+            ],
+            images: true,
+            documents: true,
+            audio: true,
+            gpu: true,
+            max_file_mb: 64,
+            model_repo: crate::semantic::model::DEFAULT_REPO.into(),
+            quant: crate::semantic::model::DEFAULT_QUANT.into(),
+            server: PathBuf::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +347,7 @@ impl Default for Settings {
             keys: BTreeMap::new(),
             terminal: String::new(),
             index: IndexSettings::default(),
+            semantic: SemanticSettings::default(),
             saved_searches: Vec::new(),
             sorting: SortSettings::default(),
             system: SystemSettings::default(),
@@ -402,6 +458,14 @@ impl Settings {
         p.inspector_width = clamp(p.inspector_width, MIN_SIDE_WIDTH, MAX_SIDE_WIDTH, 300.0);
         self.preview.text_limit_kb = self.preview.text_limit_kb.clamp(4, 4096);
         self.preview.image_limit_mb = self.preview.image_limit_mb.clamp(1, 1024);
+        let semantic = &mut self.semantic;
+        semantic.max_file_mb = semantic.max_file_mb.clamp(1, 4096);
+        if semantic.model_repo.trim().is_empty() {
+            semantic.model_repo = crate::semantic::model::DEFAULT_REPO.into();
+        }
+        if semantic.quant.trim().is_empty() {
+            semantic.quant = crate::semantic::model::DEFAULT_QUANT.into();
+        }
         self.version = SETTINGS_VERSION;
         self
     }
@@ -512,5 +576,17 @@ mod tests {
         assert_eq!(s.sorting.excluded, ["node_modules"]);
         assert!(!s.preview.handlers);
         assert_eq!(Settings::parse(&s.to_json()).0, s, "запись и чтение без потерь");
+
+        // 1.1: поиска по смыслу ещё нет — выключен, со всем по умолчанию.
+        let v11 = r#"{"version": 1, "index": {"enabled": true}}"#;
+        let (s, _) = Settings::parse(v11);
+        assert_eq!(s.semantic, SemanticSettings::default());
+        assert!(!s.semantic.enabled && s.semantic.images && s.semantic.gpu);
+        let (s, _) = Settings::parse(
+            r#"{"semantic": {"enabled": true, "max_file_mb": 0, "quant": " ", "gpu": false}}"#,
+        );
+        assert!(s.semantic.enabled && !s.semantic.gpu);
+        assert_eq!(s.semantic.max_file_mb, 1);
+        assert_eq!(s.semantic.quant, "Q8_0");
     }
 }

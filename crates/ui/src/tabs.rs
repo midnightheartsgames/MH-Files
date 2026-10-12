@@ -16,7 +16,7 @@ use mh_files_core::session::{TabSession, ViewMode};
 use mh_files_core::sort::{SortColumn, SortOrder};
 use mh_files_fs::{
     CancelToken, DirWatch, DuplicateOptions, DuplicateProgress, IndexResults, Indexer, SearchQuery,
-    Ticket, Workers,
+    Semantic, SemanticResults, Ticket, Workers,
 };
 
 /// Как часто досортировывать список, пока он ещё грузится.
@@ -51,7 +51,7 @@ pub struct Band {
     pub base: std::collections::HashSet<PathBuf>,
 }
 
-/// Поиск по дискам во вкладке: поле запроса и итог.
+/// Поиск по дискам или по смыслу во вкладке: поле запроса и итог.
 #[derive(Debug, Clone)]
 pub struct IndexView {
     /// Текст поля запроса — как набран, с пробелами по краям.
@@ -69,6 +69,8 @@ pub struct IndexView {
     pub error: Option<String>,
     /// Когда запущен последний поиск.
     pub last: Instant,
+    /// Поиск по смыслу: почему найден файл — близость и подпись.
+    pub reasons: HashMap<PathBuf, (f32, String)>,
 }
 
 impl IndexView {
@@ -85,6 +87,7 @@ impl IndexView {
             elapsed: Duration::ZERO,
             error: None,
             last: Instant::now(),
+            reasons: HashMap::new(),
         }
     }
 }
@@ -387,7 +390,7 @@ impl Tab {
                 self.recycled = Some(HashMap::new());
                 self.cancel = Some(workers.list_recycle_bin(ticket));
             }
-            Location::Index { query } => {
+            Location::Index { query } | Location::Semantic { query } => {
                 // Сам поиск запускает окно в конце кадра: у вкладки нет доступа к индексу.
                 self.watch = None;
                 self.staging = None;
@@ -404,7 +407,7 @@ impl Tab {
         if !matches!(self.location, Location::Search { .. }) {
             self.search = None;
         }
-        if !matches!(self.location, Location::Index { .. }) {
+        if !everywhere(&self.location) {
             self.index = None;
         }
         if !matches!(self.location, Location::Duplicates { .. }) {
@@ -499,25 +502,38 @@ impl Tab {
         self.after_change();
     }
 
-    /// Новый текст в поле поиска по дискам. История не пополняется на каждую букву.
+    /// Новый текст в поле поиска по дискам или по смыслу. История не пополняется на каждую
+    /// букву.
     pub fn set_index_query(&mut self, text: String, workers: &Workers) {
         let query = text.trim().to_string();
         if let Some(view) = &mut self.index {
             view.text = text;
         }
-        if self.location != (Location::Index { query: query.clone() }) {
-            if !matches!(self.location, Location::Index { .. }) {
+        let location = match self.location {
+            Location::Semantic { .. } => Location::Semantic { query },
+            _ => Location::Index { query },
+        };
+        if self.location != location {
+            if !everywhere(&self.location) {
                 self.options.sort = SortOrder { column: SortColumn::Relevance, descending: false };
             }
-            self.location = Location::Index { query };
+            self.location = location;
             self.apply_options();
             self.reload(workers, true);
         }
     }
 
-    /// Запустить поиск по индексу, если он нужен.
-    pub fn start_index_search(&mut self, indexer: &Indexer, show_hidden: bool) {
-        let Location::Index { query } = &self.location else { return };
+    /// Запустить поиск по индексу или по смыслу, если он нужен.
+    pub fn start_index_search(
+        &mut self,
+        indexer: &Indexer,
+        semantic: &Semantic,
+        show_hidden: bool,
+    ) {
+        let (Location::Index { query } | Location::Semantic { query }) = &self.location else {
+            return;
+        };
+        let meaning = matches!(self.location, Location::Semantic { .. });
         let Some(view) = &mut self.index else { return };
         if !view.pending {
             return;
@@ -532,7 +548,39 @@ impl Tab {
         }
         self.generation += 1;
         let ticket = self.ticket();
-        self.cancel = Some(indexer.search(ticket, query, show_hidden));
+        self.cancel = Some(if meaning {
+            semantic.search(ticket, query)
+        } else {
+            indexer.search(ticket, query, show_hidden)
+        });
+    }
+
+    pub fn on_semantic_results(&mut self, ticket: Ticket, result: Result<SemanticResults, String>) {
+        if !self.current(ticket) {
+            return;
+        }
+        self.cancel = None;
+        let Some(view) = &mut self.index else { return };
+        view.searching = false;
+        let entries = match result {
+            Ok(found) => {
+                view.total = found.entries.len();
+                view.elapsed = found.elapsed;
+                view.error = None;
+                view.reasons = found.reasons;
+                found.entries
+            }
+            Err(error) => {
+                view.total = 0;
+                view.error = Some(error);
+                view.reasons.clear();
+                Vec::new()
+            }
+        };
+        self.listing.replace(entries);
+        self.listing.state = LoadState::Done;
+        self.dirty = false;
+        self.after_change();
     }
 
     pub fn on_index_results(&mut self, ticket: Ticket, result: Result<IndexResults, String>) {
@@ -547,6 +595,7 @@ impl Tab {
                 view.total = found.total;
                 view.elapsed = found.elapsed;
                 view.error = None;
+                view.reasons.clear();
                 found.entries
             }
             Err(error) => {
@@ -785,11 +834,19 @@ impl Tab {
 /// показывает всё, что пришло.
 /// Места, где порядок задаёт выдача, а не сортировка.
 fn ranked(location: &Location) -> bool {
-    matches!(location, Location::Index { .. } | Location::Duplicates { .. })
+    matches!(
+        location,
+        Location::Index { .. } | Location::Semantic { .. } | Location::Duplicates { .. }
+    )
+}
+
+/// Поиск по дискам или по смыслу: поле запроса во вкладке.
+pub fn everywhere(location: &Location) -> bool {
+    matches!(location, Location::Index { .. } | Location::Semantic { .. })
 }
 
 fn options_for(location: &Location, mut options: ViewOptions) -> ViewOptions {
-    if matches!(location, Location::Index { .. }) {
+    if everywhere(location) {
         options.show_hidden = true;
         options.show_system = true;
     }

@@ -523,11 +523,28 @@ impl FilesApp {
             }
             SearchEverywhere => {
                 if !matches!(self.tab().location, Location::Index { .. }) {
-                    let query = String::new();
+                    let query = self.everywhere_query();
                     self.open_location(Location::Index { query }, Target::Current);
                 }
                 if let Some(view) = &mut self.tab_mut().index {
                     view.focus = true;
+                }
+            }
+            SearchMeaning => {
+                if !matches!(self.tab().location, Location::Semantic { .. }) {
+                    let query = self.everywhere_query();
+                    self.open_location(Location::Semantic { query }, Target::Current);
+                }
+                if let Some(view) = &mut self.tab_mut().index {
+                    view.focus = true;
+                }
+            }
+            ReindexMeaning => {
+                if self.settings.semantic.enabled {
+                    self.semantic.rescan();
+                    self.set_status("папки поиска по смыслу пересматриваются", Level::Info);
+                } else {
+                    self.settings_window.open_semantic(&self.settings, &self.sorter.config);
                 }
             }
             SaveSearch => {
@@ -827,6 +844,15 @@ impl FilesApp {
         for place in places {
             let target = if many && target == Target::Current { Target::NewTab } else { target };
             self.open_location(place, target);
+        }
+    }
+
+    /// Запрос поиска по дискам или по смыслу из текущей вкладки: при смене режима клавишей
+    /// набранное не теряется.
+    fn everywhere_query(&self) -> String {
+        match &self.tab().location {
+            Location::Index { query } | Location::Semantic { query } => query.clone(),
+            _ => String::new(),
         }
     }
 
