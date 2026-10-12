@@ -344,8 +344,9 @@ impl Shared {
             mmproj: paths.mmproj.clone(),
             port: 0,
             gpu: settings.gpu,
-            // Половина ядер: индексация в фоне не должна отнимать компьютер.
-            threads: (threads / 2).max(1),
+            // Все ядра, кроме одного: процесс модели и так с пониженным приоритетом, а на
+            // половине ядер картинка на процессоре считалась ~11 с.
+            threads: threads.saturating_sub(1).max(1),
         };
         let log = self.dir.join("llama-server.log");
         let server = Server::start(&paths.exe, &config, &log)?;
