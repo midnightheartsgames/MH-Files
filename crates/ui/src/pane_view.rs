@@ -275,7 +275,7 @@ fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app:
         run(app, CommandId::Refresh);
     }
     ui.add_space(4.0);
-    let right = 5.0 * 28.0 + 6.0;
+    let right = 6.0 * 28.0 + 6.0;
     let width = (ui.available_width() - right).max(80.0);
     let (crumb_rect, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
     if tab.address.is_some() {
@@ -295,6 +295,10 @@ fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app:
         .clicked()
     {
         run(app, CommandId::NewFile);
+    }
+    let terminal_tip = "Открыть терминал здесь (Ctrl+Shift+T)";
+    if widgets::icon_button(ui, can_create, terminal_tip, icons::terminal).clicked() {
+        run(app, CommandId::OpenTerminal);
     }
     ui.add_space(6.0);
     let filter_tip = "Фильтр (Ctrl+F)";
