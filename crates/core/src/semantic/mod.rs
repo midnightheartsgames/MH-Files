@@ -45,24 +45,6 @@ pub fn document_prompt(title: &str, text: &str) -> String {
     format!("title: {title} | text: {}", text.trim())
 }
 
-/// Имя файла словами: `IMG_2024-07 отпуск.final.jpg` в папке «Море» → «IMG 2024 07 отпуск
-/// final · Море». По нему модель понимает файлы, содержимое которых не смотрит (видео,
-/// музыка, программы), а у остальных имя — ещё одна подсказка.
-pub fn name_words(path: &std::path::Path) -> String {
-    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    let stem = crate::entry::stem_of(&name, false);
-    let words = split_words(stem);
-    let parent = path
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| split_words(&n.to_string_lossy()))
-        .filter(|p| !p.is_empty());
-    match parent {
-        Some(parent) => format!("{words} · {parent}"),
-        None => words,
-    }
-}
-
 /// Разделители и «верблюжий» регистр — в пробелы.
 fn split_words(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 8);
@@ -89,6 +71,80 @@ fn split_words(text: &str) -> String {
         previous = Some(c);
     }
     out.trim().to_string()
+}
+
+/// Служебные слова: в имени файла они ничего не значат («кошка на диване» — ищутся «кошка»
+/// и «диване»).
+const STOPWORDS: &[&str] = &[
+    "в", "во", "на", "и", "с", "со", "по", "к", "ко", "о", "об", "у", "за", "из", "от", "до",
+    "для", "про", "под", "над", "или", "а", "но", "не", "мой", "моя", "мои", "the", "a", "an",
+    "of", "in", "on", "at", "to", "for", "with", "and", "or", "my",
+];
+
+/// Слова запроса для сравнения с именами: в нижнем регистре, «ё» как «е», без служебных.
+pub fn query_words(query: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for word in plain(query).split(|c: char| !c.is_alphanumeric()) {
+        if word.chars().count() >= 2
+            && !STOPWORDS.contains(&word)
+            && !words.iter().any(|w| w == word)
+        {
+            words.push(word.to_string());
+        }
+    }
+    words
+}
+
+/// Слова имени файла и его папки — так же, как [`query_words`], но со словами из
+/// «верблюжьего» регистра и цифр: `invoiceMarch2024` → invoice, march, 2024.
+pub fn name_tokens(path: &std::path::Path) -> Vec<String> {
+    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let mut text = split_words(crate::entry::stem_of(&name, false));
+    if let Some(parent) = path.parent().and_then(|p| p.file_name()) {
+        text.push(' ');
+        text.push_str(&split_words(&parent.to_string_lossy()));
+    }
+    plain(&text)
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Доля слов запроса, которые есть среди слов имени (0…1). Слово из четырёх букв и длиннее
+/// совпадает и с другими окончаниями: «кошка» — с «кошки», «кошкой», но не с «кошмар».
+pub fn name_coverage(tokens: &[String], words: &[String]) -> f32 {
+    if words.is_empty() {
+        return 0.0;
+    }
+    let found = words
+        .iter()
+        .filter(|word| {
+            let stem = stem(word);
+            tokens.iter().any(|t| t == *word || stem.is_some_and(|s| t.starts_with(s)))
+        })
+        .count();
+    found as f32 / words.len() as f32
+}
+
+/// Основа слова без конечных гласных (`кошка` → `кошк`, `диване` → `диван`); у коротких
+/// слов основы нет — они совпадают только целиком («кот» — не «котлеты»).
+fn stem(word: &str) -> Option<&str> {
+    if word.chars().count() < 4 {
+        return None;
+    }
+    let mut stem = word;
+    while stem.chars().count() > 3
+        && let Some(last) = stem.chars().last()
+        && "аеиоуыэюяйьaeiouy".contains(last)
+    {
+        stem = &stem[..stem.len() - last.len_utf8()];
+    }
+    Some(stem)
+}
+
+fn plain(text: &str) -> String {
+    text.to_lowercase().replace('ё', "е")
 }
 
 /// Пробелы и переводы строк — по одному: модели они ничего не говорят, а место занимают.
@@ -423,12 +479,29 @@ mod tests {
 
     #[test]
     fn names_become_words() {
+        let tokens = |p: &str| name_tokens(Path::new(p)).join(" ");
         assert_eq!(
-            name_words(Path::new("/фото/Море_2024/IMG_2024-07 отпуск.final.jpg")),
-            "IMG 2024 07 отпуск final · Море 2024"
+            tokens("/фото/Море_2024/IMG_2024-07 Отпуск.final.jpg"),
+            "img 2024 07 отпуск final море 2024"
         );
-        assert_eq!(name_words(Path::new("invoiceMarch2024.pdf")), "invoice March 2024");
-        assert_eq!(name_words(Path::new("/x/report2024v2.docx")), "report 2024 v 2 · x");
+        assert_eq!(tokens("invoiceMarch2024.pdf"), "invoice march 2024");
+        assert_eq!(tokens("/x/Ёлка (2).png"), "елка 2 x");
+    }
+
+    #[test]
+    fn query_words_match_names_with_other_endings() {
+        let words = query_words("Кошка на диване, ёлка и кот");
+        assert_eq!(words, ["кошка", "диване", "елка", "кот"]);
+        let cover = |name: &str, query: &str| {
+            name_coverage(&name_tokens(Path::new(name)), &query_words(query))
+        };
+        assert_eq!(cover("/фото/кошки/IMG_1.jpg", "кошка"), 1.0);
+        assert_eq!(cover("Кошкой_на_диванчике.jpg", "кошка на диване"), 1.0);
+        assert_eq!(cover("Ночной кошмар.png", "кошка"), 0.0);
+        assert_eq!(cover("Котлеты.lnk", "кот"), 0.0, "короткое слово — только целиком");
+        assert_eq!(cover("кот.jpg", "кот"), 1.0);
+        assert_eq!(cover("cat_videos.zip", "кошка cat"), 0.5);
+        assert_eq!(cover("x.txt", ""), 0.0);
     }
 
     #[test]

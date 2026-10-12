@@ -1,5 +1,6 @@
-//! Что из файла отдать модели: имя словами — всегда, а по настройкам ещё куски текста,
-//! картинку, кадр видео, страницы PDF, начало звукозаписи.
+//! Что из файла отдать модели: по настройкам — куски текста, картинку, кадр видео, страницы
+//! PDF, начало звукозаписи. Имя файла модели не отдаётся: оно сравнивается с запросом по
+//! словам (`Store::search`).
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -14,6 +15,8 @@ use mh_files_platform::thumbs::{Bitmap, ImageMode};
 
 /// Текста читается не больше: [`MAX_CHUNKS`] кусков всё равно берутся из начала.
 const TEXT_BYTES: u64 = 64 * 1024;
+/// Картинка меньше этого по большей стороне — значок: не смотрится.
+const MIN_IMAGE_SIDE: u32 = 256;
 /// Части документа Office читаются не больше: огромная таблица — не повод ждать.
 const OFFICE_BYTES: u64 = 8 << 20;
 
@@ -37,18 +40,14 @@ fn text_item(kind: PartKind, number: u16, snippet: String, text: String) -> Item
     Item { kind, number, snippet, input: Input::Text(text) }
 }
 
-/// Части файла `path` (`size` байт). Ошибки чтения содержимого не страшны: имя есть всегда.
+/// Части файла `path` (`size` байт). Ошибка чтения — частей меньше или нет совсем: файл
+/// всё равно находится по словам имени.
 /// `media` — модель понимает картинки и звук (загружен `mmproj`): иначе ни картинок, ни
 /// страниц PDF, ни звука.
 pub fn items(path: &Path, size: u64, settings: &SemanticSettings, media: bool) -> Vec<Item> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = extension_of(&name);
-    let mut items = vec![text_item(
-        PartKind::Name,
-        0,
-        String::new(),
-        model::document_prompt("none", &model::name_words(path)),
-    )];
+    let mut items = Vec::new();
     if size > u64::from(settings.max_file_mb) << 20 {
         return items;
     }
@@ -161,6 +160,10 @@ fn image(path: &Path, ext: &str) -> Option<Input> {
     } else {
         None
     };
+    // Значки и прочая мелочь: модели на них смотреть незачем, а в выдачу они лезут.
+    if bitmap.as_ref().is_some_and(|b| b.width.max(b.height) < MIN_IMAGE_SIDE) {
+        return None;
+    }
     // HEIC, RAW, PSD — через эскизы Windows, если кодеки стоят.
     match bitmap {
         Some(bitmap) => jpeg(&bitmap),
@@ -237,23 +240,20 @@ mod tests {
     }
 
     #[test]
-    fn text_files_give_name_and_chunks() {
+    fn text_files_give_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("заметки_отпуск.md");
         std::fs::write(&path, "# Поездка на море\n\nВзять купальник и крем от солнца.").unwrap();
         let items = items(&path, 100, &settings(), true);
-        assert_eq!(items[0].kind, PartKind::Name);
-        let Input::Text(name) = &items[0].input else { panic!() };
-        assert!(name.starts_with("title: none | text: заметки отпуск"), "{name}");
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[1].kind, PartKind::Text);
-        let Input::Text(chunk) = &items[1].input else { panic!() };
+        assert_eq!(items.len(), 1, "имя модели не отдаётся");
+        assert_eq!(items[0].kind, PartKind::Text);
+        let Input::Text(chunk) = &items[0].input else { panic!() };
         assert!(chunk.starts_with("title: заметки_отпуск | text: # Поездка на море"), "{chunk}");
-        assert!(items[1].snippet.contains("купальник"));
-        // Без «документов» — только имя; слишком большой файл — тоже.
+        assert!(items[0].snippet.contains("купальник"));
+        // Без «документов» — ничего (файл найдётся по имени); слишком большой файл — тоже.
         let off = SemanticSettings { documents: false, ..settings() };
-        assert_eq!(super::items(&path, 100, &off, true).len(), 1);
-        assert_eq!(super::items(&path, 65 << 20, &settings(), true).len(), 1);
+        assert!(super::items(&path, 100, &off, true).is_empty());
+        assert!(super::items(&path, 65 << 20, &settings(), true).is_empty());
     }
 
     #[test]
@@ -273,8 +273,8 @@ mod tests {
         .unwrap();
         zip.finish().unwrap();
         let items = items(&path, 500, &settings(), true);
-        assert_eq!(items.len(), 2, "{items:?}");
-        assert_eq!(items[1].snippet, "Договор аренды квартиры");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0].snippet, "Договор аренды квартиры");
     }
 
     #[test]
@@ -294,8 +294,12 @@ mod tests {
         assert!(base64.starts_with("/9j/"), "JPEG начинается с FF D8 FF");
         let no_images = SemanticSettings { images: false, ..settings() };
         assert!(super::items(&path, 1000, &no_images, true).iter().all(|i| !i.is_media()));
-        // Модель без кодировщика картинок: только имя.
-        assert!(super::items(&path, 1000, &settings(), false).iter().all(|i| !i.is_media()));
+        // Модель без кодировщика картинок: ничего.
+        assert!(super::items(&path, 1000, &settings(), false).is_empty());
+        // Значок не смотрится.
+        let icon = dir.path().join("значок.png");
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([1, 2, 3, 255])).save(&icon).unwrap();
+        assert!(super::items(&icon, 100, &settings(), true).is_empty());
     }
 
     #[test]

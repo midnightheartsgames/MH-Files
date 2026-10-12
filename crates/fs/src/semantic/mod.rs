@@ -781,12 +781,7 @@ fn search(shared: &Shared, text: &str, cancel: &CancelToken) -> Result<SemanticR
     if cancel.is_cancelled() {
         return Err("отменено".into());
     }
-    let words: Vec<String> = query
-        .to_lowercase()
-        .split_whitespace()
-        .filter(|w| w.chars().count() >= 2)
-        .map(String::from)
-        .collect();
+    let words = semantic_model::query_words(query);
     let settings = shared.settings().unwrap_or_default();
     let limit = settings.max_results as usize;
     let hits =
@@ -844,7 +839,7 @@ mod tests {
         });
         assert_eq!(status.state, SemanticState::Ready, "{status:?}");
         assert_eq!(status.files, 2, "исключённые и скрытые папки не индексируются");
-        assert_eq!(status.parts, 4, "имя и текст у каждого");
+        assert_eq!(status.parts, 2, "текст у каждого, имена векторами не считаются");
         assert!(calls.load(Ordering::SeqCst) >= 1);
         // «квартальный» начинается с той же буквы, что текст отчёта.
         semantic.search(Ticket { owner: 1, generation: 1 }, "квартал kind:документы".into());
@@ -863,20 +858,20 @@ mod tests {
         semantic.rescan();
         std::thread::sleep(Duration::from_millis(300));
         let status = wait(&semantic, |s| s.state == SemanticState::Ready && s.files == 1);
-        assert_eq!(status.parts, 2);
+        assert_eq!(status.parts, 1);
         assert_eq!(calls.load(Ordering::SeqCst), before, "неизменное не пересчитывается");
         semantic.shutdown(Duration::from_secs(5));
         // Индекс сохранён и читается.
         let store = Store::read(&std::fs::read(data.join("index.bin")).unwrap()).unwrap();
         assert_eq!(store.len(), 1);
         let doc = store.get(&docs.join("отчёт.txt")).unwrap();
-        assert_eq!(doc.parts[0].kind, PartKind::Name);
+        assert_eq!(doc.parts[0].kind, PartKind::Text);
         drop(fake);
     }
 
     /// Поддельный сервер отвечает на любую картинку одним вектором — как llama.cpp, который
     /// молча не видит картинку. Самопроверка это замечает: картинки не берутся, поиск — по
-    /// тексту и именам.
+    /// тексту и словам имён.
     #[test]
     fn images_that_all_look_alike_are_switched_off() {
         let (port, _) = server::tests::fake_server();
@@ -884,7 +879,7 @@ mod tests {
         let data = dir.path().join("data");
         let photos = dir.path().join("photos");
         std::fs::create_dir_all(&photos).unwrap();
-        image::RgbImage::from_pixel(32, 32, image::Rgb([200, 40, 40]))
+        image::RgbImage::from_pixel(320, 320, image::Rgb([200, 40, 40]))
             .save(photos.join("кот.png"))
             .unwrap();
         let (workers, _events) = Workers::new(mh_files_platform::no_waker());
@@ -901,7 +896,7 @@ mod tests {
         });
         assert_eq!(status.state, SemanticState::Ready, "{status:?}");
         assert!(status.media_fallback, "картинки не различаются — выключены");
-        assert_eq!((status.files, status.parts), (1, 1), "у картинки — только имя");
+        assert_eq!((status.files, status.parts), (1, 0), "картинка ищется только по имени");
         semantic.shutdown(Duration::from_secs(5));
         drop(fake);
     }
