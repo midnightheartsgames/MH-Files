@@ -179,11 +179,13 @@ pub fn jpeg(bitmap: &Bitmap) -> Option<Input> {
     }
     let rgb: Vec<u8> = bitmap
         .rgba
-        .chunks_exact(4)
-        .flat_map(|p| {
-            let alpha = u16::from(p[3]);
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, a]| {
+            let alpha = u16::from(a);
             let blend = |c: u8| ((u16::from(c) * alpha + 255 * (255 - alpha)) / 255) as u8;
-            [blend(p[0]), blend(p[1]), blend(p[2])]
+            [blend(r), blend(g), blend(b)]
         })
         .collect();
     let mut out = Vec::new();
