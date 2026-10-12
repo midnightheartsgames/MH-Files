@@ -83,6 +83,8 @@ pub struct SemanticStatus {
     pub loaded: bool,
     /// Видеокарта не подошла — считается на процессоре.
     pub gpu_fallback: bool,
+    /// Кодировщик картинок и звука не загрузился — понимается только текст и имена.
+    pub media_fallback: bool,
     /// Сколько файлов в последнем проходе прочитать не вышло.
     pub skipped: usize,
 }
@@ -96,6 +98,7 @@ impl Default for SemanticStatus {
             model: None,
             loaded: false,
             gpu_fallback: false,
+            media_fallback: false,
             skipped: 0,
         }
     }
@@ -340,12 +343,13 @@ impl Shared {
         let log = self.dir.join("llama-server.log");
         let server = Server::start(&paths.exe, &config, &log)?;
         let port = server.port;
-        let fallback = server.gpu_fallback;
+        let (gpu, media) = (server.gpu_fallback, server.media_fallback);
         *guard = Some(server);
         drop(guard);
         self.update(|s| {
             s.loaded = true;
-            s.gpu_fallback = fallback;
+            s.gpu_fallback = gpu;
+            s.media_fallback = media;
         });
         Ok(port)
     }
@@ -467,14 +471,21 @@ fn activate(
         shared.unload();
         *shared.paths.lock() = Some(paths.clone());
     }
+    // Модель — сразу: не запускается, так и сказать, а не молча обходить папки. От того,
+    // запустилась ли она с кодировщиком картинок и звука, зависит, что брать из файлов.
+    shared.set_state(SemanticState::Starting);
+    if let Err(error) = shared.ensure_server() {
+        shared.set_state(SemanticState::Failed(error));
+        return (None, false);
+    }
+    let media = paths.mmproj.is_some() && !shared.status.lock().media_fallback;
     // Векторы зависят от модели и от того, что из файлов берётся.
     let file =
         paths.model.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let flags: String =
-        [settings.images, settings.documents, settings.audio, paths.mmproj.is_some()]
-            .iter()
-            .map(|&on| if on { '1' } else { '0' })
-            .collect();
+    let flags: String = [settings.images, settings.documents, settings.audio, media]
+        .iter()
+        .map(|&on| if on { '1' } else { '0' })
+        .collect();
     let id = format!("{}|{flags}", model_files::model_id(&file));
     if loaded_model.as_deref() != Some(id.as_str()) {
         let store = std::fs::read(shared.index_path())
@@ -496,7 +507,7 @@ fn activate(
         });
     }
     shared.notify(true, true);
-    let result = index(shared, &settings, jobs);
+    let result = index(shared, &settings, media, jobs);
     shared.save();
     match result {
         Ok(None) => {
@@ -523,6 +534,7 @@ struct Found {
 fn index(
     shared: &Arc<Shared>,
     settings: &SemanticSettings,
+    media: bool,
     jobs: &Receiver<Job>,
 ) -> Result<Option<Job>, String> {
     let interrupted = || jobs.try_recv().ok();
@@ -557,7 +569,7 @@ fn index(
             flush(shared, &mut batch, &mut skipped)?;
             return Ok(Some(job));
         }
-        let items = extract::items(&file.path, file.size, settings);
+        let items = extract::items(&file.path, file.size, settings, media);
         let media = items.iter().any(Item::is_media);
         if media {
             // Картинки и звук — отдельным запросом: они считаются дольше всего остального.

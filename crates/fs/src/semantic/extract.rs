@@ -38,7 +38,9 @@ fn text_item(kind: PartKind, number: u16, snippet: String, text: String) -> Item
 }
 
 /// Части файла `path` (`size` байт). Ошибки чтения содержимого не страшны: имя есть всегда.
-pub fn items(path: &Path, size: u64, settings: &SemanticSettings) -> Vec<Item> {
+/// `media` — модель понимает картинки и звук (загружен `mmproj`): иначе ни картинок, ни
+/// страниц PDF, ни звука.
+pub fn items(path: &Path, size: u64, settings: &SemanticSettings, media: bool) -> Vec<Item> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = extension_of(&name);
     let mut items = vec![text_item(
@@ -70,11 +72,11 @@ pub fn items(path: &Path, size: u64, settings: &SemanticSettings) -> Vec<Item> {
             if let Ok(text) = office_text(path, &ext) {
                 texts(&text, &mut items);
             }
-        } else if ext == "pdf" {
+        } else if ext == "pdf" && media {
             items.extend(pdf_pages(path));
         }
     }
-    if settings.images {
+    if settings.images && media {
         let picture = if Category::Images.extensions().contains(&ext.as_str()) {
             image(path, &ext)
         } else if Category::Video.extensions().contains(&ext.as_str()) {
@@ -88,6 +90,7 @@ pub fn items(path: &Path, size: u64, settings: &SemanticSettings) -> Vec<Item> {
         }
     }
     if settings.audio
+        && media
         && let Some(base64) = audio(path, &ext)
     {
         items.push(Item {
@@ -238,7 +241,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("заметки_отпуск.md");
         std::fs::write(&path, "# Поездка на море\n\nВзять купальник и крем от солнца.").unwrap();
-        let items = items(&path, 100, &settings());
+        let items = items(&path, 100, &settings(), true);
         assert_eq!(items[0].kind, PartKind::Name);
         let Input::Text(name) = &items[0].input else { panic!() };
         assert!(name.starts_with("title: none | text: заметки отпуск"), "{name}");
@@ -249,8 +252,8 @@ mod tests {
         assert!(items[1].snippet.contains("купальник"));
         // Без «документов» — только имя; слишком большой файл — тоже.
         let off = SemanticSettings { documents: false, ..settings() };
-        assert_eq!(super::items(&path, 100, &off).len(), 1);
-        assert_eq!(super::items(&path, 65 << 20, &settings()).len(), 1);
+        assert_eq!(super::items(&path, 100, &off, true).len(), 1);
+        assert_eq!(super::items(&path, 65 << 20, &settings(), true).len(), 1);
     }
 
     #[test]
@@ -269,7 +272,7 @@ mod tests {
         )
         .unwrap();
         zip.finish().unwrap();
-        let items = items(&path, 500, &settings());
+        let items = items(&path, 500, &settings(), true);
         assert_eq!(items.len(), 2, "{items:?}");
         assert_eq!(items[1].snippet, "Договор аренды квартиры");
     }
@@ -283,14 +286,16 @@ mod tests {
             *pixel = image::Rgba([(x % 256) as u8, 80, 160, if x < 800 { 255 } else { 0 }]);
         }
         picture.save(&path).unwrap();
-        let items = items(&path, 1000, &settings());
+        let items = items(&path, 1000, &settings(), true);
         let image = items.iter().find(|i| i.kind == PartKind::Image).unwrap();
         assert!(image.is_media());
         let Input::Image { mime, base64 } = &image.input else { panic!() };
         assert_eq!(*mime, "image/jpeg");
         assert!(base64.starts_with("/9j/"), "JPEG начинается с FF D8 FF");
         let no_images = SemanticSettings { images: false, ..settings() };
-        assert!(super::items(&path, 1000, &no_images).iter().all(|i| !i.is_media()));
+        assert!(super::items(&path, 1000, &no_images, true).iter().all(|i| !i.is_media()));
+        // Модель без кодировщика картинок: только имя.
+        assert!(super::items(&path, 1000, &settings(), false).iter().all(|i| !i.is_media()));
     }
 
     #[test]
@@ -301,12 +306,12 @@ mod tests {
         bytes.extend(std::iter::repeat_n(0xAA, 16)); // тег
         bytes.extend(std::iter::repeat_n(0xFF, 600 * 1024)); // «кадры»
         std::fs::write(&mp3, &bytes).unwrap();
-        let items = items(&mp3, bytes.len() as u64, &settings());
+        let items = items(&mp3, bytes.len() as u64, &settings(), true);
         let audio = items.iter().find(|i| i.kind == PartKind::Audio).unwrap();
         let Input::Audio { base64 } = &audio.input else { panic!() };
         assert_eq!(base64.len(), mh_files_core::semantic::MP3_BYTES.div_ceil(3) * 4);
         assert!(base64.starts_with("////"), "тег пропущен");
         let quiet = SemanticSettings { audio: false, ..settings() };
-        assert!(super::items(&mp3, 10, &quiet).iter().all(|i| i.kind != PartKind::Audio));
+        assert!(super::items(&mp3, 10, &quiet, true).iter().all(|i| i.kind != PartKind::Audio));
     }
 }
