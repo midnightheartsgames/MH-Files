@@ -264,6 +264,60 @@ pub fn double_clicked(response: &Response) -> bool {
         })
 }
 
+/// Ряд категорий поиска; щелчок по другой — она. `folders` — показывать «Папки» (при
+/// поиске по тексту внутри файлов папок не бывает).
+pub fn category_chips(
+    ui: &mut Ui,
+    current: mh_files_core::category::Category,
+    folders: bool,
+) -> Option<mh_files_core::category::Category> {
+    use mh_files_core::category::Category;
+    let mut picked = None;
+    ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+    for category in Category::ALL {
+        if category == Category::Folders && !folders {
+            continue;
+        }
+        let selected = category == current;
+        if chip(ui, category.title(), selected).clicked() && !selected {
+            picked = Some(category);
+        }
+    }
+    picked
+}
+
+/// Скруглённая плашка-переключатель.
+fn chip(ui: &mut Ui, text: &str, selected: bool) -> Response {
+    let color = if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), theme::regular(12.5), color);
+    let size = vec2(galley.size().x + 20.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let painter = ui.painter();
+    let radius = CornerRadius::same(11);
+    if selected {
+        painter.rect_filled(rect, radius, theme::selection_fill());
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, theme::accent().gamma_multiply(0.7)),
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        if response.hovered() {
+            painter.rect_filled(rect, radius, theme::CARD);
+        }
+        painter.rect_stroke(
+            rect,
+            radius,
+            Stroke::new(1.0, theme::CARD_STROKE),
+            egui::StrokeKind::Inside,
+        );
+    }
+    let pos = rect.center() - galley.size() / 2.0;
+    painter.galley(pos, galley, color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

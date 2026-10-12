@@ -7,11 +7,14 @@
 //! * `"в кавычках"` — фраза с пробелами;
 //! * фильтры: `ext:png,jpg` · `size:>100mb`, `size:<1kb`, `size:10mb..1gb` ·
 //!   `dm:2026`, `dm:2026-09`, `dm:>2026-09-01`, `dm:сегодня|вчера|неделя|месяц` ·
-//!   `type:папка|файл` (или `folder:`, `file:`) · `in:"K:\Models"` · `hidden:да`.
+//!   `type:папка|файл` (или `folder:`, `file:`) · `in:"K:\Models"` · `hidden:да` ·
+//!   `kind:изображения|видео|аудио|документы|архивы|программы|папки`.
 
 use std::path::PathBuf;
 
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
+
+use crate::category::Category;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Term {
@@ -34,6 +37,8 @@ pub struct Query {
     pub modified: Option<(i64, i64)>,
     /// `Some(true)` — только папки, `Some(false)` — только файлы.
     pub dirs: Option<bool>,
+    /// Категория файла: изображения, видео и так далее (папки — через `dirs`).
+    pub category: Category,
     /// Только внутри этой папки.
     pub within: Option<PathBuf>,
     /// Показывать скрытые и системные.
@@ -45,6 +50,7 @@ impl Query {
     pub fn is_empty(&self) -> bool {
         self.terms.is_empty()
             && self.exts.is_empty()
+            && self.category.extensions().is_empty()
             && self.size.is_none()
             && self.modified.is_none()
             && self.within.is_none()
@@ -98,7 +104,7 @@ fn tokenize(text: &str) -> Vec<String> {
     tokens
 }
 
-const KEYS: &[&str] = &["ext", "size", "dm", "type", "folder", "file", "in", "hidden"];
+const KEYS: &[&str] = &["ext", "size", "dm", "type", "folder", "file", "in", "hidden", "kind"];
 
 /// `ключ:значение`, если ключ известен. `C:\path` — не фильтр.
 fn filter_parts(token: &str) -> Option<(String, String)> {
@@ -129,6 +135,10 @@ fn apply_filter(query: &mut Query, key: &str, value: &str, now: i64) -> Result<(
             }
         }
         "folder" => query.dirs = Some(true),
+        "kind" => match Category::parse(value).ok_or_else(|| bad("kind", value))? {
+            Category::Folders => query.dirs = Some(true),
+            category => query.category = category,
+        },
         "file" => query.dirs = Some(false),
         "in" => {
             if value.is_empty() {
@@ -303,6 +313,10 @@ mod tests {
         assert!(parse("size:много", now()).is_err());
         assert!(parse("type:кот", now()).is_err());
         assert_eq!(q("folder:").dirs, Some(true));
+        assert_eq!(q("kind:видео").category, Category::Video);
+        assert!(!q("kind:видео").is_empty());
+        assert_eq!(q("kind:папки").dirs, Some(true));
+        assert!(parse("kind:кот", now()).is_err());
     }
 
     #[test]

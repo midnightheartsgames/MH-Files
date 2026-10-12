@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use std::io::Read;
 
+use mh_files_core::category::Category;
 use mh_files_core::filter::{ContentQuery, Filter};
 
 use crate::{CancelToken, Event, Ticket, Workers, read};
@@ -28,6 +29,8 @@ pub struct SearchQuery {
     pub include_hidden: bool,
     /// Искать слова внутри файлов, а не в именах.
     pub content: bool,
+    /// Только записи этой категории. С категорией пустой запрос по имени — «все такие».
+    pub category: Category,
 }
 
 /// Файлы больше этого по содержимому не просматриваются.
@@ -62,7 +65,8 @@ pub fn walk(
 ) -> Result<usize, String> {
     let filter = Filter::new(&query.text);
     let content = query.content.then(|| ContentQuery::new(&query.text));
-    if filter.is_empty() || content.as_ref().is_some_and(ContentQuery::is_empty) {
+    let by_category = query.category != Category::All && !query.content;
+    if (filter.is_empty() && !by_category) || content.as_ref().is_some_and(ContentQuery::is_empty) {
         return Err("пустой запрос".into());
     }
     std::fs::read_dir(root).map_err(|error| crate::listing::describe(root, &error))?;
@@ -87,6 +91,9 @@ pub fn walk(
                 entry.file_type().is_ok_and(|t| t.is_symlink()) || record.attributes.reparse();
             if record.is_dir() && !link {
                 queue.push_back(record.path());
+            }
+            if !query.category.matches(&record.name, record.is_dir()) {
+                continue;
             }
             let found_here = match &content {
                 None => filter.matches(&record.name),
@@ -157,7 +164,12 @@ mod tests {
                 .unwrap();
             assert!(status.success());
         }
-        let query = SearchQuery { text: "*.gguf".into(), include_hidden: false, content: false };
+        let query = SearchQuery {
+            text: "*.gguf".into(),
+            include_hidden: false,
+            content: false,
+            category: Category::All,
+        };
         let mut names = Vec::new();
         let scanned = walk(&dir, &query, &CancelToken::default(), |batch, _| {
             names.extend(batch.into_iter().map(|e| e.name));
@@ -166,10 +178,41 @@ mod tests {
         names.sort();
         assert_eq!(names, ["llama.gguf", "qwen-7b.gguf"]);
         assert_eq!(scanned, 4);
-        let words = SearchQuery { text: "QWEN gguf".into(), include_hidden: true, content: false };
+        let words = SearchQuery {
+            text: "QWEN gguf".into(),
+            include_hidden: true,
+            content: false,
+            category: Category::All,
+        };
         let mut count = 0;
         walk(&dir, &words, &CancelToken::default(), |batch, _| count += batch.len()).unwrap();
         assert_eq!(count, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn filters_by_category() {
+        let dir = std::env::temp_dir().join(format!("mh-files-category-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("trip/photos")).unwrap();
+        std::fs::write(dir.join("trip/photos/sea.JPG"), "").unwrap();
+        std::fs::write(dir.join("trip/sea.mp4"), "").unwrap();
+        std::fs::write(dir.join("trip/notes.txt"), "").unwrap();
+        let search = |text: &str, category| {
+            let query =
+                SearchQuery { text: text.into(), include_hidden: true, content: false, category };
+            let mut names = Vec::new();
+            let result = walk(&dir, &query, &CancelToken::default(), |batch, _| {
+                names.extend(batch.into_iter().map(|e| e.name));
+            });
+            names.sort();
+            result.map(|_| names)
+        };
+        assert_eq!(search("sea", Category::Video).unwrap(), ["sea.mp4"]);
+        assert_eq!(search("", Category::Images).unwrap(), ["sea.JPG"]);
+        assert_eq!(search("", Category::Folders).unwrap(), ["photos", "trip"]);
+        assert_eq!(search("o", Category::Documents).unwrap(), ["notes.txt"]);
+        assert!(search("", Category::All).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -191,7 +234,12 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("docs/other.txt"), "только договор").unwrap();
         let search = |text: &str| {
-            let query = SearchQuery { text: text.into(), include_hidden: true, content: true };
+            let query = SearchQuery {
+                text: text.into(),
+                include_hidden: true,
+                content: true,
+                category: Category::All,
+            };
             let mut names = Vec::new();
             walk(&dir, &query, &CancelToken::default(), |batch, _| {
                 names.extend(batch.into_iter().map(|e| e.name));
@@ -202,7 +250,12 @@ mod tests {
         };
         assert_eq!(search("аренды договор"), ["old.ini", "wide.txt", "договор.txt"]);
         assert_eq!(search("аренды *.txt"), ["wide.txt", "договор.txt"]);
-        let empty = SearchQuery { text: "*.txt".into(), include_hidden: true, content: true };
+        let empty = SearchQuery {
+            text: "*.txt".into(),
+            include_hidden: true,
+            content: true,
+            category: Category::All,
+        };
         assert!(walk(&dir, &empty, &CancelToken::default(), |_, _| {}).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }

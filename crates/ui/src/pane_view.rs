@@ -11,6 +11,7 @@ use eframe::egui::{
     ScrollArea, Sense, Stroke, TextureHandle, Ui, pos2, text::LayoutJob, vec2,
 };
 use mh_files_core::Entry;
+use mh_files_core::category::{self, Category};
 use mh_files_core::entry::stem_of;
 use mh_files_core::format;
 use mh_files_core::listing::LoadState;
@@ -38,8 +39,27 @@ pub fn show(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
     if tab.filter_open {
         filter_bar(ui, tab, app);
     }
-    if let Location::Search { root, query, .. } = &tab.location {
-        search_header(ui, tab.search.as_ref(), root, query, tab.listing.len());
+    if let Location::Search { root, query, content, category } = &tab.location
+        && let Some(picked) = search_header(
+            ui,
+            tab.search.as_ref(),
+            root,
+            query,
+            *content,
+            *category,
+            tab.listing.len(),
+        )
+    {
+        // Пустой запрос ищет только с категорией: «Всё» без слов — не поиск.
+        if picked != Category::All || !query.trim().is_empty() {
+            let location = Location::Search {
+                root: root.clone(),
+                query: query.clone(),
+                content: *content,
+                category: picked,
+            };
+            app.actions.push(Action::Open { location, target: Target::Current });
+        }
     }
     if matches!(tab.location, Location::Index { .. }) {
         index_bar(ui, tab, app);
@@ -577,20 +597,28 @@ fn filter_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     }
 }
 
+/// Итог поиска по папке и ряд категорий; возвращает выбранную другую категорию.
 fn search_header(
     ui: &mut Ui,
     progress: Option<&crate::tabs::SearchProgress>,
     root: &Path,
     query: &str,
+    content: bool,
+    category: Category,
     found: usize,
-) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
+) -> Option<Category> {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 58.0), Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
+    let what = match (query.trim().is_empty(), category) {
+        (true, category) => category.title().to_string(),
+        (false, Category::All) => format!("«{query}»"),
+        (false, category) => format!("«{query}» · {}", category.title()),
+    };
     let (text, color) = match progress {
         Some(p) if p.error.is_some() => (
             format!(
-                "«{query}» в {}: {} — {}",
+                "{what} в {}: {} — {}",
                 path_label(root),
                 format::items(found),
                 p.error.as_deref().unwrap_or("")
@@ -599,7 +627,7 @@ fn search_header(
         ),
         Some(p) if p.done => (
             format!(
-                "«{query}» в {}: {} · просмотрено папок: {}",
+                "{what} в {}: {} · просмотрено папок: {}",
                 path_label(root),
                 format::items(found),
                 p.scanned
@@ -607,24 +635,29 @@ fn search_header(
             theme::TEXT_SECONDARY,
         ),
         Some(p) => (
-            format!("Поиск «{query}»… {} · папок: {}", format::items(found), p.scanned),
+            format!("Поиск {what}… {} · папок: {}", format::items(found), p.scanned),
             theme::accent(),
         ),
         None => (String::new(), theme::TEXT_SECONDARY),
     };
     painter.text(
-        rect.left_center() + vec2(10.0, 0.0),
+        pos2(rect.left() + 10.0, rect.top() + 14.0),
         Align2::LEFT_CENTER,
         text,
         theme::regular(13.0),
         color,
     );
+    let chips = Rect::from_min_max(pos2(rect.left() + 8.0, rect.top() + 28.0), rect.max);
+    let mut row = ui.new_child(
+        egui::UiBuilder::new().max_rect(chips).layout(Layout::left_to_right(Align::Min)),
+    );
+    widgets::category_chips(&mut row, category, !content)
 }
 
 /// Поле поиска по дискам и итог: сколько найдено, за сколько, в каком состоянии индекс.
 fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     let Some(view) = &mut tab.index else { return };
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 62.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 90.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
     let field = Rect::from_min_size(rect.min + vec2(10.0, 6.0), vec2(rect.width() - 150.0, 30.0));
     ui.painter().rect_filled(field, CornerRadius::same(5), theme::CARD);
@@ -648,11 +681,18 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
                         .frame(egui::Frame::NONE)
             .vertical_align(Align::Center)
             .font(theme::regular(14.0))
-            .hint_text("Имя, маска или фильтры: ext:pdf size:>10mb dm:неделя type:папка in:\"C:\\Проекты\"")
+            .hint_text("Имя, маска или фильтры: ext:pdf size:>10mb dm:неделя kind:видео in:\"C:\\Проекты\"")
             .desired_width(edit_rect.width()),
     );
     if std::mem::take(&mut view.focus) {
         edit.request_focus();
+    }
+    let chips = Rect::from_min_max(pos2(field.left() - 2.0, field.bottom() + 6.0), rect.max);
+    let mut row = ui.new_child(
+        egui::UiBuilder::new().max_rect(chips).layout(Layout::left_to_right(Align::Min)),
+    );
+    if let Some(picked) = widgets::category_chips(&mut row, category::kind_of(&text), true) {
+        text = category::with_kind(&text, picked);
     }
     let leave = edit.has_focus()
         && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowDown));

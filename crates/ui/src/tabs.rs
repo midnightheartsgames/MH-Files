@@ -334,13 +334,13 @@ impl Tab {
                 }
                 self.cancel = Some(workers.list(ticket, dir));
             }
-            Location::Search { root, query, content } => {
+            Location::Search { root, query, content, category } => {
                 self.watch = None;
                 self.staging = None;
                 self.listing.reset();
                 self.search = Some(SearchProgress::default());
                 let include_hidden = self.options.show_hidden;
-                let query = SearchQuery { text: query, include_hidden, content };
+                let query = SearchQuery { text: query, include_hidden, content, category };
                 self.cancel = Some(workers.search(ticket, root, query));
             }
             Location::Archive { archive, inner } => {

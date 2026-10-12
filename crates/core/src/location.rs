@@ -4,6 +4,8 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::category::Category;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Location {
     /// Список дисков.
@@ -15,6 +17,9 @@ pub enum Location {
         query: String,
         #[serde(default)]
         content: bool,
+        /// Только записи этой категории: папки, изображения, видео…
+        #[serde(default)]
+        category: Category,
     },
     /// Поиск по индексу всех дисков.
     Index {
@@ -141,7 +146,11 @@ impl Location {
             Location::Computer => COMPUTER_TITLE.to_string(),
             Location::Dir(path) => path_label(path),
             Location::Search { query, content: true, .. } => format!("Текст: {query}"),
-            Location::Search { query, .. } => format!("Поиск: {query}"),
+            Location::Search { query, category: Category::All, .. } => format!("Поиск: {query}"),
+            Location::Search { query, category, .. } if query.is_empty() => {
+                category.title().to_string()
+            }
+            Location::Search { query, category, .. } => format!("{}: {query}", category.title()),
             Location::Index { query } if query.is_empty() => INDEX_TITLE.to_string(),
             Location::Index { query } => format!("Везде: {query}"),
             Location::Archive { archive, inner } => match inner.rsplit('/').find(|p| !p.is_empty())
@@ -234,9 +243,14 @@ impl Location {
             });
         }
         match self {
-            Location::Search { query, content, .. } => {
+            Location::Search { query, content, category, .. } => {
                 let what = if *content { "Текст" } else { "Поиск" };
-                crumbs.push(Crumb { label: format!("{what} «{query}»"), location: self.clone() });
+                let label = match (query.is_empty(), category) {
+                    (_, Category::All) => format!("{what} «{query}»"),
+                    (true, category) => category.title().to_string(),
+                    (false, category) => format!("{what} «{query}» · {}", category.title()),
+                };
+                crumbs.push(Crumb { label, location: self.clone() });
             }
             Location::Duplicates { .. } => {
                 crumbs.push(Crumb { label: DUPLICATES_TITLE.into(), location: self.clone() });
@@ -328,9 +342,21 @@ mod tests {
         assert_eq!(labels, [COMPUTER_TITLE, "/", "home", "user"]);
         assert_eq!(dir.title(), "user");
         assert_eq!(Location::Dir(PathBuf::from("/")).title(), "/");
-        let search =
-            Location::Search { root: PathBuf::from("/home"), query: "x".into(), content: false };
+        let search = Location::Search {
+            root: PathBuf::from("/home"),
+            query: "x".into(),
+            content: false,
+            category: Category::All,
+        };
         assert_eq!(search.crumbs().last().unwrap().label, "Поиск «x»");
+        let video = Location::Search {
+            root: PathBuf::from("/home"),
+            query: String::new(),
+            content: false,
+            category: Category::Video,
+        };
+        assert_eq!(video.crumbs().last().unwrap().label, "Видео");
+        assert_eq!(video.title(), "Видео");
         assert_eq!(search.dir(), None);
         let index = Location::Index { query: "x".into() };
         let labels: Vec<String> = index.crumbs().into_iter().map(|c| c.label).collect();
