@@ -1,14 +1,14 @@
-//! HTTPS-запрос через WinHTTP: системный прокси (в том числе автонастройка), системное
+//! HTTPS-запросы через WinHTTP: системный прокси (в том числе автонастройка), системное
 //! хранилище сертификатов, распаковка gzip.
 
 use std::ffi::c_void;
 
 use windows::Win32::Networking::WinHttp::{
     INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
-    WINHTTP_OPTION_DECOMPRESSION, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
-    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders,
-    WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
-    WinHttpSetTimeouts,
+    WINHTTP_OPTION_DECOMPRESSION, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+    WinHttpSetOption, WinHttpSetTimeouts,
 };
 use windows::core::{PCWSTR, w};
 
@@ -41,6 +41,27 @@ pub fn get(
     headers: &[(&str, &str)],
     limit: usize,
 ) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    fetch(host, path, headers, &mut |_| true, &mut |chunk| {
+        body.extend_from_slice(chunk);
+        if body.len() > limit {
+            Err("ответ слишком большой".into())
+        } else {
+            Ok(())
+        }
+    })?;
+    Ok(body)
+}
+
+/// GET с телом по частям: `length` узнаёт длину ответа (`false` — не нужен), `sink`
+/// получает куски по мере прихода; ошибка из `sink` прерывает загрузку.
+pub fn fetch(
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    length: &mut dyn FnMut(Option<u64>) -> bool,
+    sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
+) -> Result<(), String> {
     let agent = wide(format!("MH-Files/{}", env!("CARGO_PKG_VERSION")));
     let host = wide(host);
     let path = wide(path);
@@ -106,8 +127,24 @@ pub fn get(
         if status != 200 {
             return Err(format!("сервер ответил кодом {status}"));
         }
-        let mut body = Vec::new();
-        let mut chunk = vec![0u8; 64 * 1024];
+        // Длина — строкой: числом WinHTTP отдаёт только 32 бита.
+        let mut text = [0u16; 32];
+        let mut bytes = std::mem::size_of_val(&text) as u32;
+        let total = WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_CONTENT_LENGTH,
+            PCWSTR::null(),
+            Some(text.as_mut_ptr() as *mut c_void),
+            &mut bytes,
+            std::ptr::null_mut(),
+        )
+        .ok()
+        .and_then(|_| String::from_utf16(&text[..bytes as usize / 2]).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok());
+        if !length(total) {
+            return Err("отменено".into());
+        }
+        let mut chunk = vec![0u8; 256 * 1024];
         loop {
             let mut read = 0u32;
             WinHttpReadData(
@@ -120,11 +157,8 @@ pub fn get(
             if read == 0 {
                 break;
             }
-            body.extend_from_slice(&chunk[..read as usize]);
-            if body.len() > limit {
-                return Err("ответ слишком большой".into());
-            }
+            sink(&chunk[..read as usize])?;
         }
-        Ok(body)
+        Ok(())
     }
 }

@@ -61,8 +61,10 @@ commands! {
         Search => "Поиск во вложенных папках", ["search", "найти"], ["Ctrl+Shift+F"];
     SearchContent => "Поиск по содержимому", ["grep", "текст", "внутри файлов", "content"], ["Ctrl+Alt+F"];
     SearchEverywhere => "Поиск по дискам", ["everything", "везде", "index", "индекс"], ["Ctrl+E"];
+    SearchMeaning => "Поиск по смыслу", ["semantic", "смысл", "ai", "ии", "нейросеть", "embeddinggemma", "похожие", "описание"], ["Ctrl+Shift+Space"];
     SaveSearch => "Сохранить поиск", ["save search", "запомнить"], [];
     Reindex => "Переиндексировать диски", ["reindex", "rescan", "индекс"], [];
+    ReindexMeaning => "Пересканировать папки поиска по смыслу", ["semantic reindex", "смысл", "индекс"], [];
     Copy => "Копировать", ["copy"], ["Ctrl+C"];
     Cut => "Вырезать", ["cut"], ["Ctrl+X"];
     Paste => "Вставить", ["paste"], ["Ctrl+V"];

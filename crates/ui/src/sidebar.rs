@@ -113,6 +113,13 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
         if response.clicked() {
             app.actions.push(Action::Run(crate::commands::CommandId::SearchEverywhere));
         }
+        let meaning =
+            matches!(&app.tab().location, Location::Semantic { query } if query.is_empty());
+        // Без сочетания в строке: «Ctrl+Shift+Space» съел бы подпись.
+        let response = row(ui, icons::sparkle, "Поиск по смыслу", None, meaning, false);
+        if response.clicked() {
+            app.actions.push(Action::Run(crate::commands::CommandId::SearchMeaning));
+        }
         saved_searches(ui, app);
 
         ui.add_space(10.0);

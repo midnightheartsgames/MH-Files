@@ -15,6 +15,8 @@ use mh_files_core::settings::Settings;
 pub struct DataDirs {
     pub config: PathBuf,
     pub index: PathBuf,
+    /// Модель поиска по смыслу, llama.cpp и индекс векторов.
+    pub semantic: PathBuf,
     pub portable: bool,
 }
 
@@ -35,10 +37,18 @@ fn detect(force_portable: bool) -> DataDirs {
         let data = exe_dir.join("data");
         let marked = exe_dir.join("portable").is_file() || data.is_dir();
         if force_portable || marked {
-            return DataDirs { index: data.join("index"), config: data, portable: true };
+            return DataDirs {
+                index: data.join("index"),
+                semantic: data.join("semantic"),
+                config: data,
+                portable: true,
+            };
         }
     }
-    DataDirs { config: profile_config(), index: profile_index(), portable: false }
+    let index = profile_index();
+    // Рядом с индексом дисков: тоже данные машины (модель — около гигабайта).
+    let semantic = index.parent().map_or_else(|| index.join("semantic"), |p| p.join("semantic"));
+    DataDirs { config: profile_config(), index, semantic, portable: false }
 }
 
 /// `%APPDATA%\MH Files` в Windows, `~/.config/mh-files` в остальных системах.
@@ -72,6 +82,10 @@ pub fn config_dir() -> PathBuf {
 
 pub fn index_dir() -> PathBuf {
     dirs().index.clone()
+}
+
+pub fn semantic_dir() -> PathBuf {
+    dirs().semantic.clone()
 }
 
 /// Новая версия программы запускается первый раз — сохранить настройки и сеанс прошлой

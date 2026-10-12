@@ -23,6 +23,7 @@ pub mod names;
 pub mod recycle;
 pub mod rename;
 pub mod selection;
+pub mod semantic;
 pub mod session;
 pub mod settings;
 pub mod sort;

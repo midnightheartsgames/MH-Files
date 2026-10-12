@@ -79,6 +79,27 @@ pub fn search(painter: &Painter, rect: Rect, color: Color32) {
     polyline(painter, rect, color, &[(0.63, 0.63), (0.9, 0.9)]);
 }
 
+/// Поиск по смыслу: четырёхлучевая звёздочка и маленькая рядом.
+pub fn sparkle(painter: &Painter, rect: Rect, color: Color32) {
+    let star = |center: Pos2, r: f32| -> Vec<Pos2> {
+        let k = r * 0.24;
+        vec![
+            pos2(center.x, center.y - r),
+            pos2(center.x + k, center.y - k),
+            pos2(center.x + r, center.y),
+            pos2(center.x + k, center.y + k),
+            pos2(center.x, center.y + r),
+            pos2(center.x - k, center.y + k),
+            pos2(center.x - r, center.y),
+            pos2(center.x - k, center.y - k),
+        ]
+    };
+    let big = star(p(rect, 0.42, 0.58), rect.width() * 0.4);
+    painter.add(Shape::closed_line(big, stroke(rect, color)));
+    let small = star(p(rect, 0.82, 0.2), rect.width() * 0.16);
+    painter.add(Shape::closed_line(small, stroke(rect, color)));
+}
+
 pub fn dots(painter: &Painter, rect: Rect, color: Color32) {
     for x in [0.2, 0.5, 0.8] {
         painter.circle_filled(p(rect, x, 0.5), rect.width() * 0.08, color);

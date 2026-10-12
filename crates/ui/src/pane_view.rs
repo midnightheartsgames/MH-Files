@@ -61,7 +61,7 @@ pub fn show(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             app.actions.push(Action::Open { location, target: Target::Current });
         }
     }
-    if matches!(tab.location, Location::Index { .. }) {
+    if crate::tabs::everywhere(&tab.location) {
         index_bar(ui, tab, app);
     }
     if matches!(tab.location, Location::Duplicates { .. }) {
@@ -168,6 +168,7 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             Location::Computer => icons::computer(&painter, icon, theme::TEXT_SECONDARY),
             Location::Search { .. } => icons::search(&painter, icon, theme::TEXT_SECONDARY),
             Location::Index { .. } => icons::search(&painter, icon, theme::accent()),
+            Location::Semantic { .. } => icons::sparkle(&painter, icon, theme::accent()),
             Location::Archive { .. } => icons::archive(&painter, icon, theme::accent()),
             Location::Duplicates { .. } => icons::duplicates(&painter, icon, theme::accent()),
             Location::Sort { .. } => icons::sort(&painter, icon, theme::accent()),
@@ -654,12 +655,17 @@ fn search_header(
     widgets::category_chips(&mut row, category, !content)
 }
 
-/// Поле поиска по дискам и итог: сколько найдено, за сколько, в каком состоянии индекс.
+/// Поле поиска по дискам или по смыслу и итог: сколько найдено, за сколько, в каком
+/// состоянии индекс.
 fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
+    let meaning = matches!(tab.location, Location::Semantic { .. });
     let Some(view) = &mut tab.index else { return };
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 90.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
-    let field = Rect::from_min_size(rect.min + vec2(10.0, 6.0), vec2(rect.width() - 150.0, 30.0));
+    let field = Rect::from_min_size(
+        rect.min + vec2(10.0, 6.0),
+        vec2((rect.width() - 345.0).max(160.0), 30.0),
+    );
     ui.painter().rect_filled(field, CornerRadius::same(5), theme::CARD);
     ui.painter().rect_stroke(
         field,
@@ -667,49 +673,113 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
         Stroke::new(1.0, theme::accent().gamma_multiply(0.6)),
         egui::StrokeKind::Inside,
     );
-    icons::search(
-        ui.painter(),
-        Rect::from_center_size(pos2(field.left() + 15.0, field.center().y), vec2(14.0, 14.0)),
-        theme::accent(),
-    );
+    let icon =
+        Rect::from_center_size(pos2(field.left() + 15.0, field.center().y), vec2(14.0, 14.0));
+    if meaning {
+        icons::sparkle(ui.painter(), icon, theme::accent());
+    } else {
+        icons::search(ui.painter(), icon, theme::accent());
+    }
     let edit_rect = Rect::from_min_max(field.min + vec2(30.0, 0.0), field.max - vec2(8.0, 0.0));
     let mut text = view.text.clone();
+    let hint = if meaning {
+        "Опишите словами: кошка на диване, договор аренды, презентация о продажах"
+    } else {
+        "Имя, маска или фильтры: ext:pdf size:>10mb dm:неделя kind:видео in:\"C:\\Проекты\""
+    };
     let edit = ui.place(
         edit_rect,
         egui::TextEdit::singleline(&mut text)
             .id(Id::new(("index-query", tab.id)))
-                        .frame(egui::Frame::NONE)
+            .frame(egui::Frame::NONE)
             .vertical_align(Align::Center)
             .font(theme::regular(14.0))
-            .hint_text("Имя, маска или фильтры: ext:pdf size:>10mb dm:неделя kind:видео in:\"C:\\Проекты\"")
+            .hint_text(hint)
             .desired_width(edit_rect.width()),
     );
     if std::mem::take(&mut view.focus) {
         edit.request_focus();
     }
+    // Режим: по имени (индекс дисков) или по смыслу (EmbeddingGemma 2).
+    let modes =
+        Rect::from_min_size(pos2(field.right() + 8.0, field.top() + 4.0), vec2(190.0, 22.0));
+    let mut mode_row = ui.new_child(
+        egui::UiBuilder::new().max_rect(modes).layout(Layout::left_to_right(Align::Center)),
+    );
+    mode_row.spacing_mut().item_spacing = vec2(4.0, 0.0);
+    let by_name = widgets::chip(&mut mode_row, "По имени", !meaning)
+        .on_hover_text("Индекс имён всех дисков — за миллисекунды (Ctrl+E)");
+    let by_meaning = widgets::chip(&mut mode_row, "По смыслу", meaning).on_hover_text(
+        "EmbeddingGemma 2 на этом компьютере: текст, картинки и звук по описанию (Ctrl+Shift+Space)",
+    );
+    let switch = if by_name.clicked() && meaning {
+        Some(Location::Index { query: text.trim().to_string() })
+    } else if by_meaning.clicked() && !meaning {
+        Some(Location::Semantic { query: text.trim().to_string() })
+    } else {
+        None
+    };
     let chips = Rect::from_min_max(pos2(field.left() - 2.0, field.bottom() + 6.0), rect.max);
     let mut row = ui.new_child(
         egui::UiBuilder::new().max_rect(chips).layout(Layout::left_to_right(Align::Min)),
     );
-    if let Some(picked) = widgets::category_chips(&mut row, category::kind_of(&text), true) {
+    if let Some(picked) = widgets::category_chips(&mut row, category::kind_of(&text), !meaning) {
         text = category::with_kind(&text, picked);
     }
     let leave = edit.has_focus()
         && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowDown));
-    let save_rect = Rect::from_min_size(pos2(field.right() + 8.0, field.top()), vec2(130.0, 30.0));
-    let can_save = !text.trim().is_empty();
-    let save = ui.place(
-        save_rect,
-        egui::Button::new(RichText::new("Сохранить поиск").font(theme::regular(13.5)))
+    let button_rect =
+        Rect::from_min_size(pos2(modes.right() + 8.0, field.top()), vec2(130.0, 30.0));
+    let (label, tip) = if meaning {
+        ("Настроить…", "Папки, модель, картинки и звук — «Настройки › Поиск по смыслу»")
+    } else {
+        ("Сохранить поиск", "В боковую панель, раздел «Поиски»")
+    };
+    let button = ui.place(
+        button_rect,
+        egui::Button::new(RichText::new(label).font(theme::regular(13.5)))
             .corner_radius(CornerRadius::same(5)),
     );
-    let save = save.on_hover_text("В боковую панель, раздел «Поиски»");
-    if save.clicked() && can_save {
-        app.actions.push(Action::Run(CommandId::SaveSearch));
+    if button.on_hover_text(tip).clicked() {
+        if meaning {
+            app.settings_window.open_semantic(&app.settings, &app.sorter.config);
+        } else if !text.trim().is_empty() {
+            app.actions.push(Action::Run(CommandId::SaveSearch));
+        }
     }
 
+    let (line, color) = if meaning {
+        semantic_line(view, &text, tab.selection.cursor(), tab.listing.len(), app)
+    } else {
+        index_line(view, &text, tab.listing.len(), app)
+    };
+    let galley = elided(ui, &line, theme::regular(13.0), color, rect.width() - 24.0);
+    ui.painter().galley(
+        pos2(rect.left() + 12.0, rect.bottom() - 13.0 - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    if let Some(location) = switch {
+        view.focus = true;
+        app.actions.push(Action::Open { location, target: Target::Current });
+    } else if text != view.text {
+        tab.set_index_query(text, &app.workers);
+    }
+    if leave {
+        edit.surrender_focus();
+        tab.cursor_to(0, Modifiers::default());
+    }
+}
+
+/// Итог поиска по дискам одной строкой.
+fn index_line(
+    view: &crate::tabs::IndexView,
+    text: &str,
+    shown: usize,
+    app: &FilesApp,
+) -> (String, Color32) {
     let status = app.indexer.status();
-    let (line, color) = if let Some(error) = &view.error {
+    if let Some(error) = &view.error {
         (error.clone(), theme::WARN)
     } else if !status.enabled {
         (
@@ -722,7 +792,6 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
             theme::TEXT_SECONDARY,
         )
     } else {
-        let shown = tab.listing.len();
         let mut line = if view.total > shown {
             format!(
                 "Найдено {} — показаны первые {}",
@@ -737,21 +806,46 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
             line.push_str(&format!(" · {} — результаты неполные", index_state(&status)));
         }
         (line, if status.busy() { theme::accent() } else { theme::TEXT_SECONDARY })
-    };
-    ui.painter().text(
-        pos2(rect.left() + 12.0, rect.bottom() - 13.0),
-        Align2::LEFT_CENTER,
-        line,
-        theme::regular(13.0),
-        color,
-    );
-    if text != view.text {
-        tab.set_index_query(text, &app.workers);
     }
-    if leave {
-        edit.surrender_focus();
-        tab.cursor_to(0, Modifiers::default());
+}
+
+/// Итог поиска по смыслу одной строкой; у объекта под курсором — почему он найден.
+fn semantic_line(
+    view: &crate::tabs::IndexView,
+    text: &str,
+    cursor: Option<&PathBuf>,
+    shown: usize,
+    app: &FilesApp,
+) -> (String, Color32) {
+    use mh_files_fs::SemanticState;
+    let status = app.semantic.status();
+    if status.state == SemanticState::Off {
+        return (
+            "Поиск по смыслу выключен. «Настроить…» — включить: модель EmbeddingGemma 2 работает на этом компьютере, файлы никуда не отправляются".to_string(),
+            theme::WARN,
+        );
     }
+    if let Some(error) = &view.error {
+        return (error.clone(), theme::WARN);
+    }
+    if text.trim().is_empty() || category::with_kind(text, Category::All).trim().is_empty() {
+        let line = format!("В индексе {} · {}", format::items(status.files), status.describe());
+        let color = if matches!(status.state, SemanticState::Failed(_)) {
+            theme::WARN
+        } else if status.busy() {
+            theme::accent()
+        } else {
+            theme::TEXT_SECONDARY
+        };
+        return (line, color);
+    }
+    let mut line = format!("Найдено: {} · {} мс", format::count(shown), view.elapsed.as_millis());
+    if let Some((score, reason)) = cursor.and_then(|path| view.reasons.get(path)) {
+        line.push_str(&format!(" · сходство {:.0}% {reason}", score.clamp(0.0, 1.0) * 100.0));
+    } else if status.busy() {
+        line.push_str(&format!(" · {} — результаты неполные", status.describe()));
+    }
+    (line, if status.busy() { theme::accent() } else { theme::TEXT_SECONDARY })
 }
 
 /// Ход поиска дубликатов, итог и отметка лишних копий.
@@ -994,6 +1088,29 @@ fn list_view(
             LoadState::Done if tab.listing.has_filter() => {
                 Some(("Ничего не подходит под фильтр".to_string(), theme::TEXT_SECONDARY))
             }
+            LoadState::Done if matches!(tab.location, Location::Semantic { .. }) => {
+                let empty = matches!(&tab.location, Location::Semantic { query } if query.trim().is_empty());
+                let searching = tab.index.as_ref().is_some_and(|v| v.searching || v.pending);
+                let error = tab.index.as_ref().and_then(|v| v.error.clone());
+                if empty {
+                    Some((
+                        "Поиск по смыслу: опишите, что на картинке или о чём документ, — своими словами"
+                            .to_string(),
+                        theme::TEXT_DISABLED,
+                    ))
+                } else if searching {
+                    None
+                } else if let Some(error) = error {
+                    Some((error, theme::WARN))
+                } else if app.semantic.status().busy() {
+                    Some((
+                        "Пока не найдено: индекс ещё строится, выдача обновится сама".to_string(),
+                        theme::TEXT_SECONDARY,
+                    ))
+                } else {
+                    Some(("Ничего похожего не найдено".to_string(), theme::TEXT_SECONDARY))
+                }
+            }
             LoadState::Done if matches!(tab.location, Location::Index { .. }) => {
                 let empty = matches!(&tab.location, Location::Index { query } if query.is_empty());
                 let searching = tab.index.as_ref().is_some_and(|v| v.searching || v.pending);
@@ -1069,7 +1186,7 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
     });
     crate::popup::submenu(ui, "Сортировка", None, |ui| {
         let order = tab.options.sort;
-        let index = matches!(tab.location, Location::Index { .. });
+        let index = crate::tabs::everywhere(&tab.location);
         let columns = [
             SortColumn::Relevance,
             SortColumn::Name,
