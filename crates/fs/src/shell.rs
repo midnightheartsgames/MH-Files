@@ -56,7 +56,14 @@ pub enum ShellJob {
 pub(crate) fn run(workers: &Workers, job: ShellJob) {
     let _com = mh_files_platform::thumbs::init_worker_thread();
     let (what, result) = match job {
-        ShellJob::Open(path) => ("Открыть", shell::open(&path)),
+        ShellJob::Open(path) => {
+            // Ярлык на папку (на рабочем столе их много) открывается здесь, а не в Проводнике.
+            if let Some(dir) = shell::folder_link_target(&path) {
+                workers.send(Event::OpenFolder { link: path, dir });
+                return;
+            }
+            ("Открыть", shell::open(&path))
+        }
         ShellJob::OpenWith(path) => ("Открыть с помощью", shell::open_with(&path)),
         ShellJob::Properties(paths) => ("Свойства", shell::properties(&paths)),
         ShellJob::Terminal { dir, command } => ("Терминал", shell::open_terminal(&dir, &command)),
