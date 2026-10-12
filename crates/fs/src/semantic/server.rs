@@ -26,48 +26,97 @@ pub struct Server {
     pub port: u16,
     /// Запущен на процессоре, хотя просили видеокарту: с ней не запустился.
     pub gpu_fallback: bool,
+    /// Запущен без кодировщика картинок и звука (`mmproj`): с ним не запустился.
+    pub media_fallback: bool,
+}
+
+/// Попытка запуска: настройки и чем она уступает просьбе.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Attempt {
+    config: ServerConfig,
+    gpu_fallback: bool,
+    media_fallback: bool,
+}
+
+/// Порядок попыток: как просили; без `mmproj` (битый или чужой кодировщик не должен
+/// лишать поиска по тексту); на процессоре (капризный драйвер Vulkan); на процессоре
+/// без `mmproj`.
+fn attempts(config: &ServerConfig) -> Vec<Attempt> {
+    let mut out =
+        vec![Attempt { config: config.clone(), gpu_fallback: false, media_fallback: false }];
+    let text_only = ServerConfig { mmproj: None, ..config.clone() };
+    if config.mmproj.is_some() {
+        out.push(Attempt { config: text_only.clone(), gpu_fallback: false, media_fallback: true });
+    }
+    if config.gpu {
+        let cpu = ServerConfig { gpu: false, ..config.clone() };
+        out.push(Attempt { config: cpu, gpu_fallback: true, media_fallback: false });
+        if config.mmproj.is_some() {
+            let cpu_text = ServerConfig { gpu: false, ..text_only };
+            out.push(Attempt { config: cpu_text, gpu_fallback: true, media_fallback: true });
+        }
+    }
+    out
 }
 
 impl Server {
-    /// Запустить и дождаться готовности. Не запустился с видеокартой — ещё раз на
-    /// процессоре: драйвер Vulkan бывает капризным, а поиск важнее скорости.
+    /// Запустить и дождаться готовности. Не вышло — следующие попытки по [`attempts`];
+    /// журнал всех попыток — в `log`, ошибка — с причиной из журнала первой и последней.
     pub fn start(exe: &Path, config: &ServerConfig, log: &Path) -> Result<Server, String> {
         #[cfg(test)]
         if let Some(port) = *TEST_PORT.lock() {
-            return Ok(Server { process: None, port, gpu_fallback: false });
+            return Ok(Server { process: None, port, gpu_fallback: false, media_fallback: false });
         }
-        match Server::start_once(exe, config, log) {
-            Ok(server) => Ok(server),
-            Err(error) if config.gpu => {
-                let cpu = ServerConfig { gpu: false, ..config.clone() };
-                let mut server = Server::start_once(exe, &cpu, log)
-                    .map_err(|second| format!("{error}; на процессоре тоже: {second}"))?;
-                server.gpu_fallback = true;
-                Ok(server)
+        let _ = std::fs::write(log, "");
+        let mut reasons: Vec<String> = Vec::new();
+        for attempt in attempts(config) {
+            match Server::start_once(exe, &attempt.config, log) {
+                Ok(mut server) => {
+                    server.gpu_fallback = attempt.gpu_fallback;
+                    server.media_fallback = attempt.media_fallback;
+                    return Ok(server);
+                }
+                Err(reason) => {
+                    if !reasons.contains(&reason) {
+                        reasons.push(reason);
+                    }
+                }
             }
-            Err(error) => Err(error),
         }
+        Err(format!("модель не запустилась: {} (журнал: {})", reasons.join("; "), log.display()))
     }
 
     fn start_once(exe: &Path, config: &ServerConfig, log: &Path) -> Result<Server, String> {
         let port = free_port()?;
         let config = ServerConfig { port, ..config.clone() };
-        let mut process = Background::spawn(exe, &model::server_args(&config), Some(log))?;
+        let args = model::server_args(&config);
+        {
+            use std::io::Write as _;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+                let _ = writeln!(file, "{ATTEMPT_MARK} {} {}", exe.display(), args.join(" "));
+            }
+        }
+        let mut process = Background::spawn(exe, &args, Some(log))?;
         let started = Instant::now();
         loop {
             if let Some(status) = process.exited() {
-                return Err(format!("llama-server завершился ({status}){}", log_tail(log)));
+                let reason = log_reason(&std::fs::read_to_string(log).unwrap_or_default());
+                return Err(match reason {
+                    Some(reason) => reason,
+                    None => format!("llama-server завершился ({status})"),
+                });
             }
             // 503 — модель грузится; нет соединения — сервер ещё не открыл порт.
             if let Ok((200, _)) = request(port, "GET", "/health", None, Duration::from_secs(2)) {
-                return Ok(Server { process: Some(process), port, gpu_fallback: false });
+                return Ok(Server {
+                    process: Some(process),
+                    port,
+                    gpu_fallback: false,
+                    media_fallback: false,
+                });
             }
             if started.elapsed() > START_TIMEOUT {
-                return Err(format!(
-                    "модель не загрузилась за {} с{}",
-                    START_TIMEOUT.as_secs(),
-                    log_tail(log)
-                ));
+                return Err(format!("модель не загрузилась за {} с", START_TIMEOUT.as_secs()));
             }
             std::thread::sleep(Duration::from_millis(150));
         }
@@ -137,20 +186,68 @@ fn free_port() -> Result<u16, String> {
     listener.local_addr().map(|a| a.port()).map_err(|e| e.to_string())
 }
 
-/// Последние строки журнала сервера с ошибкой — в текст для пользователя.
-fn log_tail(log: &Path) -> String {
-    let Ok(text) = std::fs::read_to_string(log) else { return String::new() };
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| {
-            let l = l.to_lowercase();
-            l.contains("error") || l.contains("failed") || l.contains("unknown")
-        })
-        .collect();
-    match lines.last() {
-        Some(line) => format!(": {}", line.trim().chars().take(200).collect::<String>()),
-        None => String::new(),
+/// Начало попытки запуска в журнале сервера.
+const ATTEMPT_MARK: &str = "=== MH Files: запуск";
+
+/// Причина отказа из журнала последней попытки: строки ошибок llama.cpp (уровень `E`,
+/// «error», «failed»), кроме общего «exiting due to model loading error» — он лишь итог.
+/// Не больше двух строк, первыми — самые говорящие.
+fn log_reason(log: &str) -> Option<String> {
+    let last = log.rsplit(ATTEMPT_MARK).next().unwrap_or(log);
+    let mut lines: Vec<String> = Vec::new();
+    for line in last.lines() {
+        let line = strip_ansi(line);
+        let lower = line.to_lowercase();
+        let error = line.contains(" E ") || lower.contains("error") || lower.contains("failed");
+        if !error || lower.contains("exiting due to model loading error") {
+            continue;
+        }
+        // Метка времени и уровень llama.cpp («0.00.814.770 E ») — не для людей.
+        let text = line
+            .split_once(" E ")
+            .filter(|(head, _)| head.chars().all(|c| c.is_ascii_digit() || c == '.' || c == ' '))
+            .map_or(line.as_str(), |(_, rest)| rest)
+            .trim()
+            .to_string();
+        if !text.is_empty() && !lines.contains(&text) {
+            lines.push(text);
+        }
     }
+    let telling = |l: &String| {
+        let l = l.to_lowercase();
+        l.contains("error loading model")
+            || l.contains("unknown")
+            || l.contains("failed to load")
+            || l.contains("invalid")
+            || l.contains("out of memory")
+    };
+    lines.sort_by_key(|l| !telling(l));
+    lines.truncate(2);
+    (!lines.is_empty()).then(|| {
+        lines
+            .iter()
+            .map(|l| l.chars().take(240).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    })
+}
+
+/// Без цветовых кодов терминала (`ESC[…m`).
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// HTTP/1.1 к `127.0.0.1:port`: код ответа и тело.
@@ -257,6 +354,51 @@ pub mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn start_attempts_in_order() {
+        let config = ServerConfig {
+            model: "m.gguf".into(),
+            mmproj: Some("mmproj.gguf".into()),
+            port: 0,
+            gpu: true,
+            threads: 0,
+        };
+        let plan: Vec<(bool, bool, bool, bool)> = attempts(&config)
+            .iter()
+            .map(|a| (a.config.gpu, a.config.mmproj.is_some(), a.gpu_fallback, a.media_fallback))
+            .collect();
+        assert_eq!(
+            plan,
+            [
+                (true, true, false, false),
+                (true, false, false, true),
+                (false, true, true, false),
+                (false, false, true, true)
+            ]
+        );
+        let cpu_text = ServerConfig { gpu: false, mmproj: None, ..config };
+        assert_eq!(attempts(&cpu_text).len(), 1);
+    }
+
+    #[test]
+    fn log_reason_skips_the_generic_line() {
+        let log = "=== MH Files: запуск a\n0.00.100.000 E llama_model_load: error loading model: old\n=== MH Files: запуск b\n\
+            0.00.500.000 I srv load_model: loading model\n\
+            0.00.700.000 E clip_model_loader: \u{1b}[31mtensor 'v.patch_embd' not found\u{1b}[0m\n\
+            0.00.800.000 E llama_model_load: error loading model: unknown model architecture: 'gemma-embedding2'\n\
+            0.00.814.770 E srv  llama_server: exiting due to model loading error\n";
+        assert_eq!(
+            log_reason(log).unwrap(),
+            "llama_model_load: error loading model: unknown model architecture: 'gemma-embedding2' · clip_model_loader: tensor 'v.patch_embd' not found"
+        );
+        assert_eq!(
+            log_reason(
+                "0.1 I всё хорошо\n0.2 E srv  llama_server: exiting due to model loading error"
+            ),
+            None
+        );
+    }
 
     #[test]
     fn responses_parse() {
@@ -398,7 +540,9 @@ pub mod tests {
         };
         let error = Server::start(&exe, &config, &log).err().unwrap();
         assert!(error.contains("failed to load model"), "{error}");
-        assert!(error.contains("на процессоре тоже"), "вторая попытка — без видеокарты: {error}");
+        assert!(error.contains(&log.display().to_string()), "путь к журналу: {error}");
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(text.matches(ATTEMPT_MARK).count(), 2, "как просили и на процессоре: {text}");
         assert_eq!(find_exe(&exe, None), Some(exe.clone()));
         assert_eq!(find_exe(&dir.path().join("нет"), Some(exe.clone())), None, "свой путь важнее");
         assert_eq!(find_exe(Path::new(""), Some(exe.clone())), Some(exe));

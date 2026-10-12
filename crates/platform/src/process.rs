@@ -13,7 +13,8 @@ pub struct Background {
 }
 
 impl Background {
-    /// Запустить `program` с `args`; вывод (stdout и stderr) — в файл `log`, если он задан.
+    /// Запустить `program` с `args`; вывод (stdout и stderr) дописывается в файл `log`, если
+    /// он задан.
     pub fn spawn(
         program: &Path,
         args: &[String],
@@ -24,7 +25,8 @@ impl Background {
         if let Some(dir) = program.parent().filter(|d| !d.as_os_str().is_empty()) {
             command.current_dir(dir);
         }
-        match log.map(std::fs::File::create) {
+        let open = |path: &Path| std::fs::OpenOptions::new().create(true).append(true).open(path);
+        match log.map(open) {
             Some(Ok(file)) => {
                 let copy = file.try_clone().map_err(|e| e.to_string())?;
                 command.stdout(Stdio::from(copy)).stderr(Stdio::from(file));

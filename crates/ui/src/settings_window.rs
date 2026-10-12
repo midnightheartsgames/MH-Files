@@ -327,6 +327,9 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     }
     match semantic_action {
         Some(SemanticAction::Rescan) => app.semantic.rescan(),
+        Some(SemanticAction::OpenFile(path)) => {
+            app.workers.shell(mh_files_fs::ShellJob::Open(path))
+        }
         Some(SemanticAction::Open(path)) => {
             let _ = std::fs::create_dir_all(&path);
             app.actions.push(crate::app::Action::Open {
@@ -1041,6 +1044,7 @@ struct SemanticInfo<'a> {
 enum SemanticAction {
     Rescan,
     Open(std::path::PathBuf),
+    OpenFile(std::path::PathBuf),
 }
 
 /// Квантования модели: подпись и что это значит.
@@ -1092,6 +1096,13 @@ fn semantic(ui: &mut Ui, state: &mut State, info: &SemanticInfo) -> Option<Seman
             if ui.button("Открыть папку модели").clicked() {
                 action = Some(SemanticAction::Open(info.dir.to_path_buf()));
             }
+            if ui
+                .button("Открыть журнал")
+                .on_hover_text("Вывод llama-server: почему модель не запустилась")
+                .clicked()
+            {
+                action = Some(SemanticAction::OpenFile(info.dir.join("llama-server.log")));
+            }
         });
         if let Some(model) = &info.status.model {
             widgets::hint(ui, &format!("Модель: {model}"));
@@ -1100,6 +1111,15 @@ fn semantic(ui: &mut Ui, state: &mut State, info: &SemanticInfo) -> Option<Seman
             widgets::hint(
                 ui,
                 "Видеокарта не подошла (нет Vulkan или драйвер отказал) — модель работает на процессоре.",
+            );
+        }
+        if let mh_files_fs::SemanticState::Failed(error) = &info.status.state {
+            ui.add(egui::Label::new(RichText::new(error).color(theme::WARN)).wrap());
+        }
+        if info.status.media_fallback {
+            widgets::hint(
+                ui,
+                "Кодировщик картинок и звука (mmproj) не загрузился — ищется по тексту и именам. Причина — в журнале.",
             );
         }
         if info.status.skipped > 0 {
