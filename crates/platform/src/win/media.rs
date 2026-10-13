@@ -40,7 +40,7 @@ const FIELDS: &[Field] = &[
     Field::One("Название", &[PKEY_Title]),
     Field::One("Длительность", &[PKEY_Media_Duration]),
     Field::Frame,
-    Field::One("Размеры", &[PKEY_Image_Dimensions]),
+    Field::One(crate::media::DIMENSIONS, &[PKEY_Image_Dimensions]),
     Field::One("Частота кадров", &[PKEY_Video_FrameRate]),
     // У видео — общий битрейт, у звука — битрейт дорожки.
     Field::One(

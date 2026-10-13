@@ -115,13 +115,15 @@ pub fn load(request: &PreviewRequest, cancel: &CancelToken) -> Preview {
             None => decode_scaled(&request.path, request.max_side, request.image_limit),
         };
         return match first {
-            Ok(bitmap) => Preview::Image {
-                bitmap,
-                dimensions: dimensions(&request.path),
-                pages: None,
-                info: info(&request.path, &ext),
-                animation,
-            },
+            Ok(bitmap) => {
+                let dimensions = dimensions(&request.path);
+                let mut info = info(&request.path, &ext);
+                // Размер картинки уже показан под ней — второй строкой из Windows не нужен.
+                if dimensions.is_some() {
+                    info.retain(|(label, _)| label != media::DIMENSIONS);
+                }
+                Preview::Image { bitmap, dimensions, pages: None, info, animation }
+            }
             Err(error) => Preview::Error(error),
         };
     }
