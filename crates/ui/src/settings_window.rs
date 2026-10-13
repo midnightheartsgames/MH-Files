@@ -632,6 +632,23 @@ fn files(ui: &mut Ui, s: &mut Settings) {
             &mut s.files.confirm_recycle,
         );
     });
+    card(ui, "Поиск дубликатов", |ui| {
+        row(ui, "Ход в заголовке вкладки", |ui| {
+            use mh_files_core::settings::TabProgress;
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for style in TabProgress::ALL {
+                let selected = s.duplicates.tab_progress == style;
+                if widgets::chip(ui, style.title(), selected).clicked() {
+                    s.duplicates.tab_progress = style;
+                }
+            }
+        });
+        widgets::hint(
+            ui,
+            "Сравнение содержимого видно и из другой вкладки: заголовок вкладки поиска \
+             заполняется по мере работы. Порог размера и исключения — в самой вкладке поиска.",
+        );
+    });
 }
 
 fn preview(ui: &mut Ui, s: &mut Settings) {
@@ -643,17 +660,7 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
             &mut s.preview.thumbnails,
         );
     });
-    card(ui, "Инспектор", |ui| {
-        switch_row(
-            ui,
-            "Размер выбранной папки сразу",
-            Some(
-                "Из индекса поиска, иначе подсчётом на своих дисках. На сетевых дисках — по \
-                 кнопке.",
-            ),
-            &mut s.preview.inspector_folder_size,
-        );
-    });
+    inspector_view(ui, s);
     card(ui, "Обработчики Windows", |ui| {
         switch_row(
             ui,
@@ -681,6 +688,75 @@ fn preview(ui: &mut Ui, s: &mut Settings) {
         row(ui, "Картинки до, МБ", |ui| {
             ui.add(egui::DragValue::new(&mut s.preview.image_limit_mb).range(1..=1024));
         });
+    });
+}
+
+/// Вид Инспектора: какие сведения показывать, отступы и сколько тегов.
+fn inspector_view(ui: &mut Ui, s: &mut Settings) {
+    use mh_files_core::settings::InspectorView;
+    card(ui, "Инспектор", |ui| {
+        widgets::hint(ui, "Что показывать о файле или папке под курсором.");
+        ui.add_space(4.0);
+        let v = &mut s.inspector;
+        let items: [(&str, &mut bool); 10] = [
+            ("Предпросмотр", &mut v.preview),
+            ("Тип", &mut v.kind),
+            ("Размер", &mut v.size),
+            ("Изменён", &mut v.modified),
+            ("Создан", &mut v.created),
+            ("Атрибуты", &mut v.attributes),
+            ("Теги и звук", &mut v.tags),
+            ("Рейтинг автотегов", &mut s.tags.rating),
+            ("Размер папки", &mut v.folder_size),
+            ("Путь", &mut v.path),
+        ];
+        egui::Grid::new("inspector-fields").num_columns(3).spacing([24.0, 6.0]).show(ui, |ui| {
+            for (index, (title, value)) in items.into_iter().enumerate() {
+                ui.checkbox(value, title);
+                if index % 3 == 2 {
+                    ui.end_row();
+                }
+            }
+        });
+        ui.add_space(6.0);
+        row(ui, "Отступ между сведениями", |ui| {
+            ui.add(
+                egui::Slider::new(&mut s.inspector.spacing, 0.0..=InspectorView::MAX_SPACING)
+                    .step_by(1.0)
+                    .fixed_decimals(0)
+                    .suffix(" точек"),
+            );
+            if s.inspector.spacing != InspectorView::default().spacing
+                && ui.button("По умолчанию").clicked()
+            {
+                s.inspector.spacing = InspectorView::default().spacing;
+            }
+        });
+        row(ui, "Тегов в разделе", |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for limit in InspectorView::TAG_LIMITS {
+                let title =
+                    if limit == 0 { "все".to_string() } else { format!("первые {limit}") };
+                if widgets::chip(ui, &title, s.inspector.tag_limit == limit).clicked() {
+                    s.inspector.tag_limit = limit;
+                }
+            }
+        });
+        widgets::hint(
+            ui,
+            "Между разделами (предпросмотр, теги, звук) отступ вдвое больше. Если тегов больше, \
+             чем показывается, остальные раскрывает кнопка «Ещё» после них.",
+        );
+        ui.add_space(4.0);
+        switch_row(
+            ui,
+            "Размер выбранной папки сразу",
+            Some(
+                "Из индекса поиска, иначе подсчётом на своих дисках. На сетевых дисках — по \
+                 кнопке.",
+            ),
+            &mut s.preview.inspector_folder_size,
+        );
     });
 }
 

@@ -39,6 +39,8 @@ pub struct State {
     sizing: Option<(PathBuf, CancelToken)>,
     /// Кадр анимации (GIF) и когда следующий.
     playback: preview_ui::Playback,
+    /// Все теги раскрыты кнопкой, хотя в настройках — только первые; до другого объекта.
+    all_tags: bool,
 }
 
 impl State {
@@ -110,6 +112,7 @@ pub fn follow(app: &mut FilesApp) {
     state.path = Some(path);
     state.is_dir = is_dir;
     state.page = 0;
+    state.all_tags = false;
     request(app);
     request_size(app);
 }
@@ -159,7 +162,8 @@ fn request_size(app: &mut FilesApp) {
     }
 }
 
-/// Попросить предпросмотр того, что выбрано, с текущей страницей.
+/// Попросить предпросмотр того, что выбрано, с текущей страницей. Предпросмотр скрыт в
+/// настройках — не просить: его попросит показ, когда его включат.
 fn request(app: &mut FilesApp) {
     let state = &mut app.inspector;
     let Some(path) = state.path.clone() else { return };
@@ -169,6 +173,9 @@ fn request(app: &mut FilesApp) {
     state.generation += 1;
     state.preview = None;
     state.texture = None;
+    if !app.settings.inspector.preview {
+        return;
+    }
     // В корзине объект лежит не по своему пути: показать нечего, кроме сведений.
     if app.tab().location == Location::RecycleBin {
         app.inspector.preview = Some(Preview::Info(Vec::new()));
@@ -253,11 +260,12 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             RichText::new(format!("Выделено: {}", format::items(selected.len())))
                 .font(theme::bold(17.0)),
         );
-        ui.add_space(6.0);
-        field(ui, "Папок", &dirs.to_string());
-        field(ui, "Файлов", &(entries.len() - dirs).to_string());
-        field(ui, "Размер файлов", &format::size(bytes));
-        ui.add_space(10.0);
+        let gap = app.settings.inspector.spacing;
+        ui.add_space(gap + 2.0);
+        field(ui, gap, "Папок", &dirs.to_string());
+        field(ui, gap, "Файлов", &(entries.len() - dirs).to_string());
+        field(ui, gap, "Размер файлов", &format::size(bytes));
+        ui.add_space(gap * 2.0 + 2.0);
         if widgets::button(ui, "Пакетное переименование", false).clicked() {
             app.actions.push(Action::Run(CommandId::BatchRename));
         }
@@ -271,12 +279,21 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
     };
     let entry = tab.entry(&path).cloned();
     let is_dir = app.inspector.is_dir;
-    let handler = wants_handler(app, &path, is_dir);
+    let view = app.settings.inspector.clone();
+    let gap = view.spacing;
+    let handler = view.preview && wants_handler(app, &path, is_dir);
+    // Предпросмотр только что включили в настройках — попросить его.
+    if view.preview && !handler && app.inspector.preview.is_none() && app.inspector.cancel.is_none()
+    {
+        request(app);
+    }
     ScrollArea::vertical().id_salt("inspector").auto_shrink([false, false]).show(ui, |ui| {
         let max = (ui.available_height() * 0.5).clamp(160.0, 420.0);
         let state = &mut app.inspector;
         state.playback.tick(ui.ctx(), state.preview.as_ref(), state.texture.as_mut());
-        if handler {
+        if !view.preview {
+            // Без предпросмотра — сразу сведения.
+        } else if handler {
             // Место под окно обработчика: оно встанет сюда после кадра.
             let (rect, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), max), egui::Sense::hover());
@@ -307,35 +324,40 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             app.inspector.page = page;
             request(app);
         }
-        ui.add_space(10.0);
+        if view.preview {
+            ui.add_space(gap * 2.0 + 2.0);
+        }
         ui.add(
             egui::Label::new(
                 RichText::new(path_label(&path)).font(theme::bold(17.0)).color(theme::TEXT_PRIMARY),
             )
             .wrap(),
         );
-        ui.add_space(6.0);
+        ui.add_space(gap + 2.0);
         if let Some(entry) = &entry {
-            field(ui, "Тип", &format::kind(&entry.extension(), entry.is_dir()));
-            if !entry.is_dir() {
+            if view.kind {
+                field(ui, gap, "Тип", &format::kind(&entry.extension(), entry.is_dir()));
+            }
+            if view.size && !entry.is_dir() {
                 field(
                     ui,
+                    gap,
                     "Размер",
                     &format!("{} ({} байт)", format::size(entry.size), group_digits(entry.size)),
                 );
             }
-            if let Some(time) = entry.modified {
+            if let Some(time) = entry.modified.filter(|_| view.modified) {
                 let dot = crate::pane_view::age_dot_color(app, time);
                 let title = if app.tab().location == Location::RecycleBin {
                     "Удалён"
                 } else {
                     "Изменён"
                 };
-                dated_field(ui, title, &format::date_full(time), dot);
+                dated_field(ui, gap, title, &format::date_full(time), dot);
             }
-            if let Some(time) = entry.created {
+            if let Some(time) = entry.created.filter(|_| view.created) {
                 let dot = crate::pane_view::age_dot_color(app, time);
-                dated_field(ui, "Создан", &format::date_full(time), dot);
+                dated_field(ui, gap, "Создан", &format::date_full(time), dot);
             }
             let mut attributes = Vec::new();
             if entry.attributes.readonly() {
@@ -350,20 +372,23 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             if entry.attributes.reparse() {
                 attributes.push("ссылка");
             }
-            if !attributes.is_empty() {
-                field(ui, "Атрибуты", &attributes.join(", "));
+            if view.attributes && !attributes.is_empty() {
+                field(ui, gap, "Атрибуты", &attributes.join(", "));
             }
-            if !entry.is_dir() && crate::pane_view::real_files(&app.tab().location) {
+            if view.tags && !entry.is_dir() && crate::pane_view::real_files(&app.tab().location) {
                 tags(ui, app, entry);
             }
         }
         // Папка: размер целиком — по запросу, обход может быть долгим.
         let in_archive =
             matches!(app.tab().location, Location::Archive { .. } | Location::RecycleBin);
-        if entry.as_ref().is_none_or(Entry::is_dir) && !in_archive {
+        if view.folder_size && entry.as_ref().is_none_or(Entry::is_dir) && !in_archive {
             folder_size(ui, app, &path);
         }
-        ui.add_space(4.0);
+        if !view.path {
+            return;
+        }
+        ui.add_space(gap);
         ui.label(RichText::new("Путь").font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
         let text = path.display().to_string();
         let response = ui.add(
@@ -383,6 +408,7 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
 /// Разделы «Теги» и «Звук»: что на картинке или кадрах видео и что слышно. Щелчок по тегу —
 /// поиск по нему, «+» — добавить к поиску (или к фильтру папки), правый — ещё.
 fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
+    let gap = app.settings.inspector.spacing;
     let name = entry.name.as_str();
     let ext = mh_files_core::entry::extension_of(name);
     let label = |ui: &mut Ui, text: &str| {
@@ -399,7 +425,7 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
                     app.settings_window.open_tags(&app.settings, &app.sorter.config);
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(gap);
         }
         return;
     }
@@ -412,14 +438,14 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
     let shown = match app.tagger.lookup(&path, entry.size, modified) {
         mh_files_fs::Lookup::Ready(shown) => shown,
         mh_files_fs::Lookup::Pending => {
-            field(ui, "Теги", "определяются…");
+            field(ui, gap, "Теги", "определяются…");
             return;
         }
         mh_files_fs::Lookup::None => {
             if let mh_files_fs::TagState::Failed(error) = app.tagger.status().state {
                 label(ui, "Теги");
                 ui.add(egui::Label::new(RichText::new(error).color(theme::WARN)).wrap());
-                ui.add_space(4.0);
+                ui.add_space(gap);
             }
             return;
         }
@@ -462,11 +488,12 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
                 ui.close();
             }
         });
-        ui.add_space(4.0);
+        ui.add_space(gap);
     }
     if image {
         let empty = "модель ничего уверенно не узнала";
         chips(ui, app, "Теги", &shown.tags, &shown.line, empty);
+        ui.add_space(gap);
     }
     if sound {
         let line = shown.sounds.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -476,10 +503,12 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
             "ничего уверенно не слышно"
         };
         chips(ui, app, "Звук", &shown.sounds, &line, empty);
+        ui.add_space(gap);
     }
 }
 
-/// Заголовок с числом и кнопкой «Копировать», затем теги плашками.
+/// Заголовок с числом и кнопкой «Копировать», затем теги плашками: все или первые сколько
+/// задано в настройках, остальные — кнопкой «Ещё».
 fn chips(
     ui: &mut Ui,
     app: &mut FilesApp,
@@ -501,11 +530,15 @@ fn chips(
             app.actions.push(Action::Status("теги скопированы".into(), crate::app::Level::Info));
         }
     });
+    let gap = app.settings.inspector.spacing;
     if tags.is_empty() {
         ui.label(RichText::new(empty).color(theme::TEXT_SECONDARY));
-        ui.add_space(4.0);
+        ui.add_space(gap);
         return;
     }
+    let limit = app.settings.inspector.tag_limit as usize;
+    let folded = limit > 0 && tags.len() > limit;
+    let shown = if folded && !app.inspector.all_tags { &tags[..limit] } else { tags };
     let in_search = matches!(app.tab().location, Location::Tags { .. });
     let plus_hint = if in_search {
         "Добавить к этому поиску по тегам"
@@ -514,7 +547,7 @@ fn chips(
     };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        for tag in tags {
+        for tag in shown {
             // Персонажи — цветом акцента: их меньше, и они важнее.
             let color = if tag.kind == mh_files_core::tags::TagKind::Character {
                 theme::accent()
@@ -571,8 +604,34 @@ fn chips(
                 }
             });
         }
+        if folded {
+            let (text, hint) = if app.inspector.all_tags {
+                ("Свернуть".to_string(), format!("Только первые {limit}"))
+            } else {
+                (format!("Ещё {}", tags.len() - limit), "Показать все теги".to_string())
+            };
+            if more_chip(ui, &text).on_hover_text(hint).clicked() {
+                app.inspector.all_tags = !app.inspector.all_tags;
+            }
+        }
     });
-    ui.add_space(8.0);
+    ui.add_space(gap);
+}
+
+/// Маленькая кнопка в ряду тегов: «Ещё 12» или «Свернуть».
+fn more_chip(ui: &mut Ui, text: &str) -> egui::Response {
+    let font = theme::regular(12.5);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, theme::accent());
+    let size = egui::vec2(galley.size().x + 12.0, galley.size().y + 6.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        if response.hovered() {
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(4), theme::CARD);
+        }
+        let pos = rect.center() - galley.size() / 2.0;
+        ui.painter().galley(pos, galley, theme::accent());
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 /// Плашка тега с «+» слева. Второе — указатель над «+» (щелчок по нему — добавить к поиску).
@@ -667,7 +726,7 @@ fn filter_folder(app: &mut FilesApp, text: String) {
     tab.set_filter(text);
 }
 
-fn field(ui: &mut Ui, label: &str, value: &str) {
+fn field(ui: &mut Ui, gap: f32, label: &str, value: &str) {
     ui.label(RichText::new(label).font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
     ui.add(
         egui::Label::new(
@@ -675,13 +734,13 @@ fn field(ui: &mut Ui, label: &str, value: &str) {
         )
         .wrap(),
     );
-    ui.add_space(4.0);
+    ui.add_space(gap);
 }
 
 /// Поле с датой и кружком давности слева от неё.
-fn dated_field(ui: &mut Ui, label: &str, value: &str, dot: Option<egui::Color32>) {
+fn dated_field(ui: &mut Ui, gap: f32, label: &str, value: &str, dot: Option<egui::Color32>) {
     let Some(color) = dot else {
-        field(ui, label, value);
+        field(ui, gap, label, value);
         return;
     };
     ui.label(RichText::new(label).font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
@@ -696,7 +755,7 @@ fn dated_field(ui: &mut Ui, label: &str, value: &str, dot: Option<egui::Color32>
             .wrap(),
         );
     });
-    ui.add_space(4.0);
+    ui.add_space(gap);
 }
 
 /// `8 589 934 592` — пробелы между разрядами.
@@ -713,6 +772,7 @@ fn group_digits(value: u64) -> String {
 }
 
 fn folder_size(ui: &mut Ui, app: &mut FilesApp, path: &std::path::Path) {
+    let gap = app.settings.inspector.spacing;
     if let Some(size) = app.folder_sizes.get(path) {
         let partial = if size.partial { " (без недоступных папок)" } else { "" };
         let text = format!(
@@ -721,13 +781,13 @@ fn folder_size(ui: &mut Ui, app: &mut FilesApp, path: &std::path::Path) {
             size.files,
             size.dirs
         );
-        field(ui, "Размер целиком", &text);
+        field(ui, gap, "Размер целиком", &text);
     } else if app.sizes_pending.contains(path)
         || app.inspector.sizing.as_ref().is_some_and(|(p, _)| p == path)
     {
-        field(ui, "Размер целиком", "считается…");
+        field(ui, gap, "Размер целиком", "считается…");
     } else if ui.button("Посчитать размер").clicked() {
         app.actions.push(Action::FolderSizes(vec![path.to_path_buf()]));
     }
-    ui.add_space(4.0);
+    ui.add_space(gap);
 }

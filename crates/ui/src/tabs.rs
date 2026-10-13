@@ -421,6 +421,19 @@ impl Tab {
         }
     }
 
+    /// Ход поиска дубликатов для заголовка вкладки: `None` — поиска нет или он закончен,
+    /// `Some(None)` — обход папок (сколько всего, ещё не известно), `Some(Some(доля))` —
+    /// сравнение содержимого.
+    pub fn duplicates_progress(&self) -> Option<Option<f32>> {
+        let view = self.duplicates.as_ref().filter(|v| !v.done && v.error.is_none())?;
+        Some(match view.progress {
+            Some(DuplicateProgress::Hashing { done, total }) if total > 0 => {
+                Some((done as f64 / total as f64).clamp(0.0, 1.0) as f32)
+            }
+            _ => None,
+        })
+    }
+
     pub fn on_duplicates_progress(&mut self, ticket: Ticket, progress: DuplicateProgress) {
         if self.current(ticket)
             && let Some(view) = &mut self.duplicates
@@ -772,6 +785,15 @@ impl Tab {
     pub fn set_options(&mut self, options: ViewOptions) {
         self.options = options;
         self.apply_options();
+    }
+
+    /// Сортировка новой вкладки здесь: поиск и дубликаты — в порядке выдачи, папки — по имени.
+    pub fn default_sort(&self) -> SortOrder {
+        if ranked(&self.location) {
+            SortOrder { column: SortColumn::Relevance, descending: false }
+        } else {
+            SortOrder::default()
+        }
     }
 
     pub fn set_sort(&mut self, sort: SortOrder) {

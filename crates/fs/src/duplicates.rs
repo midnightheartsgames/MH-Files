@@ -69,6 +69,8 @@ pub fn find(
             progress(DuplicateProgress::Hashing { done, total });
         }
     };
+    // Сравнение началось: сколько читать, уже известно.
+    report(0, total, true);
     // Первый отсев: начало файла. Для маленьких файлов это и есть весь файл.
     let mut full_candidates = Vec::new();
     let mut groups = Vec::new();
@@ -80,7 +82,7 @@ pub fn find(
             }
             let file = &files[i];
             let read = file.size.min(HEAD);
-            if let Ok(hash) = hash_file(&file.path, Some(HEAD), cancel) {
+            if let Ok(hash) = hash_file(&file.path, Some(HEAD), cancel, |_| {}) {
                 by_head.entry(hash).or_default().push(i);
             }
             done += read;
@@ -102,7 +104,10 @@ pub fn find(
             if cancel.is_cancelled() {
                 return Err("отменено".into());
             }
-            if let Ok(hash) = hash_file(&files[i].path, None, cancel) {
+            // Большой файл читается долго: ход — и внутри него.
+            let (base, size) = (done, files[i].size);
+            let read = |read: u64| report(base + read.min(size), total, false);
+            if let Ok(hash) = hash_file(&files[i].path, None, cancel, read) {
                 by_hash.entry(hash).or_default().push(i);
             }
             done += files[i].size;
@@ -254,7 +259,13 @@ fn scan(
 }
 
 /// BLAKE3 файла или его первых `limit` байт.
-fn hash_file(path: &Path, limit: Option<u64>, cancel: &CancelToken) -> std::io::Result<[u8; 32]> {
+/// Хэш файла (или его начала до `limit`); `on_read` — сколько байт прочитано на сейчас.
+fn hash_file(
+    path: &Path,
+    limit: Option<u64>,
+    cancel: &CancelToken,
+    mut on_read: impl FnMut(u64),
+) -> std::io::Result<[u8; 32]> {
     let file = File::open(path)?;
     let mut reader: Box<dyn Read> = match limit {
         Some(limit) => Box::new(file.take(limit)),
@@ -262,6 +273,7 @@ fn hash_file(path: &Path, limit: Option<u64>, cancel: &CancelToken) -> std::io::
     };
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
     loop {
         if cancel.is_cancelled() {
             return Err(std::io::Error::other("отменено"));
@@ -271,6 +283,8 @@ fn hash_file(path: &Path, limit: Option<u64>, cancel: &CancelToken) -> std::io::
             break;
         }
         hasher.update(&buffer[..read]);
+        total += read as u64;
+        on_read(total);
     }
     Ok(*hasher.finalize().as_bytes())
 }
@@ -310,6 +324,8 @@ mod tests {
         assert!(
             matches!(stages.last(), Some(DuplicateProgress::Hashing { done, total }) if done == total)
         );
+        // Ход сравнения виден с самого начала: сколько читать, известно сразу после обхода.
+        assert!(stages.iter().any(|s| matches!(s, DuplicateProgress::Hashing { done: 0, .. })));
 
         let cancel = CancelToken::default();
         cancel.cancel();

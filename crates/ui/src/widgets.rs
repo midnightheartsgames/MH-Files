@@ -272,12 +272,20 @@ pub fn category_chips(
     folders: bool,
 ) -> Option<mh_files_core::category::Category> {
     use mh_files_core::category::Category;
+    let shown: Vec<Category> =
+        Category::ALL.into_iter().filter(|&c| folders || c != Category::Folders).collect();
+    kind_chips(ui, current, &shown)
+}
+
+/// Ряд из этих категорий; щелчок по другой — она.
+pub fn kind_chips(
+    ui: &mut Ui,
+    current: mh_files_core::category::Category,
+    categories: &[mh_files_core::category::Category],
+) -> Option<mh_files_core::category::Category> {
     let mut picked = None;
     ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
-    for category in Category::ALL {
-        if category == Category::Folders && !folders {
-            continue;
-        }
+    for &category in categories {
         let selected = category == current;
         if chip(ui, category.title(), selected).clicked() && !selected {
             picked = Some(category);
@@ -286,12 +294,25 @@ pub fn category_chips(
     picked
 }
 
-/// Скруглённая плашка-переключатель.
-pub fn chip(ui: &mut Ui, text: &str, selected: bool) -> Response {
+/// Плашка с выпадающим меню: стрелка вниз после подписи. Меню открывает вызывающий.
+pub fn menu_chip(ui: &mut Ui, text: &str, selected: bool) -> Response {
     let color = if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
     let galley = ui.painter().layout_no_wrap(text.to_string(), theme::regular(12.5), color);
-    let size = vec2(galley.size().x + 20.0, 22.0);
+    let size = vec2(galley.size().x + 34.0, 22.0);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    paint_chip(ui, rect, &response, selected);
+    let text_pos = egui::pos2(rect.left() + 10.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(text_pos, galley, color);
+    let arrow = egui::Rect::from_center_size(
+        egui::pos2(rect.right() - 13.0, rect.center().y),
+        vec2(8.0, 8.0),
+    );
+    crate::icons::chevron_down(ui.painter(), arrow, color);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Фон и рамка плашки: выбранная — цветом акцента, наведённая — светлее.
+fn paint_chip(ui: &Ui, rect: egui::Rect, response: &Response, selected: bool) {
     let painter = ui.painter();
     let radius = CornerRadius::same(11);
     if selected {
@@ -313,8 +334,17 @@ pub fn chip(ui: &mut Ui, text: &str, selected: bool) -> Response {
             egui::StrokeKind::Inside,
         );
     }
+}
+
+/// Скруглённая плашка-переключатель.
+pub fn chip(ui: &mut Ui, text: &str, selected: bool) -> Response {
+    let color = if selected { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), theme::regular(12.5), color);
+    let size = vec2(galley.size().x + 20.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    paint_chip(ui, rect, &response, selected);
     let pos = rect.center() - galley.size() / 2.0;
-    painter.galley(pos, galley, color);
+    ui.painter().galley(pos, galley, color);
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 

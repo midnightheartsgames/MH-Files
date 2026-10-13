@@ -46,21 +46,29 @@ pub fn chevron_down(painter: &Painter, rect: Rect, color: Color32) {
     polyline(painter, rect, color, &[(0.2, 0.35), (0.5, 0.65), (0.8, 0.35)]);
 }
 
+/// Обновить: дуга по часовой стрелке и залитый наконечник по касательной к её концу.
 pub fn refresh(painter: &Painter, rect: Rect, color: Color32) {
     let center = rect.center();
     let radius = rect.width() * 0.36;
-    let points: Vec<Pos2> = (0..=20)
+    let (from, to) = (20f32.to_radians(), 290f32.to_radians());
+    let points: Vec<Pos2> = (0..=24)
         .map(|i| {
-            let angle = -0.6 + i as f32 / 20.0 * 4.9;
+            let angle = from + (to - from) * i as f32 / 24.0;
             center + vec2(angle.cos(), angle.sin()) * radius
         })
         .collect();
     let end = *points.last().unwrap();
     painter.add(Shape::line(points, stroke(rect, color)));
-    let s = rect.width() * 0.2;
-    painter.add(Shape::line(
-        vec![end + vec2(-s, -s * 0.2), end, end + vec2(s * 0.3, -s)],
-        stroke(rect, color),
+    // Касательная — куда идёт дуга, нормаль — от центра.
+    let tangent = vec2(-to.sin(), to.cos());
+    let normal = vec2(to.cos(), to.sin());
+    let (length, half) = (rect.width() * 0.26, rect.width() * 0.2);
+    let tip = end + tangent * length * 0.7;
+    let back = end - tangent * length * 0.3;
+    painter.add(Shape::convex_polygon(
+        vec![tip, back - normal * half, back + normal * half],
+        color,
+        Stroke::NONE,
     ));
 }
 
@@ -334,6 +342,29 @@ pub fn terminal(painter: &Painter, rect: Rect, color: Color32) {
     painter.rect_stroke(window, CornerRadius::same(2), stroke(rect, color), egui_inside());
     polyline(painter, rect, color, &[(0.24, 0.36), (0.42, 0.5), (0.24, 0.64)]);
     polyline(painter, rect, color, &[(0.5, 0.66), (0.74, 0.66)]);
+}
+
+/// Перейти к…: стрелка вверх и вправо, как «перейти дальше».
+pub fn goto(painter: &Painter, rect: Rect, color: Color32) {
+    polyline(painter, rect, color, &[(0.18, 0.9), (0.18, 0.55), (0.3, 0.42), (0.85, 0.42)]);
+    polyline(painter, rect, color, &[(0.6, 0.17), (0.85, 0.42), (0.6, 0.67)]);
+}
+
+/// Палитра команд: окно со строкой ввода сверху и списком под ней.
+pub fn palette(painter: &Painter, rect: Rect, color: Color32) {
+    let window = Rect::from_min_max(p(rect, 0.05, 0.1), p(rect, 0.95, 0.9));
+    painter.rect_stroke(window, CornerRadius::same(2), stroke(rect, color), egui_inside());
+    polyline(painter, rect, color, &[(0.08, 0.38), (0.92, 0.38)]);
+    polyline(painter, rect, color, &[(0.24, 0.57), (0.7, 0.57)]);
+    polyline(painter, rect, color, &[(0.24, 0.73), (0.55, 0.73)]);
+}
+
+/// Порядок сортировки: стрелки вниз и вверх рядом.
+pub fn sort_order(painter: &Painter, rect: Rect, color: Color32) {
+    polyline(painter, rect, color, &[(0.3, 0.12), (0.3, 0.88)]);
+    polyline(painter, rect, color, &[(0.12, 0.7), (0.3, 0.88), (0.48, 0.7)]);
+    polyline(painter, rect, color, &[(0.7, 0.88), (0.7, 0.12)]);
+    polyline(painter, rect, color, &[(0.52, 0.3), (0.7, 0.12), (0.88, 0.3)]);
 }
 
 /// Шестерёнка — настройки MH Files.
