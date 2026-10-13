@@ -148,7 +148,9 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
         if response.drag_started() {
             egui::DragAndDrop::set_payload(ui.ctx(), DragTab { pane: pane.id, tab: tab.id });
         }
-        let hovered = response.hovered();
+        // Указатель над вкладкой — и над её крестиком тоже: `hovered()` у вкладки там ложно
+        // (наведён крестик), и крестик пропадал бы через кадр, теряя щелчок.
+        let hovered = response.hovered() || ui.rect_contains_pointer(rect);
         let fill = if active {
             theme::WINDOW_BACKGROUND
         } else if hovered {
