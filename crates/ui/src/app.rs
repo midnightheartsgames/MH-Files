@@ -1170,7 +1170,12 @@ impl FilesApp {
                         .fill(theme::PANEL)
                         .inner_margin(egui::Margin::symmetric(8, 10)),
                 )
-                .show(ui, |ui| sidebar::show(ui, self));
+                .show(ui, |ui| {
+                    // Панель шириной с выставленную, а не с содержимое: иначе узкое
+                    // содержимое сжимает её и не даёт растянуть.
+                    ui.set_min_width(ui.available_width());
+                    sidebar::show(ui, self)
+                });
             self.settings.panes.sidebar_width = response.response.rect.width();
         }
 
@@ -1184,7 +1189,12 @@ impl FilesApp {
                         .fill(theme::PANEL)
                         .inner_margin(egui::Margin::symmetric(12, 10)),
                 )
-                .show(ui, |ui| inspector::show(ui, self));
+                .show(ui, |ui| {
+                    // В «Этом компьютере» и при выделении нескольких в Инспекторе одна-две
+                    // строки: без этого панель сжималась до них и не растягивалась мышью.
+                    ui.set_min_width(ui.available_width());
+                    inspector::show(ui, self)
+                });
             self.settings.panes.inspector_width = response.response.rect.width();
         }
 

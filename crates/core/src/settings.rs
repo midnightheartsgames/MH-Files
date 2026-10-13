@@ -25,6 +25,8 @@ pub struct Settings {
     pub files: Files,
     pub panes: Panes,
     pub preview: Preview,
+    /// Что показывает Инспектор и как плотно.
+    pub inspector: InspectorView,
     /// Группы боковой панели: «Избранное», «Проекты»…
     pub groups: Vec<Group>,
     /// Свои сочетания: имя команды → сочетания. Нет записи — по умолчанию.
@@ -86,11 +88,87 @@ pub struct DuplicateSettings {
     /// Что пропускать: имя папки или файла (`node_modules`), маска (`*.tmp`) или полный
     /// путь папки (`D:\Резерв`). См. `duplicates::excluded`.
     pub exclude: Vec<String>,
+    /// Как показывать ход поиска в заголовке вкладки (видно и из другой вкладки).
+    pub tab_progress: TabProgress,
 }
 
 impl Default for DuplicateSettings {
     fn default() -> DuplicateSettings {
-        DuplicateSettings { min_size: 1, exclude: vec![".git".into(), "node_modules".into()] }
+        DuplicateSettings {
+            min_size: 1,
+            exclude: vec![".git".into(), "node_modules".into()],
+            tab_progress: TabProgress::Fill,
+        }
+    }
+}
+
+/// Ход долгой работы вкладки (поиск дубликатов) в её заголовке.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TabProgress {
+    /// Не показывать.
+    Off,
+    /// Тонкая полоска по низу вкладки.
+    Bar,
+    /// Вкладка заливается слева направо.
+    #[default]
+    Fill,
+}
+
+impl TabProgress {
+    pub const ALL: [TabProgress; 3] = [TabProgress::Fill, TabProgress::Bar, TabProgress::Off];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            TabProgress::Off => "Не показывать",
+            TabProgress::Bar => "Полоской снизу",
+            TabProgress::Fill => "Заливкой вкладки",
+        }
+    }
+}
+
+/// Инспектор: какие сведения показывать, отступы между ними и сколько тегов.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InspectorView {
+    /// Предпросмотр сверху.
+    pub preview: bool,
+    pub kind: bool,
+    pub size: bool,
+    pub modified: bool,
+    pub created: bool,
+    pub attributes: bool,
+    /// Разделы «Теги» и «Звук» (рейтинг — `tags.rating`).
+    pub tags: bool,
+    /// Размер папки целиком.
+    pub folder_size: bool,
+    pub path: bool,
+    /// Отступ между сведениями, точки; между разделами — вдвое больше.
+    pub spacing: f32,
+    /// Сколько тегов в разделе сразу (0 — все); остальные — по кнопке.
+    pub tag_limit: u32,
+}
+
+impl InspectorView {
+    pub const MAX_SPACING: f32 = 24.0;
+    /// Варианты числа тегов: 0 — все.
+    pub const TAG_LIMITS: [u32; 4] = [5, 10, 15, 0];
+}
+
+impl Default for InspectorView {
+    fn default() -> InspectorView {
+        InspectorView {
+            preview: true,
+            kind: true,
+            size: true,
+            modified: true,
+            created: true,
+            attributes: true,
+            tags: true,
+            folder_size: true,
+            path: true,
+            spacing: 4.0,
+            tag_limit: 0,
+        }
     }
 }
 
@@ -468,6 +546,7 @@ impl Default for Settings {
             files: Files::default(),
             panes: Panes::default(),
             preview: Preview::default(),
+            inspector: InspectorView::default(),
             groups: vec![Group {
                 name: "Избранное".into(), collapsed: false, items: Vec::new()
             }],
@@ -588,6 +667,8 @@ impl Settings {
         p.inspector_width = clamp(p.inspector_width, MIN_SIDE_WIDTH, MAX_SIDE_WIDTH, 300.0);
         self.preview.text_limit_kb = self.preview.text_limit_kb.clamp(4, 4096);
         self.preview.image_limit_mb = self.preview.image_limit_mb.clamp(1, 1024);
+        let inspector = &mut self.inspector;
+        inspector.spacing = clamp(inspector.spacing, 0.0, InspectorView::MAX_SPACING, 4.0);
         let semantic = &mut self.semantic;
         semantic.max_file_mb = semantic.max_file_mb.clamp(1, 4096);
         semantic.strictness = semantic.strictness.clamp(0, 60);
@@ -666,6 +747,9 @@ mod tests {
             Settings::parse(r#"{"tags":{"general":3,"character":250,"model":" "}}"#);
         assert_eq!((settings.tags.general, settings.tags.character), (20, 99));
         assert_eq!(settings.tags.model, crate::tags::DEFAULT_MODEL);
+        let (settings, _) = Settings::parse(r#"{"inspector":{"spacing":100.0,"path":false}}"#);
+        assert_eq!(settings.inspector.spacing, InspectorView::MAX_SPACING);
+        assert!(!settings.inspector.path && settings.inspector.tags);
         let (_, notice) = Settings::parse(r#"{"version":99}"#);
         assert!(notice.is_some());
     }
@@ -702,6 +786,8 @@ mod tests {
         assert!(s.preview.handlers);
         assert_eq!(s.sorting, SortSettings::default());
         assert!(s.system.single_instance);
+        assert_eq!(s.inspector, InspectorView::default());
+        assert_eq!(s.duplicates.tab_progress, TabProgress::Fill);
 
         // 0.3–0.5: индекс, поиски, сортировщик.
         let v05 = r#"{

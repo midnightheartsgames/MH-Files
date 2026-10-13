@@ -164,6 +164,10 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             let bar = Rect::from_min_size(rect.min, vec2(rect.width(), 2.0));
             painter.rect_filled(bar, CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 }, theme::accent());
         }
+        let progress = tab.duplicates_progress();
+        if let Some(progress) = progress {
+            tab_progress(ui, &painter, rect, progress, app.settings.duplicates.tab_progress);
+        }
         let icon =
             Rect::from_center_size(pos2(rect.left() + 14.0, rect.center().y), vec2(14.0, 14.0));
         match tab.location {
@@ -205,10 +209,18 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             app.actions.push(Action::SelectTab { pane: pane.id, index });
         }
         let tab_title = tab.location.clone();
-        response.on_hover_text(match &tab_title {
+        let mut hint = match &tab_title {
             Location::Dir(path) => path.display().to_string(),
             other => other.title(),
-        });
+        };
+        match progress {
+            Some(Some(done)) => {
+                hint.push_str(&format!("\nСравнение содержимого: {:.0}%", done * 100.0));
+            }
+            Some(None) => hint.push_str("\nОбход папок…"),
+            None => {}
+        }
+        response.on_hover_text(hint);
     }
     let plus = Rect::from_min_size(pos2(x + 2.0, strip.top() + 4.0), vec2(24.0, 24.0));
     let plus_response = ui.interact(plus, Id::new(("new-tab", pane.id.0)), Sense::click());
@@ -252,6 +264,97 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
     });
 }
 
+/// Ход долгой работы вкладки в её заголовке — видно и из другой вкладки. `progress` —
+/// доля сделанного; `None` — сколько всего, ещё не известно (бежит отрезок).
+fn tab_progress(
+    ui: &Ui,
+    painter: &egui::Painter,
+    rect: Rect,
+    progress: Option<f32>,
+    style: mh_files_core::settings::TabProgress,
+) {
+    use mh_files_core::settings::TabProgress;
+    if style == TabProgress::Off {
+        return;
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+    let (from, to) = match progress {
+        Some(done) => (0.0, done),
+        None => {
+            // Отрезок в треть вкладки ездит туда и обратно.
+            let t = (ui.input(|i| i.time) * 0.8).fract() as f32;
+            let at = if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 };
+            (at * 0.7, at * 0.7 + 0.3)
+        }
+    };
+    let span = |top: f32| {
+        Rect::from_min_max(
+            pos2(rect.left() + rect.width() * from, top),
+            pos2(rect.left() + rect.width() * to, rect.bottom()),
+        )
+    };
+    match style {
+        TabProgress::Fill => {
+            let radius = CornerRadius { nw: 5, ne: 5, sw: 0, se: 0 };
+            painter.rect_filled(span(rect.top()), radius, theme::accent().gamma_multiply(0.3));
+        }
+        TabProgress::Bar => {
+            painter.rect_filled(span(rect.bottom() - 2.0), CornerRadius::ZERO, theme::accent());
+        }
+        TabProgress::Off => {}
+    }
+}
+
+/// Сортировка: по чему, в какую сторону и «По умолчанию» — как в новой вкладке.
+fn sort_menu(ui: &mut Ui, tab: &mut Tab) {
+    let order = tab.options.sort;
+    let index = crate::tabs::everywhere(&tab.location);
+    let columns = [
+        SortColumn::Relevance,
+        SortColumn::Name,
+        SortColumn::Modified,
+        SortColumn::Type,
+        SortColumn::Size,
+        SortColumn::Created,
+    ];
+    for column in columns.into_iter().filter(|&c| index || c != SortColumn::Relevance) {
+        if ui.radio(order.column == column, column.title()).clicked() {
+            tab.set_sort(order.toggled(column));
+            ui.close();
+        }
+    }
+    ui.separator();
+    let mut descending = order.descending;
+    if ui.checkbox(&mut descending, "По убыванию").changed() {
+        tab.set_sort(mh_files_core::sort::SortOrder { descending, ..order });
+    }
+    ui.separator();
+    let default = tab.default_sort();
+    let hint = if default.column == SortColumn::Relevance {
+        "В порядке выдачи: лучшие совпадения первыми"
+    } else {
+        "По имени от А до Я, папки первыми"
+    };
+    let button = egui::Button::new("По умолчанию");
+    if ui.add_enabled(order != default, button).on_hover_text(hint).clicked() {
+        tab.set_sort(default);
+        ui.close();
+    }
+}
+
+/// Подсказка кнопки с сочетанием команды, если оно есть: «Палитра команд (Ctrl+Shift+P)».
+fn shortcut_tip(text: &str, app: &FilesApp, command: CommandId) -> String {
+    let keys = app.keymap.label(command);
+    if keys.is_empty() { text.to_string() } else { format!("{text} ({keys})") }
+}
+
+/// Подпись кнопки сортировки: по чему и в какую сторону.
+fn sort_tip(order: mh_files_core::sort::SortOrder) -> String {
+    let way =
+        if order.descending { "по убыванию" } else { "по возрастанию" };
+    format!("Сортировка: {}, {way}", order.column.title().to_lowercase())
+}
+
 /// Пункт меню: имя команды, сочетание справа, недоступные — серые.
 pub fn menu_item(ui: &mut Ui, app: &mut FilesApp, command: CommandId) {
     let enabled = app.available_cached(command);
@@ -265,6 +368,9 @@ pub fn menu_item(ui: &mut Ui, app: &mut FilesApp, command: CommandId) {
 }
 
 // ── Навигация и строка пути ──────────────────────────────────────────────────────────
+
+/// Уже строки пути кнопки справа начинают прятаться.
+const MIN_CRUMBS: f32 = 160.0;
 
 fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app: &mut FilesApp) {
     let (bar, _) = ui.allocate_exact_size(vec2(ui.available_width(), NAV_HEIGHT), Sense::hover());
@@ -298,8 +404,31 @@ fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app:
     if widgets::icon_button(ui, true, "Обновить (F5)", icons::refresh).clicked() {
         run(app, CommandId::Refresh);
     }
+    // Сортировка в любом виде, не только щелчком по заголовку столбца таблицы.
+    let sortable = !matches!(tab.location, Location::Sort { .. });
+    let sort_tip = sort_tip(tab.options.sort);
+    let sort = widgets::icon_button(ui, sortable, &sort_tip, icons::sort_order);
+    if sort.clicked() {
+        app.actions.push(Action::FocusPane(pane));
+    }
+    egui::Popup::menu(&sort).show(|ui| {
+        crate::popup::compact(ui.style_mut());
+        ui.set_min_width(180.0);
+        sort_menu(ui, tab);
+    });
     ui.add_space(4.0);
-    let right = 6.0 * 28.0 + 6.0;
+    // Справа до девяти кнопок по 28 и отступ между группами. В узкой панели строке пути
+    // нужно место: сначала прячутся «Перейти» и палитра, потом дубликаты и новый файл — они
+    // есть в меню и на клавишах.
+    let room = |buttons: f32| ui.available_width() - buttons * 28.0 - 6.0;
+    let level = if room(9.0) >= MIN_CRUMBS {
+        0
+    } else if room(7.0) >= MIN_CRUMBS {
+        1
+    } else {
+        2
+    };
+    let right = [9.0, 7.0, 5.0][level] * 28.0 + 6.0;
     let width = (ui.available_width() - right).max(80.0);
     let (crumb_rect, _) = ui.allocate_exact_size(vec2(width, 26.0), Sense::hover());
     if tab.address.is_some() {
@@ -315,16 +444,30 @@ fn nav_bar(ui: &mut Ui, pane: mh_files_core::layout::PaneId, tab: &mut Tab, app:
     {
         run(app, CommandId::NewFolder);
     }
-    if widgets::icon_button(ui, can_create, "Новый текстовый файл (Ctrl+Alt+N)", icons::new_file)
-        .clicked()
-    {
+    let new_file_tip = "Новый текстовый файл (Ctrl+Alt+N)";
+    if level < 2 && widgets::icon_button(ui, can_create, new_file_tip, icons::new_file).clicked() {
         run(app, CommandId::NewFile);
+    }
+    let duplicates = app.available_cached(CommandId::FindDuplicates);
+    let duplicates_tip = shortcut_tip("Найти дубликаты", app, CommandId::FindDuplicates);
+    if level < 2
+        && widgets::icon_button(ui, duplicates, &duplicates_tip, icons::duplicates).clicked()
+    {
+        run(app, CommandId::FindDuplicates);
     }
     let terminal_tip = "Открыть терминал здесь (Ctrl+Shift+T)";
     if widgets::icon_button(ui, can_create, terminal_tip, icons::terminal).clicked() {
         run(app, CommandId::OpenTerminal);
     }
     ui.add_space(6.0);
+    let goto_tip = shortcut_tip("Перейти к папке", app, CommandId::GoTo);
+    if level < 1 && widgets::icon_button(ui, true, &goto_tip, icons::goto).clicked() {
+        run(app, CommandId::GoTo);
+    }
+    let palette_tip = shortcut_tip("Палитра команд", app, CommandId::CommandPalette);
+    if level < 1 && widgets::icon_button(ui, true, &palette_tip, icons::palette).clicked() {
+        run(app, CommandId::CommandPalette);
+    }
     let filter_tip = "Фильтр (Ctrl+F)";
     if widgets::icon_button(ui, true, filter_tip, icons::search).clicked() {
         if tab.filter_open {
@@ -787,19 +930,36 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
         egui::UiBuilder::new().max_rect(chips).layout(Layout::left_to_right(Align::Min)),
     );
     if by_tags {
-        // Рейтинги: выделенные показываются, щелчок прячет или возвращает (`-rating:…`).
-        row.spacing_mut().item_spacing = vec2(4.0, 0.0);
-        for (name, label) in mh_files_core::tags::RATINGS {
-            let shown = !mh_files_core::tags::rating_hidden(&text, name);
-            let hint = if shown {
-                "Скрыть файлы с этим рейтингом"
-            } else {
-                "Показать снова"
-            };
-            if widgets::chip(&mut row, label, shown).on_hover_text(hint).clicked() {
-                text = mh_files_core::tags::toggle_rating(&text, name);
-            }
+        // Тип файлов (`kind:`) — теги бывают только у картинок, видео и звука.
+        let kinds = [Category::All, Category::Images, Category::Video, Category::Audio];
+        if let Some(picked) = widgets::kind_chips(&mut row, category::kind_of(&text), &kinds) {
+            text = category::with_kind(&text, picked);
         }
+        row.add_space(8.0);
+        // Рейтинги — в меню: отмеченные показываются, снятые прячутся (`-rating:…`).
+        let hidden = mh_files_core::tags::RATINGS
+            .iter()
+            .filter(|(name, _)| mh_files_core::tags::rating_hidden(&text, name))
+            .count();
+        let title = if hidden > 0 {
+            format!("Рейтинг · скрыто {hidden}")
+        } else {
+            "Рейтинг".into()
+        };
+        let rating = widgets::menu_chip(&mut row, &title, hidden > 0)
+            .on_hover_text("Какие рейтинги автотегов показывать: 18+, сомнительные…");
+        // Галочек несколько: меню не закрывается щелчком внутри.
+        let menu = egui::Popup::menu(&rating)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
+        menu.show(|ui| {
+            crate::popup::compact(ui.style_mut());
+            for (name, label) in mh_files_core::tags::RATINGS {
+                let mut shown = !mh_files_core::tags::rating_hidden(&text, name);
+                if ui.checkbox(&mut shown, label).changed() {
+                    text = mh_files_core::tags::toggle_rating(&text, name);
+                }
+            }
+        });
     } else if let Some(picked) =
         widgets::category_chips(&mut row, category::kind_of(&text), !meaning)
     {
@@ -1319,29 +1479,7 @@ fn background_menu(ui: &mut Ui, app: &mut FilesApp, tab: &mut Tab) {
             }
         }
     });
-    crate::popup::submenu(ui, "Сортировка", None, |ui| {
-        let order = tab.options.sort;
-        let index = crate::tabs::everywhere(&tab.location);
-        let columns = [
-            SortColumn::Relevance,
-            SortColumn::Name,
-            SortColumn::Modified,
-            SortColumn::Type,
-            SortColumn::Size,
-            SortColumn::Created,
-        ];
-        for column in columns.into_iter().filter(|&c| index || c != SortColumn::Relevance) {
-            if ui.radio(order.column == column, column.title()).clicked() {
-                tab.set_sort(order.toggled(column));
-                ui.close();
-            }
-        }
-        ui.separator();
-        let mut descending = order.descending;
-        if ui.checkbox(&mut descending, "По убыванию").changed() {
-            tab.set_sort(mh_files_core::sort::SortOrder { descending, ..order });
-        }
-    });
+    crate::popup::submenu(ui, "Сортировка", None, |ui| sort_menu(ui, tab));
     for command in [
         CommandId::Refresh,
         CommandId::ToggleHidden,

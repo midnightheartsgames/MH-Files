@@ -1025,6 +1025,9 @@ fn search(shared: &Shared, text: &str, cancel: &CancelToken) -> Result<TagResult
         let store = shared.store.read();
         store
             .iter()
+            .filter(|(path, _)| {
+                path.file_name().is_some_and(|name| query.kind_matches(&name.to_string_lossy()))
+            })
             .filter_map(|(path, record)| {
                 let shown = model::show(&record.tags, &vocabulary, sounds.as_deref(), thresholds);
                 query

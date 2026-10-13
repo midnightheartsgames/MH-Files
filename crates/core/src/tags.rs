@@ -554,7 +554,8 @@ fn query_words(text: &str) -> Vec<String> {
 /// * `rating:explicit` — только этот рейтинг, `-rating:18+` — без него (рейтинги: `general`,
 ///   `sensitive`, `questionable`, `explicit` или по-русски);
 /// * в поиске по тегам и голые слова — теги (`cat outdoors -dog`), в фильтре папки они
-///   остаются словами имени.
+///   остаются словами имени;
+/// * в поиске по тегам `kind:видео` — только файлы этого типа (как в поиске по дискам).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TagQuery {
     pub include: Vec<String>,
@@ -562,6 +563,8 @@ pub struct TagQuery {
     /// Только эти рейтинги (пусто — любые).
     pub only_ratings: Vec<&'static str>,
     pub hide_ratings: Vec<&'static str>,
+    /// Только файлы этого типа (`kind:`; только в поиске по тегам).
+    pub kind: crate::category::Category,
 }
 
 impl TagQuery {
@@ -583,6 +586,14 @@ impl TagQuery {
                 } else {
                     query.only_ratings.extend(ratings);
                 }
+                continue;
+            }
+            if bare
+                && !negative
+                && let Some(kind) =
+                    lower.strip_prefix("kind:").and_then(crate::category::Category::parse)
+            {
+                query.kind = kind;
                 continue;
             }
             let tag = match lower.strip_prefix("tag:") {
@@ -613,11 +624,20 @@ impl TagQuery {
             && self.exclude.is_empty()
             && self.only_ratings.is_empty()
             && self.hide_ratings.is_empty()
+            && self.kind == crate::category::Category::All
     }
 
-    /// Есть что искать: нужные теги или рейтинги (одни исключения — это всё подряд).
+    /// Есть что искать: нужные теги, рейтинги или тип файлов (одни исключения — это всё
+    /// подряд).
     pub fn selects(&self) -> bool {
-        !self.include.is_empty() || !self.only_ratings.is_empty()
+        !self.include.is_empty()
+            || !self.only_ratings.is_empty()
+            || self.kind != crate::category::Category::All
+    }
+
+    /// Подходит ли файл по типу (`kind:`); имя — с расширением.
+    pub fn kind_matches(&self, name: &str) -> bool {
+        self.kind.matches(name, false)
     }
 
     /// Подходит ли файл. `None` — тегов у файла нет (не картинка или ещё не посчитаны): такой
@@ -1098,6 +1118,14 @@ mod tests {
         assert!(!TagQuery::parse("tag:cat", false).0.matches(None));
         assert!(!TagQuery::parse("cat", false).0.selects());
         assert_eq!(query_token("long hair"), "long_hair");
+        // Тип файлов — только в поиске по тегам; одного типа хватает для выдачи.
+        let (query, _) = TagQuery::parse("cat kind:видео", true);
+        assert_eq!(query.include, vec!["cat"]);
+        assert_eq!(query.kind, crate::category::Category::Video);
+        assert!(query.kind_matches("clip.MP4") && !query.kind_matches("cat.png"));
+        assert!(TagQuery::parse("kind:аудио", true).0.selects());
+        let (query, rest) = TagQuery::parse("kind:видео", false);
+        assert_eq!((query.kind, rest.as_str()), (crate::category::Category::All, "kind:видео"));
     }
 
     #[test]
