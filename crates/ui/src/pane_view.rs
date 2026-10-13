@@ -556,7 +556,7 @@ fn filter_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     let mut text = tab.filter.clone();
     let tags = app.settings.tags.enabled;
     let (hint, reserve) = if tags {
-        ("Фильтр: слова, маска *.png, теги tag:cat -tag:dog", 260.0)
+        ("Фильтр: слова, маска *.png, теги tag:cat -tag:dog tag:cat|dog", 260.0)
     } else {
         ("Фильтр: слова в любом порядке или маска *.png", 160.0)
     };
@@ -571,6 +571,12 @@ fn filter_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
         response.request_focus();
     }
     if response.changed() {
+        tab.set_filter(text.clone());
+    }
+    if tags
+        && let Some(picked) = crate::tag_suggest::show(ui, id, &response, &text, false, &app.tagger)
+    {
+        text = picked;
         tab.set_filter(text.clone());
     }
     // Рейтинг автотегов: какие показывать в папке (`-rating:…` в тексте фильтра).
@@ -699,6 +705,7 @@ fn search_header(
 fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     let meaning = matches!(tab.location, Location::Semantic { .. });
     let by_tags = matches!(tab.location, Location::Tags { .. });
+    let edit_id = Id::new(("index-query", tab.id));
     let Some(view) = &mut tab.index else { return };
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 90.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
@@ -725,7 +732,7 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     let edit_rect = Rect::from_min_max(field.min + vec2(30.0, 0.0), field.max - vec2(8.0, 0.0));
     let mut text = view.text.clone();
     let hint = if by_tags {
-        "Теги: cat outdoors -dog, long_hair, *hair, rating:general"
+        "Теги: cat outdoors -dog, cat|dog, long_hair, *hair, music, rating:general"
     } else if meaning {
         "Опишите словами: кошка на диване, договор аренды, презентация о продажах"
     } else {
@@ -734,7 +741,7 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     let edit = ui.place(
         edit_rect,
         egui::TextEdit::singleline(&mut text)
-            .id(Id::new(("index-query", tab.id)))
+            .id(edit_id)
             .frame(egui::Frame::NONE)
             .vertical_align(Align::Center)
             .font(theme::regular(14.0))
@@ -743,6 +750,11 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     );
     if std::mem::take(&mut view.focus) {
         edit.request_focus();
+    }
+    if by_tags
+        && let Some(picked) = crate::tag_suggest::show(ui, edit_id, &edit, &text, true, &app.tagger)
+    {
+        text = picked;
     }
     // Режим: по имени (индекс дисков), по смыслу (EmbeddingGemma 2) или по автотегам.
     let modes =
@@ -757,7 +769,7 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
         "EmbeddingGemma 2 на этом компьютере: текст, картинки и звук по описанию (Ctrl+Shift+Space)",
     );
     let tag_mode = widgets::chip(&mut mode_row, "По тегам", by_tags)
-        .on_hover_text("Автотеги картинок и видео: файлы, у которых теги уже посчитаны");
+        .on_hover_text("Автотеги картинок, видео и звука: файлы, у которых теги уже посчитаны");
     let query = text.trim().to_string();
     let switch = if by_name.clicked() && (meaning || by_tags) {
         Some(Location::Index { query })

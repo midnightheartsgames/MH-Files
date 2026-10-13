@@ -30,6 +30,7 @@ mod startup;
 mod statusbar;
 mod storage;
 mod tabs;
+mod tag_suggest;
 mod theme;
 mod titlebar;
 mod widgets;

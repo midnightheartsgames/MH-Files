@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! <папка>\models\SmilingWolf--wd-eva02-large-tagger-v3\model.onnx, selected_tags.csv
+//! <папка>\models\Xenova--ast-finetuned-audioset-10-10-0.4593\config.json, onnx\model.onnx
 //! <папка>\runtime\1.24.4-directml\onnxruntime.dll, onnxruntime_providers_shared.dll, DirectML.dll
 //! ```
 
@@ -11,6 +12,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use mh_files_core::settings::TagSettings;
+use mh_files_core::sound::{SOUND_CONFIG, SOUND_MODELS, SOUND_REPO};
 use mh_files_core::tags::{self, MODEL_FILE, NUGET_HOST, RUNTIME_FILES, RUNTIME_FOLDER, TAGS_FILE};
 
 /// Готовые к работе пути.
@@ -20,6 +22,14 @@ pub struct Paths {
     pub runtime: PathBuf,
     pub model: PathBuf,
     pub tags: PathBuf,
+    /// Модель звука и её классы — если звуковые теги включены.
+    pub sound: Option<SoundPaths>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoundPaths {
+    pub model: PathBuf,
+    pub config: PathBuf,
 }
 
 /// Ход скачивания: что, сколько из скольких; вернуть `false` — прервать.
@@ -27,6 +37,21 @@ pub type Progress<'a> = &'a mut dyn FnMut(&str, u64, u64) -> bool;
 
 fn model_dir(dir: &Path, settings: &TagSettings) -> PathBuf {
     dir.join("models").join(tags::model_folder(&settings.model))
+}
+
+fn sound_dir(dir: &Path) -> PathBuf {
+    dir.join("models").join(tags::model_folder(SOUND_REPO))
+}
+
+/// Файл модели звука из настроек (неизвестный — первый из готовых).
+fn sound_file(settings: &TagSettings) -> &str {
+    mh_files_core::sound::sound_model(&settings.sound_model)
+        .map_or(SOUND_MODELS[0].file, |m| m.file)
+}
+
+fn sound_paths(dir: &Path, settings: &TagSettings) -> SoundPaths {
+    let folder = sound_dir(dir);
+    SoundPaths { model: folder.join(sound_file(settings)), config: folder.join(SOUND_CONFIG) }
 }
 
 fn runtime_dir(dir: &Path) -> PathBuf {
@@ -45,10 +70,16 @@ fn runtime_lib(dir: &Path, settings: &TagSettings) -> PathBuf {
 /// Пути, если всё на месте.
 pub fn ready(dir: &Path, settings: &TagSettings) -> Option<Paths> {
     let models = model_dir(dir, settings);
+    let sound = sound_paths(dir, settings);
+    let sound_ready = sound.model.is_file() && sound.config.is_file();
+    if settings.sound && !sound_ready {
+        return None;
+    }
     let paths = Paths {
         runtime: runtime_lib(dir, settings),
         model: models.join(MODEL_FILE),
         tags: models.join(TAGS_FILE),
+        sound: settings.sound.then_some(sound),
     };
     // Скачанная сборка — только вся: без DirectML.dll видеокарта не заработает.
     let runtime = if settings.runtime.as_os_str().is_empty() {
@@ -120,11 +151,33 @@ pub fn ensure(dir: &Path, settings: &TagSettings, progress: Progress) -> Result<
         })
         .map_err(|e| format!("{file} из {} не скачан: {e}", settings.model))?;
     }
-    // Прежние модели больше не нужны: гигабайт на диске.
-    let keep = tags::model_folder(&settings.model);
+    if settings.sound {
+        let sound = sound_paths(dir, settings);
+        let file = sound_file(settings);
+        for (dest, remote, what) in
+            [(&sound.config, SOUND_CONFIG, "классы звука"), (&sound.model, file, "модель звука")]
+        {
+            if dest.is_file() {
+                continue;
+            }
+            let path = format!("/{SOUND_REPO}/resolve/main/{remote}");
+            mh_files_platform::net::download("huggingface.co", &path, dest, &mut |done, total| {
+                progress(what, done, total.unwrap_or(0))
+            })
+            .map_err(|e| format!("{remote} из {SOUND_REPO} не скачан: {e}"))?;
+        }
+        // Другой вариант модели звука больше не нужен.
+        for other in SOUND_MODELS.iter().filter(|m| m.file != file) {
+            let _ = std::fs::remove_file(sound_dir(dir).join(other.file));
+        }
+    }
+    // Прежние модели больше не нужны: гигабайт на диске. Модель звука остаётся, даже если
+    // звук выключен: включить его снова — без скачивания.
+    let keep = [tags::model_folder(&settings.model), tags::model_folder(SOUND_REPO)];
     if let Ok(entries) = std::fs::read_dir(dir.join("models")) {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy() != keep && entry.path().is_dir() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !keep.contains(&name) && entry.path().is_dir() {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -280,10 +333,20 @@ mod tests {
         std::fs::create_dir_all(&models).unwrap();
         std::fs::write(models.join(MODEL_FILE), "m").unwrap();
         std::fs::write(models.join(TAGS_FILE), "t").unwrap();
+        let quiet = TagSettings { sound: false, ..settings.clone() };
+        assert!(ready(dir.path(), &settings).is_none(), "модели звука ещё нет");
         let paths =
-            ensure(dir.path(), &settings, &mut |_, _, _| panic!("ничего не качается")).unwrap();
+            ensure(dir.path(), &quiet, &mut |_, _, _| panic!("ничего не качается")).unwrap();
         assert_eq!(paths.runtime, runtime);
         assert_eq!(paths.model, models.join(MODEL_FILE));
+        assert_eq!(paths.sound, None);
+        let sound = sound_paths(dir.path(), &settings);
+        std::fs::create_dir_all(sound.model.parent().unwrap()).unwrap();
+        std::fs::write(&sound.model, "m").unwrap();
+        std::fs::write(&sound.config, "{}").unwrap();
+        let paths =
+            ensure(dir.path(), &settings, &mut |_, _, _| panic!("ничего не качается")).unwrap();
+        assert!(paths.sound.unwrap().model.ends_with("onnx/model.onnx"));
         let missing = TagSettings { runtime: dir.path().join("нет"), ..settings };
         assert!(ensure(dir.path(), &missing, &mut |_, _, _| true).unwrap_err().contains("нет"));
     }

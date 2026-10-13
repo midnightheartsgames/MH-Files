@@ -1094,7 +1094,7 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
     card(ui, "Автотеги", |ui| {
         widgets::hint(
             ui,
-            "Модель WD Tagger v3 смотрит на картинки и кадры видео и подписывает, что на них: предметы, место, вид кадра, персонажей аниме и игр — словами Danbooru (около 10 800 тегов, по-английски). Теги видны в столбце «Теги» таблицы и в Инспекторе: сначала у видимых файлов, потом у остальных картинок открытой папки. Всё считается на этом компьютере: файлы никуда не отправляются.",
+            "Модель WD Tagger v3 смотрит на картинки и кадры видео и подписывает, что на них: предметы, место, вид кадра, персонажей аниме и игр — словами Danbooru (около 10 800 тегов, по-английски). Модель звука слушает аудио и звуковые дорожки видео: речь, музыку и её жанры, инструменты, звуки. Теги видны в столбце «Теги» таблицы и в Инспекторе: сначала у видимых файлов, потом у остальных файлов открытой папки. Всё считается на этом компьютере: файлы никуда не отправляются.",
         );
         switch_row(
             ui,
@@ -1108,7 +1108,7 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
             ui,
             "Всю открытую папку",
             Some(
-                "После видимых файлов — остальные картинки и видео папки, в фоне. Выключено — только то, что на экране.",
+                "После видимых файлов — остальные картинки, видео и звук папки, в фоне. Выключено — только то, что на экране.",
             ),
             &mut t.whole_folder,
         );
@@ -1132,6 +1132,13 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
                     " · модель на видеокарте"
                 } else {
                     " · модель на процессоре"
+                });
+            }
+            if status.sound_loaded {
+                text.push_str(if status.sound_gpu {
+                    " · звук на видеокарте"
+                } else {
+                    " · звук на процессоре"
                 });
             }
             if let Some(last) = status.last {
@@ -1173,6 +1180,15 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
         }
         if info.status.skipped > 0 {
             widgets::hint(ui, &format!("Модель отказалась от файлов: {}.", info.status.skipped));
+        }
+        if let Some(error) = &info.status.sound_error {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(format!("Модель звука не заработала: {error}"))
+                        .color(theme::WARN),
+                )
+                .wrap(),
+            );
         }
     });
     card(ui, "Модель", |ui| {
@@ -1234,10 +1250,82 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
             Some("Обычный, чувствительный, сомнительный или откровенный — как его видит модель."),
             &mut t.rating,
         );
-        row(ui, "Файлы больше", |ui| {
+        row(ui, "Картинки больше", |ui| {
             ui.add(egui::DragValue::new(&mut t.max_file_mb).range(1..=4096).suffix(" МБ"));
             ui.label(RichText::new("— без тегов").color(theme::TEXT_SECONDARY));
         });
+    });
+    card(ui, "Видео", |ui| {
+        widgets::hint(
+            ui,
+            "Видео смотрится по нескольким кадрам: тег засчитывается, если он есть хотя бы на двух кадрах, рейтинг — по самому откровенному кадру. Больше кадров — точнее, но дольше. Новые значения — для следующих видео; уже посчитанные пересчитаются кнопкой «Пересчитать все теги».",
+        );
+        row(ui, "Кадр каждые", |ui| {
+            ui.add(egui::DragValue::new(&mut t.video_step).range(1..=600).suffix(" с"));
+            ui.label(RichText::new("по умолчанию 10 с").color(theme::TEXT_SECONDARY));
+        });
+        row(ui, "Не больше кадров", |ui| {
+            ui.add(egui::DragValue::new(&mut t.video_frames).range(1..=64));
+            ui.label(
+                RichText::new("длинное видео — равномерно по всей длине")
+                    .color(theme::TEXT_SECONDARY),
+            );
+        });
+    });
+    card(ui, "Звук", |ui| {
+        use mh_files_core::sound::{SOUND_MODELS, SOUND_REPO, sound_model};
+        widgets::hint(
+            ui,
+            "Модель AST (Audio Spectrogram Transformer, онтология AudioSet — 527 классов): речь, пение, музыка и её жанры, инструменты, животные, транспорт, звуки дома и природы. Слушает аудио и звуковые дорожки видео отрезками по 10 секунд.",
+        );
+        switch_row(
+            ui,
+            "Звуковые теги",
+            Some(
+                "Для аудио и звука видео. Включено — один раз скачивается модель звука (90–350 МБ).",
+            ),
+            &mut t.sound,
+        );
+        row(ui, "Модель звука", |ui| {
+            let selected = sound_model(&t.sound_model)
+                .map_or_else(|| t.sound_model.clone(), |m| format!("{} ({})", m.title, m.size));
+            egui::ComboBox::from_id_salt("tags-sound-model")
+                .selected_text(selected)
+                .width(300.0)
+                .show_ui(ui, |ui| {
+                    for model in SOUND_MODELS {
+                        let label = format!("{} ({})", model.title, model.size);
+                        if ui.selectable_label(t.sound_model == model.file, label).clicked() {
+                            t.sound_model = model.file.to_string();
+                        }
+                    }
+                });
+        });
+        widgets::hint(
+            ui,
+            &format!(
+                "{SOUND_REPO} с Hugging Face. Другая модель — звуковые теги считаются заново."
+            ),
+        );
+        row(ui, "Порог звуков", |ui| {
+            use mh_files_core::settings::TagSettings;
+            ui.add(
+                egui::Slider::new(&mut t.sound_threshold, TagSettings::MIN_SOUND_THRESHOLD..=80)
+                    .suffix("%"),
+            );
+            ui.label(RichText::new("по умолчанию 10%").color(theme::TEXT_SECONDARY));
+        });
+        row(ui, "Отрезков с записи", |ui| {
+            ui.add(egui::DragValue::new(&mut t.sound_clips).range(1..=16));
+            ui.label(RichText::new("по 10 с, равномерно по записи").color(theme::TEXT_SECONDARY));
+        });
+        if ui
+            .button("Открыть журнал звука")
+            .on_hover_text("Вывод ONNX Runtime у модели звука")
+            .clicked()
+        {
+            action = Some(TagsAction::OpenFile(info.dir.join("tagger-sound.log")));
+        }
     });
     action
 }

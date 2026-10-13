@@ -21,6 +21,14 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// Звук с первого кадра: громкость 0..1, выключен ли он и скорость.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sound {
+    pub volume: f64,
+    pub muted: bool,
+    pub rate: f64,
+}
+
 /// Что сейчас с воспроизведением.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlayerState {
@@ -34,6 +42,9 @@ pub struct PlayerState {
     pub has_video: bool,
     pub has_audio: bool,
     pub volume: f64,
+    pub muted: bool,
+    /// Скорость воспроизведения (1 — обычная).
+    pub rate: f64,
     pub error: Option<String>,
 }
 
@@ -43,6 +54,8 @@ pub(crate) enum Command {
     Pause,
     Seek(f64),
     Volume(f64),
+    Muted(bool),
+    Rate(f64),
 }
 
 #[derive(Default)]
@@ -63,9 +76,9 @@ pub struct Player {
 
 impl Player {
     /// Открыть и сразу начать воспроизведение. `max_side` — предел стороны кадра в пикселях.
-    /// `spectrum` — ещё и разложить звук для эквалайзера ([`Player::levels`]); `volume` —
-    /// громкость 0..1 с первого звука.
-    pub fn open(path: &Path, max_side: u32, spectrum: bool, volume: f64, waker: Waker) -> Player {
+    /// `spectrum` — ещё и разложить звук для эквалайзера ([`Player::levels`]); `sound` —
+    /// громкость, выключен ли звук и скорость — с первого звука.
+    pub fn open(path: &Path, max_side: u32, spectrum: bool, sound: Sound, waker: Waker) -> Player {
         let shared = Arc::new(Shared::default());
         let (commands, receiver) = unbounded();
         #[cfg(windows)]
@@ -78,7 +91,7 @@ impl Player {
             }
             let (path, thread_shared) = (path.to_path_buf(), shared.clone());
             let started = std::thread::Builder::new().name("player".into()).spawn(move || {
-                crate::win::player::run(&path, max_side, volume, &thread_shared, &receiver, &waker)
+                crate::win::player::run(&path, max_side, sound, &thread_shared, &receiver, &waker)
             });
             if let Err(error) = started {
                 shared.state.lock().unwrap().error = Some(error.to_string());
@@ -86,9 +99,15 @@ impl Player {
         }
         #[cfg(not(windows))]
         {
-            let _ = (path, max_side, spectrum, volume, waker, receiver);
-            shared.state.lock().unwrap().error =
-                Some("воспроизведение есть только в Windows".into());
+            let _ = (path, max_side, spectrum);
+            // Проверка интерфейса под Linux: часы без кадров и звука.
+            if std::env::var_os("MH_FILES_FAKE_PLAYER").is_some() {
+                let thread_shared = shared.clone();
+                std::thread::spawn(move || fake(&thread_shared, sound, &receiver, &waker));
+            } else {
+                shared.state.lock().unwrap().error =
+                    Some("воспроизведение есть только в Windows".into());
+            }
         }
         Player { shared, commands }
     }
@@ -129,6 +148,63 @@ impl Player {
     /// Громкость 0..1.
     pub fn set_volume(&self, volume: f64) {
         let _ = self.commands.send(Command::Volume(volume.clamp(0.0, 1.0)));
+    }
+
+    /// Выключить звук или вернуть.
+    pub fn set_muted(&self, muted: bool) {
+        let _ = self.commands.send(Command::Muted(muted));
+    }
+
+    /// Скорость воспроизведения: 0,25–4 (1 — обычная).
+    pub fn set_rate(&self, rate: f64) {
+        let _ = self.commands.send(Command::Rate(rate.clamp(0.25, 4.0)));
+    }
+}
+
+/// Имитация воспроизведения для проверки интерфейса вне Windows: полторы минуты «видео».
+#[cfg(not(windows))]
+fn fake(
+    shared: &Arc<Shared>,
+    sound: Sound,
+    commands: &crossbeam_channel::Receiver<Command>,
+    waker: &Waker,
+) {
+    let mut state = PlayerState {
+        ready: true,
+        duration: 95.0,
+        has_video: true,
+        has_audio: true,
+        volume: sound.volume,
+        muted: sound.muted,
+        rate: sound.rate,
+        ..PlayerState::default()
+    };
+    let tick = std::time::Duration::from_millis(50);
+    loop {
+        match commands.recv_timeout(tick) {
+            Ok(Command::Play) => {
+                if state.ended {
+                    state.position = 0.0;
+                }
+                state.paused = false;
+            }
+            Ok(Command::Pause) => state.paused = true,
+            Ok(Command::Seek(at)) => state.position = at.min(state.duration),
+            Ok(Command::Volume(volume)) => state.volume = volume,
+            Ok(Command::Muted(muted)) => state.muted = muted,
+            Ok(Command::Rate(rate)) => state.rate = rate,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+        }
+        if !state.paused && !state.ended {
+            state.position += tick.as_secs_f64() * state.rate;
+        }
+        state.ended = state.position >= state.duration;
+        if state.ended {
+            state.position = state.duration;
+        }
+        *shared.state.lock().unwrap() = state.clone();
+        waker();
     }
 }
 

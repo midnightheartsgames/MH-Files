@@ -380,28 +380,36 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
     });
 }
 
-/// Раздел «Теги»: что на картинке или кадре видео. Щелчок по тегу — копия в буфер.
+/// Разделы «Теги» и «Звук»: что на картинке или кадрах видео и что слышно. Щелчок по тегу —
+/// поиск по нему, «+» — добавить к поиску (или к фильтру папки), правый — ещё.
 fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
     let name = entry.name.as_str();
-    if !mh_files_fs::tags::picture::taggable(&mh_files_core::entry::extension_of(name)) {
-        return;
-    }
+    let ext = mh_files_core::entry::extension_of(name);
     let label = |ui: &mut Ui, text: &str| {
         ui.label(RichText::new(text).font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
     };
     if !app.settings.tags.enabled {
-        label(ui, "Теги");
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new("автотеги выключены").color(theme::TEXT_SECONDARY));
-            if ui.small_button("Включить…").clicked() {
-                app.settings_window.open_tags(&app.settings, &app.sorter.config);
-            }
-        });
-        ui.add_space(4.0);
+        let media = mh_files_fs::tags::picture::taggable(&ext)
+            || mh_files_core::category::Category::Audio.extensions().contains(&ext.as_str());
+        if media {
+            label(ui, "Теги");
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("автотеги выключены").color(theme::TEXT_SECONDARY));
+                if ui.small_button("Включить…").clicked() {
+                    app.settings_window.open_tags(&app.settings, &app.sorter.config);
+                }
+            });
+            ui.add_space(4.0);
+        }
+        return;
+    }
+    let path = entry.path();
+    let parts = app.tagger.wanted_parts(&path, entry.size);
+    if parts == 0 {
         return;
     }
     let modified = entry.modified.map_or(0, mh_files_core::index::unix);
-    let shown = match app.tagger.lookup(&entry.path(), entry.size, modified) {
+    let shown = match app.tagger.lookup(&path, entry.size, modified) {
         mh_files_fs::Lookup::Ready(shown) => shown,
         mh_files_fs::Lookup::Pending => {
             field(ui, "Теги", "определяются…");
@@ -416,7 +424,10 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
             return;
         }
     };
-    if app.settings.tags.rating
+    let image = parts & mh_files_core::tags::PART_IMAGE != 0;
+    let sound = parts & mh_files_core::tags::PART_SOUND != 0;
+    if image
+        && app.settings.tags.rating
         && let Some(rating) = &shown.rating
     {
         let text = format!(
@@ -453,52 +464,92 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
         });
         ui.add_space(4.0);
     }
+    if image {
+        let empty = "модель ничего уверенно не узнала";
+        chips(ui, app, "Теги", &shown.tags, &shown.line, empty);
+    }
+    if sound {
+        let line = shown.sounds.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
+        let empty = if shown.sounds.is_empty() && !image && shown.tags.is_empty() {
+            "ничего уверенно не слышно (или звука нет)"
+        } else {
+            "ничего уверенно не слышно"
+        };
+        chips(ui, app, "Звук", &shown.sounds, &line, empty);
+    }
+}
+
+/// Заголовок с числом и кнопкой «Копировать», затем теги плашками.
+fn chips(
+    ui: &mut Ui,
+    app: &mut FilesApp,
+    title: &str,
+    tags: &[mh_files_core::tags::Tag],
+    line: &str,
+    empty: &str,
+) {
     ui.horizontal(|ui| {
-        label(ui, &format!("Теги · {}", shown.tags.len()));
-        if !shown.tags.is_empty()
-            && ui.small_button("Копировать").on_hover_text("Все теги через запятую").clicked()
+        ui.label(
+            RichText::new(format!("{title} · {}", tags.len()))
+                .font(theme::regular(12.5))
+                .color(theme::TEXT_DISABLED),
+        );
+        if !tags.is_empty()
+            && ui.small_button("Копировать").on_hover_text("Все через запятую").clicked()
         {
-            ui.ctx().copy_text(shown.line.clone());
+            ui.ctx().copy_text(line.to_string());
             app.actions.push(Action::Status("теги скопированы".into(), crate::app::Level::Info));
         }
     });
-    if shown.tags.is_empty() {
-        ui.label(RichText::new("модель ничего уверенно не узнала").color(theme::TEXT_SECONDARY));
+    if tags.is_empty() {
+        ui.label(RichText::new(empty).color(theme::TEXT_SECONDARY));
         ui.add_space(4.0);
         return;
     }
+    let in_search = matches!(app.tab().location, Location::Tags { .. });
+    let plus_hint = if in_search {
+        "Добавить к этому поиску по тегам"
+    } else {
+        "Добавить к фильтру папки: только файлы и с этим тегом"
+    };
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        for tag in &shown.tags {
+        for tag in tags {
             // Персонажи — цветом акцента: их меньше, и они важнее.
             let color = if tag.kind == mh_files_core::tags::TagKind::Character {
                 theme::accent()
             } else {
                 theme::TEXT_PRIMARY
             };
-            let chip =
-                egui::Button::new(RichText::new(&tag.name).font(theme::regular(13.0)).color(color))
-                    .fill(theme::FIELD)
-                    .stroke(egui::Stroke::new(1.0, theme::CARD_STROKE))
-                    .corner_radius(egui::CornerRadius::same(4));
-            let kind = if tag.kind == mh_files_core::tags::TagKind::Character {
-                "персонаж · "
-            } else {
-                ""
+            let kind = match tag.kind {
+                mh_files_core::tags::TagKind::Character => "персонаж · ",
+                mh_files_core::tags::TagKind::Sound => "звук · ",
+                _ => "",
             };
-            let hint = format!(
-                "{kind}уверенность {:.0}%\nщелчок — все файлы с этим тегом, правый — ещё",
-                tag.score * 100.0
-            );
             let token = mh_files_core::tags::query_token(&tag.name);
-            let response =
-                ui.add(chip).on_hover_text(hint).on_hover_cursor(egui::CursorIcon::PointingHand);
-            if response.clicked() {
-                search_tags(app, token.clone());
+            let (response, plus) = tag_chip(ui, &tag.name, color);
+            if plus {
+                if response.clicked() {
+                    add_to_search(app, &token);
+                }
+                response.clone().on_hover_text(plus_hint);
+            } else {
+                let hint = format!(
+                    "{kind}уверенность {:.0}%\nщелчок — все файлы с этим тегом, «+» — добавить к поиску, правый — ещё",
+                    tag.score * 100.0
+                );
+                if response.clicked() {
+                    search_tags(app, token.clone());
+                }
+                response.clone().on_hover_text(hint);
             }
             response.context_menu(|ui| {
                 if ui.button("Все файлы с этим тегом").clicked() {
                     search_tags(app, token.clone());
+                    ui.close();
+                }
+                if in_search && ui.button("Добавить к поиску").clicked() {
+                    add_to_search(app, &token);
                     ui.close();
                 }
                 if ui.button("Только с этим тегом в папке").clicked() {
@@ -522,6 +573,70 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
         }
     });
     ui.add_space(8.0);
+}
+
+/// Плашка тега с «+» слева. Второе — указатель над «+» (щелчок по нему — добавить к поиску).
+fn tag_chip(ui: &mut Ui, name: &str, color: egui::Color32) -> (egui::Response, bool) {
+    let font = theme::regular(13.0);
+    let galley = ui.painter().layout_no_wrap(name.to_string(), font.clone(), color);
+    let plus_width = 18.0;
+    let size = egui::vec2(plus_width + galley.size().x + 12.0, galley.size().y + 6.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let plus_rect = egui::Rect::from_min_size(rect.min, egui::vec2(plus_width, rect.height()));
+    let on_plus = response.hover_pos().is_some_and(|p| plus_rect.contains(p))
+        || (response.clicked()
+            && response.interact_pointer_pos().is_some_and(|p| plus_rect.contains(p)));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let radius = egui::CornerRadius::same(4);
+        let fill = if response.hovered() && !on_plus { theme::CARD } else { theme::FIELD };
+        painter.rect(
+            rect,
+            radius,
+            fill,
+            egui::Stroke::new(1.0, theme::CARD_STROKE),
+            egui::StrokeKind::Inside,
+        );
+        if on_plus {
+            let left = egui::CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 };
+            painter.rect_filled(plus_rect.shrink(1.0), left, theme::CARD);
+        }
+        painter.vline(
+            plus_rect.right(),
+            rect.y_range().shrink(4.0),
+            egui::Stroke::new(1.0, theme::CARD_STROKE),
+        );
+        let plus_color = if on_plus { theme::accent() } else { theme::TEXT_SECONDARY };
+        let c = plus_rect.center();
+        let stroke = egui::Stroke::new(1.5, plus_color);
+        painter.line_segment([c - egui::vec2(4.0, 0.0), c + egui::vec2(4.0, 0.0)], stroke);
+        painter.line_segment([c - egui::vec2(0.0, 4.0), c + egui::vec2(0.0, 4.0)], stroke);
+        let text_pos = egui::pos2(plus_rect.right() + 6.0, rect.center().y - galley.size().y / 2.0);
+        painter.galley(text_pos, galley, color);
+    }
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    (response, on_plus)
+}
+
+/// «+» у тега: во вкладке поиска по тегам — к её запросу, иначе — к фильтру папки.
+fn add_to_search(app: &mut FilesApp, token: &str) {
+    let Location::Tags { query } = &app.tab().location else {
+        add_to_filter(app, &format!("tag:{token}"));
+        return;
+    };
+    let current = app.tab().index.as_ref().map_or_else(|| query.clone(), |view| view.text.clone());
+    let (parsed, _) = mh_files_core::tags::TagQuery::parse(&current, true);
+    let (wanted, _) = mh_files_core::tags::TagQuery::parse(token, true);
+    if wanted.include.iter().all(|t| parsed.include.contains(t)) {
+        return;
+    }
+    let text = if current.trim().is_empty() {
+        token.to_string()
+    } else {
+        format!("{} {token}", current.trim_end())
+    };
+    let workers = app.workers.clone();
+    app.tab_mut().set_index_query(text, &workers);
 }
 
 /// Поиск по тегам в новой вкладке.

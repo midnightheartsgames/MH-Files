@@ -1,6 +1,7 @@
 //! Быстрый просмотр (пробел): крупный предпросмотр поверх окна. Стрелки листают объекты
 //! списка, не закрывая просмотр; пробел или Esc закрывают. Видео и звук сразу играют:
-//! Enter — пауза, Shift+стрелки — перемотка на 5 секунд.
+//! Enter или щелчок по кадру — пауза, Shift+стрелки — перемотка на 5 секунд, M — звук. Над
+//! полоской перемотки — кадр под указателем, в конце — повтор.
 
 use std::path::PathBuf;
 
@@ -34,7 +35,19 @@ pub struct State {
     peaks: Vec<f32>,
     /// Громкость поменяли: запомнить в настройках; `true` — ползунок отпущен, пора сохранить.
     volume_changed: Option<(Option<f32>, bool)>,
+    /// Звук выключили или сменили скорость — запомнить в настройках.
+    sound_changed: Option<(bool, f32)>,
+    /// Кадры над полоской перемотки: поток, готовые кадры (секунда, текстура) и о какой
+    /// секунде спросили последней.
+    peek: Option<mh_files_fs::peek::FramePeek>,
+    peeks: Vec<(f64, TextureHandle)>,
+    peek_asked: Option<f64>,
 }
+
+/// Скорости в меню.
+const RATES: [f64; 8] = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0];
+/// Кадров над полоской в памяти не больше.
+const MAX_PEEKS: usize = 150;
 
 impl State {
     pub fn open(app: &FilesApp) -> State {
@@ -53,6 +66,10 @@ impl State {
             bars: Vec::new(),
             peaks: Vec::new(),
             volume_changed: None,
+            sound_changed: None,
+            peek: None,
+            peeks: Vec::new(),
+            peek_asked: None,
         };
         state.request(app, None);
         state
@@ -83,6 +100,9 @@ impl State {
         self.seeking = None;
         self.bars.clear();
         self.peaks.clear();
+        self.peek = None;
+        self.peeks.clear();
+        self.peek_asked = None;
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         self.wants_player = app.settings.preview.media
             && !is_dir
@@ -156,9 +176,17 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         let audio =
             mh_files_core::entry::media_kind(&name) == Some(mh_files_core::entry::MediaKind::Audio);
-        let volume = f64::from(app.settings.preview.volume.clamp(0.0, 1.0));
+        let preview = &app.settings.preview;
+        let sound = mh_files_platform::player::Sound {
+            volume: f64::from(preview.volume.clamp(0.0, 1.0)),
+            muted: preview.muted,
+            rate: f64::from(preview.rate).clamp(0.25, 4.0),
+        };
+        if !audio {
+            quick.peek = Some(mh_files_fs::peek::FramePeek::open(path, 240, waker.clone()));
+        }
         quick.player =
-            Some(mh_files_platform::player::Player::open(path, 1920, audio, volume, waker));
+            Some(mh_files_platform::player::Player::open(path, 1920, audio, sound, waker));
     }
     let mut turn = None;
     let screen = ctx.content_rect();
@@ -199,7 +227,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             "{index} / {}   стрелки — листать, {}пробел — закрыть",
                             tab.listing.len(),
                             if quick.player.is_some() {
-                                "Enter — пауза, Shift+стрелки — перемотка, "
+                                "Enter — пауза, Shift+стрелки — перемотка, M — звук, "
                             } else if preview_ui::animated(quick.preview.as_ref()) {
                                 "Enter — пауза, "
                             } else {
@@ -258,6 +286,11 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
             app.save_settings();
         }
     }
+    if let Some((muted, rate)) = quick.sound_changed.take() {
+        app.settings.preview.muted = muted;
+        app.settings.preview.rate = rate;
+        app.save_settings();
+    }
     // GIF: Enter — пауза.
     if quick.player.is_none()
         && preview_ui::animated(quick.preview.as_ref())
@@ -277,6 +310,10 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
             }
             if i.consume_key(egui::Modifiers::SHIFT, Key::ArrowLeft) {
                 player.seek(state.position - 5.0);
+            }
+            if i.consume_key(egui::Modifiers::NONE, Key::M) {
+                player.set_muted(!state.muted);
+                quick.sound_changed = Some((!state.muted, state.rate as f32));
             }
         });
     }
@@ -302,6 +339,20 @@ fn media(ui: &mut egui::Ui, quick: &mut State, height: f32) {
             }
         }
     }
+    // Кадры над полоской, что успели посчитаться.
+    if let Some(peek) = &quick.peek {
+        for (at, bitmap) in peek.take() {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [bitmap.width as usize, bitmap.height as usize],
+                &bitmap.rgba,
+            );
+            let texture = ui.ctx().load_texture("quick-peek", image, egui::TextureOptions::LINEAR);
+            if quick.peeks.len() >= MAX_PEEKS {
+                drop(quick.peeks.remove(0));
+            }
+            quick.peeks.push((at, texture));
+        }
+    }
     let state = player.state();
     let controls = 40.0;
     let area = vec2(ui.available_width(), (height - controls).max(60.0));
@@ -313,13 +364,37 @@ fn media(ui: &mut egui::Ui, quick: &mut State, height: f32) {
     }
     // Видео — кадр, звук — обложка из эскиза Windows, если она есть.
     let picture = if state.has_video { quick.frame.as_ref() } else { quick.texture.as_ref() };
+    let mut toggle = false;
     ui.allocate_ui(area, |ui| {
         ui.set_min_size(area);
         ui.centered_and_justified(|ui| match picture {
             Some(texture) => {
                 let size = texture.size_vec2();
                 let scale = (area.x / size.x).min(area.y / size.y);
-                ui.add(egui::Image::new(texture).fit_to_exact_size(size * scale));
+                let response = ui.add(
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(size * scale)
+                        .sense(egui::Sense::click()),
+                );
+                // Кончилось — посередине кнопка повтора.
+                if state.ended {
+                    let c = response.rect.center();
+                    let hovered = response.hovered();
+                    ui.painter().circle_filled(
+                        c,
+                        34.0,
+                        Color32::from_black_alpha(if hovered { 200 } else { 150 }),
+                    );
+                    replay_icon(ui.painter(), c, 14.0, Color32::WHITE);
+                }
+                let tip = if state.ended {
+                    "Сначала"
+                } else if state.paused {
+                    "Играть"
+                } else {
+                    "Пауза"
+                };
+                toggle = response.on_hover_text(tip).clicked();
             }
             None if !state.ready => {
                 ui.add(egui::Spinner::new().color(theme::accent()));
@@ -330,6 +405,9 @@ fn media(ui: &mut egui::Ui, quick: &mut State, height: f32) {
             }
         });
     });
+    if toggle && let Some(player) = &quick.player {
+        if state.paused || state.ended { player.play() } else { player.pause() }
+    }
     controls_row(ui, quick, &state);
 }
 
@@ -341,12 +419,15 @@ fn controls_row(
 ) {
     let Some(player) = &quick.player else { return };
     ui.add_space(6.0);
+    let mut peek = None;
     ui.horizontal(|ui| {
         let paused = state.paused || state.ended;
         let (rect, response) = ui.allocate_exact_size(vec2(32.0, 28.0), egui::Sense::click());
         let color = if response.hovered() { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
         let c = rect.center();
-        if paused {
+        if state.ended {
+            replay_icon(ui.painter(), c, 8.0, color);
+        } else if paused {
             let points = vec![c + vec2(-5.0, -7.0), c + vec2(-5.0, 7.0), c + vec2(7.0, 0.0)];
             ui.painter().add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
         } else {
@@ -355,8 +436,14 @@ fn controls_row(
                 ui.painter().rect_filled(bar, CornerRadius::ZERO, color);
             }
         }
-        if response.on_hover_text(if paused { "Играть (Enter)" } else { "Пауза (Enter)" }).clicked()
-        {
+        let tip = if state.ended {
+            "Сначала (Enter)"
+        } else if paused {
+            "Играть (Enter)"
+        } else {
+            "Пауза (Enter)"
+        };
+        if response.on_hover_text(tip).clicked() {
             if paused { player.play() } else { player.pause() }
         }
         let position = quick.seeking.unwrap_or(state.position);
@@ -365,7 +452,8 @@ fn controls_row(
                 .color(theme::TEXT_SECONDARY),
         );
         let volume_width = 110.0;
-        let width = (ui.available_width() - volume_width - 40.0).max(80.0);
+        let tail = volume_width + 52.0 + 32.0 + 40.0;
+        let width = (ui.available_width() - tail).max(80.0);
         if state.duration > 0.0 {
             let mut value = position;
             ui.spacing_mut().slider_width = width;
@@ -379,8 +467,46 @@ fn controls_row(
             {
                 player.seek(target);
             }
+            if state.has_video
+                && let Some(pointer) = slider.hover_pos()
+            {
+                // Ось ползунка — без радиуса ручки по краям, как у egui::Slider.
+                let range = slider.rect.x_range().shrink(slider.rect.height() / 2.5);
+                let share = ((pointer.x - range.min) / range.span().max(1.0)).clamp(0.0, 1.0);
+                peek = Some((f64::from(share) * state.duration, slider.rect, pointer.x));
+            }
         } else {
             ui.add_space(width);
+        }
+        // Скорость.
+        let rate = if state.rate > 0.0 { state.rate } else { 1.0 };
+        let mut picked_rate = None;
+        ui.menu_button(rate_label(rate), |ui| {
+            for value in RATES {
+                if ui.selectable_label((value - rate).abs() < 1e-3, rate_label(value)).clicked() {
+                    picked_rate = Some(value);
+                    ui.close();
+                }
+            }
+        })
+        .response
+        .on_hover_text("Скорость воспроизведения");
+        if let Some(value) = picked_rate {
+            player.set_rate(value);
+            quick.sound_changed = Some((state.muted, value as f32));
+        }
+        // Звук: выключить и вернуть.
+        let (rect, response) = ui.allocate_exact_size(vec2(28.0, 28.0), egui::Sense::click());
+        let color = if response.hovered() { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
+        speaker_icon(ui.painter(), rect.center(), state.muted || state.volume <= 0.0, color);
+        let tip = if state.muted {
+            "Включить звук (M)"
+        } else {
+            "Выключить звук (M)"
+        };
+        if response.on_hover_text(tip).clicked() {
+            player.set_muted(!state.muted);
+            quick.sound_changed = Some((!state.muted, rate as f32));
         }
         let mut volume = state.volume;
         ui.spacing_mut().slider_width = volume_width - 20.0;
@@ -389,6 +515,11 @@ fn controls_row(
             .on_hover_text("Громкость");
         if slider.changed() {
             player.set_volume(volume);
+            // Громкость тронули — значит, звук нужен.
+            if state.muted {
+                player.set_muted(false);
+                quick.sound_changed = Some((false, rate as f32));
+            }
         }
         if slider.changed() || slider.drag_stopped() {
             // Пока тянут, громкость только запоминается; отпустили — сохраняется.
@@ -396,6 +527,110 @@ fn controls_row(
             quick.volume_changed = Some((value, !slider.dragged()));
         }
     });
+    if let Some((at, bar, x)) = peek {
+        peek_over(ui, quick, at, bar, x, state.duration);
+    }
+}
+
+/// «1×», «1,5×», «0,25×».
+fn rate_label(rate: f64) -> String {
+    let text = format!("{rate}").replace('.', ",");
+    format!("{text}×")
+}
+
+/// Кадр над полоской перемотки у секунды `at` (указатель — на `x`). Готового нет — спросить
+/// поток и показать ближайший готовый.
+fn peek_over(ui: &egui::Ui, quick: &mut State, at: f64, bar: egui::Rect, x: f32, duration: f64) {
+    let Some(peek) = &quick.peek else { return };
+    // Кадры — с шагом в 1/150 длины (не чаще секунды): соседние положения указателя
+    // показывают один и тот же кадр без нового чтения.
+    let step = (duration / 150.0).max(1.0);
+    let bucket = (at / step).floor() * step + step / 2.0;
+    let bucket = bucket.min(duration);
+    let exact = quick.peeks.iter().find(|(t, _)| (t - bucket).abs() < 1e-6);
+    if exact.is_none() && quick.peek_asked != Some(bucket) {
+        peek.request(bucket);
+        quick.peek_asked = Some(bucket);
+    }
+    let texture = exact.or_else(|| {
+        quick
+            .peeks
+            .iter()
+            .filter(|(t, _)| (t - at).abs() <= step * 4.0)
+            .min_by(|a, b| (a.0 - at).abs().total_cmp(&(b.0 - at).abs()))
+    });
+    let width = 200.0;
+    let height = texture.map_or(112.0, |(_, t)| width * t.size_vec2().y / t.size_vec2().x.max(1.0));
+    let screen = ui.ctx().content_rect();
+    let left = (x - width / 2.0 - 6.0).clamp(screen.left() + 4.0, screen.right() - width - 16.0);
+    let top = bar.top() - height - 36.0;
+    egui::Area::new(Id::new("quick-peek"))
+        .order(egui::Order::Tooltip)
+        .fixed_pos(egui::pos2(left, top))
+        .interactable(false)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    match texture {
+                        Some((_, texture)) => {
+                            ui.add(
+                                egui::Image::new(texture).fit_to_exact_size(vec2(width, height)),
+                            );
+                        }
+                        None => {
+                            let (rect, _) =
+                                ui.allocate_exact_size(vec2(width, height), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 2.0, Color32::from_black_alpha(120));
+                        }
+                    }
+                    ui.label(RichText::new(clock(at)).font(theme::regular(12.5)));
+                });
+            });
+        });
+}
+
+/// Круговая стрелка «сначала»: дуга почти на полный круг и наконечник.
+fn replay_icon(painter: &egui::Painter, center: egui::Pos2, radius: f32, color: Color32) {
+    let stroke = Stroke::new((radius / 5.0).max(1.6), color);
+    let start = -std::f32::consts::FRAC_PI_2 + 0.5;
+    let end = start + std::f32::consts::TAU * 0.8;
+    let point = |a: f32| center + vec2(a.cos(), a.sin()) * radius;
+    let points: Vec<egui::Pos2> =
+        (0..=24).map(|i| point(start + (end - start) * i as f32 / 24.0)).collect();
+    painter.add(egui::Shape::line(points, stroke));
+    // Наконечник в начале дуги, против хода стрелки.
+    let tip = point(start);
+    let tangent = vec2(-start.sin(), start.cos());
+    let normal = vec2(start.cos(), start.sin());
+    let size = radius * 0.55;
+    let arrow = vec![tip - tangent * size, tip + normal * size * 0.7, tip - normal * size * 0.7];
+    painter.add(egui::Shape::convex_polygon(arrow, color, Stroke::NONE));
+}
+
+/// Динамик: со звуковыми дугами или перечёркнутый.
+fn speaker_icon(painter: &egui::Painter, center: egui::Pos2, muted: bool, color: Color32) {
+    let c = center + vec2(-4.0, 0.0);
+    let body = egui::Rect::from_center_size(c + vec2(-3.0, 0.0), vec2(4.0, 6.0));
+    painter.rect_filled(body, CornerRadius::ZERO, color);
+    let cone =
+        vec![c + vec2(-1.0, -3.0), c + vec2(4.0, -7.0), c + vec2(4.0, 7.0), c + vec2(-1.0, 3.0)];
+    painter.add(egui::Shape::convex_polygon(cone, color, Stroke::NONE));
+    let stroke = Stroke::new(1.5, color);
+    if muted {
+        let x = c + vec2(10.0, 0.0);
+        painter.line_segment([x + vec2(-3.0, -3.0), x + vec2(3.0, 3.0)], stroke);
+        painter.line_segment([x + vec2(-3.0, 3.0), x + vec2(3.0, -3.0)], stroke);
+    } else {
+        for radius in [5.0f32, 9.0] {
+            let points: Vec<egui::Pos2> = (0..=10)
+                .map(|i| {
+                    let a = -0.8 + 1.6 * i as f32 / 10.0;
+                    c + vec2(4.0, 0.0) + vec2(a.cos(), a.sin()) * radius
+                })
+                .collect();
+            painter.add(egui::Shape::line(points, stroke));
+        }
+    }
 }
 
 /// «1:05», «1:02:03».
@@ -439,7 +674,10 @@ fn equalizer(
         *bar += (target - *bar) * if target > *bar { attack } else { release };
         *peak = if *bar > *peak { *bar } else { (*peak - 0.7 * dt).max(*bar) };
     }
-    let (rect, _) = ui.allocate_exact_size(area, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(area, egui::Sense::click());
+    if response.clicked() {
+        if state.paused || state.ended { player.play() } else { player.pause() }
+    }
     let painter = ui.painter_at(rect);
     let mut bars_rect = rect.shrink2(vec2(8.0, 12.0));
     if let Some(cover) = &quick.texture {

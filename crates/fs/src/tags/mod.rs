@@ -5,8 +5,13 @@
 //! сначала видимых в списке и в Инспекторе, потом остальных картинок и видео открытой
 //! папки. Теги запоминаются по пути, размеру и времени изменения (`tags.bin`): второй раз
 //! файл не смотрится, пока не изменится. После пяти минут без дела модель уходит из памяти.
+//!
+//! С 1.3.3 — ещё и звук: аудио и звуковая дорожка видео слушаются моделью звука (AST, свой
+//! помощник), а видео смотрится по нескольким кадрам. У файла — части разбора (картинка,
+//! звук): включили звук — у видео досчитается только он.
 
 pub mod host;
+pub mod listen;
 pub mod picture;
 pub mod setup;
 
@@ -17,9 +22,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
+use mh_files_core::category::Category;
 use mh_files_core::entry::extension_of;
 use mh_files_core::settings::TagSettings;
-use mh_files_core::tags::{self as model, FileTags, Record, Shown, TagQuery, TagStore, Vocabulary};
+use mh_files_core::sound::{self as sound_model, SoundVocabulary};
+use mh_files_core::tags::{
+    self as model, FileTags, PART_IMAGE, PART_SOUND, Record, Shown, TagQuery, TagStore, Vocabulary,
+};
 use parking_lot::{Mutex, RwLock};
 
 pub use self::host::{HOST_FLAG, Host, HostCommand, RunError, Spec};
@@ -69,6 +78,13 @@ pub struct TagStatus {
     pub gpu: bool,
     /// Видеокарту просили, но она не подошла — считается на процессоре.
     pub gpu_fallback: bool,
+    /// Модель звука готова (скачана, классы прочитаны).
+    pub sound: bool,
+    /// Модель звука в памяти и где считает.
+    pub sound_loaded: bool,
+    pub sound_gpu: bool,
+    /// Модель звука не заработала: звуковые теги не считаются до смены настроек.
+    pub sound_error: Option<String>,
 }
 
 impl Default for TagStatus {
@@ -83,6 +99,10 @@ impl Default for TagStatus {
             skipped: 0,
             gpu: false,
             gpu_fallback: false,
+            sound: false,
+            sound_loaded: false,
+            sound_gpu: false,
+            sound_error: None,
         }
     }
 }
@@ -138,7 +158,8 @@ impl Want {
 /// Что показать у файла.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Lookup {
-    /// Тегов нет и не будет: не картинка и не видео, слишком большой или автотеги выключены.
+    /// Тегов нет и не будет: не картинка, не видео и не звук, слишком большой или автотеги
+    /// выключены.
     None,
     /// Скоро будут.
     Pending,
@@ -168,19 +189,30 @@ impl Engine for Host {
     }
 }
 
-/// Как запустить модель: пути файлов, журнал и просить ли видеокарту.
+/// Как запустить модель: ONNX Runtime, файл модели, журнал и просить ли видеокарту.
 pub type Launcher =
-    Arc<dyn Fn(&setup::Paths, &Path, bool) -> Result<Box<dyn Engine>, String> + Send + Sync>;
+    Arc<dyn Fn(&Path, &Path, &Path, bool) -> Result<Box<dyn Engine>, String> + Send + Sync>;
 
 /// Помощник — этот же exe с [`HOST_FLAG`].
 pub fn host_launcher(command: HostCommand) -> Launcher {
-    Arc::new(move |paths, log, gpu| {
+    Arc::new(move |runtime, model, log, gpu| {
         // Все ядра, кроме одного: процесс и так с пониженным приоритетом.
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
         let threads = threads.saturating_sub(1).max(1);
-        Host::start(&command, &paths.runtime, &paths.model, threads, gpu, log)
+        Host::start(&command, runtime, model, threads, gpu, log)
             .map(|host| Box::new(host) as Box<dyn Engine>)
     })
+}
+
+/// Известные теги для подсказок: имя и у скольких файлов он виден.
+pub type KnownTags = Arc<Vec<(String, u32)>>;
+
+#[derive(Default)]
+struct Known {
+    tags: Option<KnownTags>,
+    /// Теги менялись с тех пор, как список собран.
+    stale: bool,
+    building: bool,
 }
 
 enum Job {
@@ -219,6 +251,11 @@ struct Shared {
     status: Mutex<TagStatus>,
     store: RwLock<TagStore>,
     vocabulary: RwLock<Option<Arc<Vocabulary>>>,
+    /// Классы модели звука — если звуковые теги включены и модель на месте.
+    sounds: RwLock<Option<Arc<SoundVocabulary>>>,
+    /// Модель звука не заработала: звук не просится до смены настроек.
+    sound_failed: AtomicBool,
+    known: Mutex<Known>,
     paths: Mutex<Option<setup::Paths>>,
     /// Готовое для показа: путь → размер, время, теги.
     views: Mutex<HashMap<PathBuf, View>>,
@@ -226,6 +263,7 @@ struct Shared {
     /// Что спросил интерфейс в этом кадре и в прошлом.
     frame: Mutex<(Vec<Want>, Vec<Want>)>,
     engine: Mutex<Option<Box<dyn Engine>>>,
+    sound_engine: Mutex<Option<Box<dyn Engine>>>,
     jobs: Sender<Job>,
     /// Растёт при каждой смене настроек: скачивание по старым настройкам прерывается.
     generation: AtomicU64,
@@ -255,11 +293,15 @@ impl Tagger {
             status: Mutex::new(TagStatus::default()),
             store: RwLock::new(TagStore::default()),
             vocabulary: RwLock::new(None),
+            sounds: RwLock::new(None),
+            sound_failed: AtomicBool::new(false),
+            known: Mutex::new(Known::default()),
             paths: Mutex::new(None),
             views: Mutex::new(HashMap::new()),
             queue: Mutex::new(Queue::default()),
             frame: Mutex::new((Vec::new(), Vec::new())),
             engine: Mutex::new(None),
+            sound_engine: Mutex::new(None),
             jobs,
             generation: AtomicU64::new(0),
             last_used: Mutex::new(Instant::now()),
@@ -284,6 +326,7 @@ impl Tagger {
                 current.as_ref().is_some_and(|c| c.for_engine() == settings.for_engine());
             *current = Some(settings.clone());
             self.shared.views.lock().clear();
+            self.shared.known.lock().stale = true;
             if same_engine {
                 drop(current);
                 self.shared.notify(true, true);
@@ -309,25 +352,21 @@ impl Tagger {
     /// — порядок вопросов за кадр; кадр закрывает [`Tagger::end_frame`]). Только память:
     /// можно звать из потока интерфейса на каждую видимую строку.
     pub fn lookup(&self, path: &Path, size: u64, modified: i64) -> Lookup {
-        let limit = match self.shared.settings.lock().as_ref() {
-            Some(settings) if settings.enabled => u64::from(settings.max_file_mb) << 20,
-            _ => return Lookup::None,
-        };
-        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        if size > limit || !picture::taggable(&extension_of(&name)) {
+        let wanted = self.shared.wanted(path, size);
+        if wanted == 0 {
             return Lookup::None;
         }
-        if let Some((s, m, shown)) = self.shared.views.lock().get(path)
-            && *s == size
-            && *m == modified
+        let shown = self.tags_of(path, size, modified);
+        if self.shared.store.read().missing(path, size, modified, wanted) == 0
+            && let Some(shown) = shown
         {
-            return Lookup::Ready(shown.clone());
-        }
-        if let Some(shown) = self.shared.show(path, size, modified) {
             return Lookup::Ready(shown);
         }
+        // Чего-то ещё нет (или посчитана только картинка видео, а звука нет) — в очередь;
+        // показать то, что уже есть.
+        let ready = Lookup::Ready;
         match self.shared.status.lock().state {
-            TagState::Off | TagState::Failed(_) => return Lookup::None,
+            TagState::Off | TagState::Failed(_) => return shown.map_or(Lookup::None, ready),
             TagState::Downloading { .. } | TagState::Ready => {}
         }
         let want = Want { path: path.to_path_buf(), size, modified };
@@ -335,7 +374,36 @@ impl Tagger {
         if !frame.0.contains(&want) {
             frame.0.push(want);
         }
-        Lookup::Pending
+        shown.map_or(Lookup::Pending, ready)
+    }
+
+    /// Какие части разбора нужны файлу ([`PART_IMAGE`], [`PART_SOUND`]); 0 — тегов у него не
+    /// бывает.
+    pub fn wanted_parts(&self, path: &Path, size: u64) -> u8 {
+        self.shared.wanted(path, size)
+    }
+
+    /// Теги, что встречаются у посчитанных файлов, — для подсказок при вводе, самые частые
+    /// первыми. Список собирается в фоне: первый раз (и после новых тегов) — прежний или
+    /// `None`, готовый придёт с [`Event::TagsChanged`].
+    pub fn known_tags(&self) -> Option<KnownTags> {
+        let mut known = self.shared.known.lock();
+        if (known.tags.is_none() || known.stale) && !known.building && self.enabled() {
+            known.building = true;
+            known.stale = false;
+            let shared = self.shared.clone();
+            self.shared.workers.spawn("tags-known", move |_| {
+                let tags = collect_known(&shared);
+                let mut known = shared.known.lock();
+                known.building = false;
+                if let Some(tags) = tags {
+                    known.tags = Some(Arc::new(tags));
+                }
+                drop(known);
+                shared.notify(true, true);
+            });
+        }
+        known.tags.clone()
     }
 
     /// Кадр нарисован: то, что спросили в нём, — новая очередь видимого.
@@ -387,22 +455,25 @@ impl Tagger {
         cancel
     }
 
-    /// Остальные картинки и видео открытой папки — после видимого. Заменяет прошлый список.
+    /// Остальные картинки, видео и звук открытой папки — после видимого. Заменяет прошлый
+    /// список.
     pub fn background(&self, wants: Vec<Want>) {
         if !self.enabled() {
             return;
         }
-        let limit =
-            self.shared.settings.lock().as_ref().map_or(0, |s| u64::from(s.max_file_mb) << 20);
+        let wants: Vec<(Want, u8)> = wants
+            .into_iter()
+            .map(|w| {
+                let parts = self.shared.wanted(&w.path, w.size);
+                (w, parts)
+            })
+            .filter(|(_, parts)| *parts != 0)
+            .collect();
         let store = self.shared.store.read();
         let wants: VecDeque<Want> = wants
             .into_iter()
-            .filter(|w| {
-                let name = w.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-                w.size <= limit
-                    && picture::taggable(&extension_of(&name))
-                    && store.fresh(&w.path, w.size, w.modified).is_none()
-            })
+            .filter(|(w, parts)| store.missing(&w.path, w.size, w.modified, *parts) != 0)
+            .map(|(w, _)| w)
             .collect();
         drop(store);
         self.shared.queue.lock().background = wants;
@@ -420,13 +491,16 @@ impl Tagger {
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
         let (reply, done) = unbounded();
         if self.shared.jobs.send(Job::Stop(reply)).is_ok() {
-            // Картинка на процессоре — секунды: помощника — долой, и хозяин сохранит теги.
-            if let Some(mut engine) = self.shared.engine.try_lock_for(Duration::from_millis(200)) {
-                *engine = None;
+            // Картинка на процессоре — секунды: помощников — долой, и хозяин сохранит теги.
+            for engine in [&self.shared.engine, &self.shared.sound_engine] {
+                if let Some(mut engine) = engine.try_lock_for(Duration::from_millis(200)) {
+                    *engine = None;
+                }
             }
             let _ = done.recv_timeout(wait);
         }
         *self.shared.engine.lock() = None;
+        *self.shared.sound_engine.lock() = None;
     }
 }
 
@@ -461,14 +535,37 @@ impl Shared {
         self.workers.send(Event::TagsChanged);
     }
 
+    /// Нужные файлу части разбора (см. [`Tagger::wanted_parts`]).
+    fn wanted(&self, path: &Path, size: u64) -> u8 {
+        let settings = self.settings.lock();
+        let Some(settings) = settings.as_ref().filter(|s| s.enabled) else { return 0 };
+        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+        let ext = extension_of(&name);
+        let sound = if settings.sound && !self.sound_failed.load(Ordering::Relaxed) {
+            PART_SOUND
+        } else {
+            0
+        };
+        if picture::is_video(&ext) {
+            PART_IMAGE | sound
+        } else if Category::Audio.extensions().contains(&ext.as_str()) {
+            sound
+        } else if picture::taggable(&ext) && size <= u64::from(settings.max_file_mb) << 20 {
+            PART_IMAGE
+        } else {
+            0
+        }
+    }
+
     /// Теги из снимка — в готовый для показа вид (и в кэш).
     fn show(&self, path: &Path, size: u64, modified: i64) -> Option<Arc<Shown>> {
         let vocabulary = self.vocabulary.read().clone()?;
+        let sounds = self.sounds.read().clone();
         let thresholds = self.settings.lock().as_ref().map(TagSettings::thresholds)?;
         let shown = {
             let store = self.store.read();
             let tags = store.fresh(path, size, modified)?;
-            Arc::new(model::show(tags, &vocabulary, thresholds))
+            Arc::new(model::show(tags, &vocabulary, sounds.as_deref(), thresholds))
         };
         let mut views = self.views.lock();
         if views.len() >= MAX_VIEWS {
@@ -491,21 +588,40 @@ impl Shared {
     }
 
     fn unload(&self) {
-        if self.engine.lock().take().is_some() {
-            self.update(|s| s.loaded = false);
+        let image = self.engine.lock().take().is_some();
+        let sound = self.sound_engine.lock().take().is_some();
+        if image || sound {
+            self.update(|s| {
+                s.loaded = false;
+                s.sound_loaded = false;
+            });
         }
     }
 
-    /// Следующий файл: видимое раньше остального; уже посчитанное пропускается.
-    fn next(&self) -> Option<Want> {
-        let mut queue = self.queue.lock();
-        let store = self.store.read();
+    /// Следующий файл и недостающие части: видимое раньше остального; уже посчитанное
+    /// пропускается.
+    fn next(&self) -> Option<(Want, u8)> {
         loop {
-            let want = queue.visible.pop_front().or_else(|| queue.background.pop_front())?;
-            if store.fresh(&want.path, want.size, want.modified).is_none() {
-                return Some(want);
+            let want = {
+                let mut queue = self.queue.lock();
+                queue.visible.pop_front().or_else(|| queue.background.pop_front())?
+            };
+            let wanted = self.wanted(&want.path, want.size);
+            let missing = self.store.read().missing(&want.path, want.size, want.modified, wanted);
+            if missing != 0 {
+                return Some((want, missing));
             }
         }
+    }
+
+    fn sound_failed(&self, error: String) {
+        self.sound_failed.store(true, Ordering::SeqCst);
+        *self.sound_engine.lock() = None;
+        self.update(|s| {
+            s.sound_loaded = false;
+            s.sound_error = Some(error);
+        });
+        self.notify(true, true);
     }
 
     fn has_work(&self) -> bool {
@@ -544,6 +660,7 @@ fn run(shared: &Arc<Shared>, jobs: &Receiver<Job>) {
             Some(Job::Forget) => {
                 shared.store.write().clear();
                 shared.views.lock().clear();
+                shared.known.lock().stale = true;
                 shared.dirty.store(true, Ordering::SeqCst);
                 shared.save();
                 shared.update(|s| {
@@ -555,9 +672,9 @@ fn run(shared: &Arc<Shared>, jobs: &Receiver<Job>) {
             Some(Job::Wake) | None => {}
         }
         if shared.status.lock().state == TagState::Ready
-            && let Some(want) = shared.next()
+            && let Some((want, parts)) = shared.next()
         {
-            tag(shared, &want);
+            tag(shared, &want, parts);
             if last_save.elapsed() >= SAVE_EVERY {
                 last_save = Instant::now();
                 shared.save();
@@ -583,6 +700,8 @@ fn activate(shared: &Arc<Shared>) {
         shared.save();
         *shared.store.write() = TagStore::default();
         *shared.vocabulary.write() = None;
+        *shared.sounds.write() = None;
+        *shared.known.lock() = Known::default();
         *shared.paths.lock() = None;
         shared.views.lock().clear();
         *shared.queue.lock() = Queue::default();
@@ -617,6 +736,19 @@ fn activate(shared: &Arc<Shared>) {
             return;
         }
     };
+    let sounds = match &paths.sound {
+        Some(sound) => match std::fs::read_to_string(&sound.config)
+            .map_err(|e| format!("{} не читается: {e}", sound.config.display()))
+            .and_then(|text| SoundVocabulary::parse(&text))
+        {
+            Ok(sounds) => Some(Arc::new(sounds)),
+            Err(error) => {
+                shared.set_state(TagState::Failed(error));
+                return;
+            }
+        },
+        None => None,
+    };
     let key = TagStore::model_key(&settings.model, &vocabulary);
     if shared.store.read().model != key {
         shared.save();
@@ -627,96 +759,210 @@ fn activate(shared: &Arc<Shared>) {
             .unwrap_or_else(|| TagStore::new(&key));
         *shared.store.write() = store;
     }
-    // Сменилась модель, ONNX Runtime или видеокарта — помощник запустится заново.
+    // Звук выключен — его теги остаются в снимке, просто не видны.
+    if let Some(sounds) = &sounds {
+        let sound_key = TagStore::sound_key(&settings.sound_model, sounds);
+        if shared.store.read().sound != sound_key {
+            shared.store.write().set_sound_model(&sound_key);
+            shared.dirty.store(true, Ordering::SeqCst);
+        }
+    }
+    // Сменилась модель, ONNX Runtime или видеокарта — помощники запустятся заново.
     shared.unload();
+    shared.sound_failed.store(false, Ordering::SeqCst);
     *shared.paths.lock() = Some(paths);
     *shared.vocabulary.write() = Some(vocabulary);
+    let has_sound = sounds.is_some();
+    *shared.sounds.write() = sounds;
     shared.views.lock().clear();
+    shared.known.lock().stale = true;
     let tagged = shared.store.read().len();
     let name = model::model_info(&settings.model)
         .map_or_else(|| settings.model.clone(), |m| m.repo.to_string());
     shared.update(|s| {
         s.tagged = tagged;
         s.model = Some(name);
+        s.sound = has_sound;
+        s.sound_error = None;
         s.state = TagState::Ready;
     });
     shared.notify(true, true);
 }
 
-/// Работающая модель; нет — запустить (секунды). Ошибка — автотеги не работают.
-fn engine<'a>(
-    shared: &'a Shared,
-) -> Result<parking_lot::MutexGuard<'a, Option<Box<dyn Engine>>>, String> {
+/// Работающая модель (картинки или звука); нет — запустить (секунды).
+fn engine(
+    shared: &Shared,
+    sound: bool,
+) -> Result<parking_lot::MutexGuard<'_, Option<Box<dyn Engine>>>, String> {
     if shared.stopping.load(Ordering::SeqCst) {
         return Err("программа закрывается".into());
     }
     *shared.last_used.lock() = Instant::now();
-    let mut guard = shared.engine.lock();
+    let slot = if sound { &shared.sound_engine } else { &shared.engine };
+    let mut guard = slot.lock();
     if guard.as_mut().is_some_and(|engine| !engine.alive()) {
         *guard = None;
     }
     if guard.is_none() {
         let paths = shared.paths.lock().clone().ok_or("модель ещё не готова")?;
         let wanted = shared.settings().is_some_and(|s| s.gpu);
-        let engine = (shared.launcher)(&paths, &shared.dir.join("tagger.log"), wanted)?;
+        let (model, log) = match (&paths.sound, sound) {
+            (Some(sound), true) => (sound.model.clone(), "tagger-sound.log"),
+            (None, true) => return Err("звуковые теги выключены".into()),
+            (_, false) => (paths.model.clone(), "tagger.log"),
+        };
+        let engine = (shared.launcher)(&paths.runtime, &model, &shared.dir.join(log), wanted)?;
         let gpu = engine.spec().gpu;
         *guard = Some(engine);
         drop(guard);
         shared.update(|s| {
-            s.loaded = true;
-            s.gpu = gpu;
-            s.gpu_fallback = wanted && !gpu;
+            if sound {
+                s.sound_loaded = true;
+                s.sound_gpu = gpu;
+            } else {
+                s.loaded = true;
+                s.gpu = gpu;
+                s.gpu_fallback = wanted && !gpu;
+            }
         });
-        guard = shared.engine.lock();
+        guard = slot.lock();
     }
     Ok(guard)
 }
 
-/// Посчитать теги одного файла. Модель не запускается — автотеги в ошибку, очередь пуста.
-fn tag(shared: &Shared, want: &Want) {
-    let Some(vocabulary) = shared.vocabulary.read().clone() else { return };
-    let started = Instant::now();
+/// Прогнать входы через модель: `prepare` готовит их по её форме (без замка — кадры видео
+/// читаются долго). Отказ модели на одном входе — он пропускается (`true` во втором поле);
+/// помощник умер — перезапуск, один раз на вход; второй раз или не запустился — ошибка.
+fn run_model(
+    shared: &Shared,
+    sound: bool,
+    prepare: impl FnOnce(Spec) -> Vec<Vec<f32>>,
+) -> Result<(Vec<Vec<f32>>, bool), String> {
+    let spec = {
+        let mut guard = engine(shared, sound)?;
+        guard.as_mut().ok_or("модель выгружена")?.spec()
+    };
+    let inputs = prepare(spec);
+    let mut outputs = Vec::with_capacity(inputs.len());
     let mut skipped = false;
-    let mut attempt = 0;
-    let tags = loop {
-        let mut guard = match engine(shared) {
-            Ok(guard) => guard,
-            Err(error) => return fail(shared, error),
-        };
-        let Some(engine) = guard.as_mut() else { return };
-        let spec = engine.spec();
-        let name = want.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        let input = picture::load(&want.path, &extension_of(&name), spec.side)
-            .and_then(|rgb| model::input_tensor(&rgb, spec.side));
-        let Some(input) = input else { break FileTags::default() };
-        match engine.run(&input) {
-            Ok(scores) => match FileTags::from_scores(&scores, &vocabulary) {
-                Ok(tags) => break tags,
-                // Словарь не от этой модели: дальше смотреть бессмысленно.
-                Err(error) => return fail(shared, error),
-            },
-            Err(RunError::Failed(_)) => {
-                skipped = true;
-                break FileTags::default();
-            }
-            // Помощник умер: перезапуск, один раз на файл.
-            Err(RunError::Died(error)) => {
-                *guard = None;
-                drop(guard);
-                shared.update(|s| s.loaded = false);
-                attempt += 1;
-                if attempt > 1 {
-                    return fail(shared, error);
+    for input in &inputs {
+        let mut attempt = 0;
+        loop {
+            let mut guard = engine(shared, sound)?;
+            let engine = guard.as_mut().ok_or("модель выгружена")?;
+            match engine.run(input) {
+                Ok(output) => {
+                    outputs.push(output);
+                    break;
+                }
+                Err(RunError::Failed(_)) => {
+                    skipped = true;
+                    break;
+                }
+                Err(RunError::Died(error)) => {
+                    *guard = None;
+                    drop(guard);
+                    shared.update(|s| {
+                        if sound {
+                            s.sound_loaded = false;
+                        } else {
+                            s.loaded = false;
+                        }
+                    });
+                    attempt += 1;
+                    if attempt > 1 {
+                        return Err(error);
+                    }
                 }
             }
         }
-    };
+    }
+    Ok((outputs, skipped))
+}
+
+/// Посчитать недостающие части тегов файла (`parts`). Модель картинок не запускается —
+/// автотеги в ошибку, очередь пуста; модель звука — без звука до смены настроек.
+fn tag(shared: &Shared, want: &Want, parts: u8) {
+    let Some(vocabulary) = shared.vocabulary.read().clone() else { return };
+    let Some(settings) = shared.settings() else { return };
+    let started = Instant::now();
+    let name = want.path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let ext = extension_of(&name);
+    let mut record =
+        shared.store.read().record(&want.path, want.size, want.modified).cloned().unwrap_or(
+            Record {
+                size: want.size,
+                modified: want.modified,
+                parts: 0,
+                tags: FileTags::default(),
+            },
+        );
+    let mut skipped = false;
+    if parts & PART_IMAGE != 0 {
+        let video = picture::is_video(&ext);
+        let step = f64::from(settings.video_step.max(1));
+        let frames = settings.video_frames.max(1) as usize;
+        let ran = run_model(shared, false, |spec| {
+            let pictures = if video {
+                picture::video_frames(&want.path, spec.side, step, frames)
+            } else {
+                picture::load(&want.path, &ext, spec.side).into_iter().collect()
+            };
+            pictures.iter().filter_map(|rgb| model::input_tensor(rgb, spec.side)).collect()
+        });
+        let (outputs, refused) = match ran {
+            Ok(ran) => ran,
+            Err(error) => return fail(shared, error),
+        };
+        skipped |= refused;
+        let image = match outputs.as_slice() {
+            [] => FileTags::default(),
+            [one] => match FileTags::from_scores(one, &vocabulary) {
+                Ok(tags) => tags,
+                // Словарь не от этой модели: дальше смотреть бессмысленно.
+                Err(error) => return fail(shared, error),
+            },
+            frames => {
+                let scores = model::combine_frames(frames, &vocabulary);
+                match FileTags::from_scores(&scores, &vocabulary) {
+                    Ok(tags) => tags,
+                    Err(error) => return fail(shared, error),
+                }
+            }
+        };
+        record.tags.set_image(&image);
+        record.parts |= PART_IMAGE;
+    }
+    if parts & PART_SOUND != 0
+        && let Some(sounds) = shared.sounds.read().clone()
+    {
+        let clips = settings.sound_clips.clamp(1, 16) as usize;
+        match listen::clips(&want.path, &ext, clips) {
+            Ok(clips) => match run_model(shared, true, move |_| clips) {
+                Ok((outputs, refused)) => {
+                    skipped |= refused;
+                    let scores = sound_model::combine_clips(&outputs);
+                    match record.tags.set_sound(&scores, &sounds) {
+                        Ok(()) => record.parts |= PART_SOUND,
+                        Err(error) => shared.sound_failed(error),
+                    }
+                }
+                Err(error) => shared.sound_failed(error),
+            },
+            // Звука нет или он не читается: смотреть снова незачем.
+            Err(_) => {
+                record.tags.set_sound(&[], &sounds).ok();
+                record.parts |= PART_SOUND;
+            }
+        }
+    }
+    if record.parts == 0 {
+        return;
+    }
     // Файл без тегов тоже запоминается: смотреть его снова незачем, пока он не изменится.
-    shared
-        .store
-        .write()
-        .insert(want.path.clone(), Record { size: want.size, modified: want.modified, tags });
+    shared.store.write().insert(want.path.clone(), record);
     shared.views.lock().remove(&want.path);
+    shared.known.lock().stale = true;
     shared.dirty.store(true, Ordering::SeqCst);
     let tagged = shared.store.read().len();
     shared.update(|s| {
@@ -725,6 +971,26 @@ fn tag(shared: &Shared, want: &Want) {
         s.skipped += usize::from(skipped);
     });
     shared.notify(true, true);
+}
+
+/// Теги посчитанных файлов по порогам показа и сколько у кого.
+fn collect_known(shared: &Shared) -> Option<Vec<(String, u32)>> {
+    let vocabulary = shared.vocabulary.read().clone()?;
+    let sounds = shared.sounds.read().clone();
+    let thresholds = shared.settings()?.thresholds();
+    let mut counts: HashMap<String, u32> = HashMap::new();
+    {
+        let store = shared.store.read();
+        for (_, record) in store.iter() {
+            let shown = model::show(&record.tags, &vocabulary, sounds.as_deref(), thresholds);
+            for tag in shown.all() {
+                *counts.entry(tag.name.clone()).or_default() += 1;
+            }
+        }
+    }
+    let mut tags: Vec<(String, u32)> = counts.into_iter().collect();
+    tags.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Some(tags)
 }
 
 /// Итог поиска по тегам.
@@ -753,13 +1019,14 @@ fn search(shared: &Shared, text: &str, cancel: &CancelToken) -> Result<TagResult
         shared.vocabulary.read().clone().ok_or_else(|| {
             format!("Автотеги ещё не готовы: {}", shared.status.lock().describe())
         })?;
+    let sounds = shared.sounds.read().clone();
     let thresholds = settings.thresholds();
     let mut found: Vec<(f32, PathBuf, u64, i64)> = {
         let store = shared.store.read();
         store
             .iter()
             .filter_map(|(path, record)| {
-                let shown = model::show(&record.tags, &vocabulary, thresholds);
+                let shown = model::show(&record.tags, &vocabulary, sounds.as_deref(), thresholds);
                 query
                     .matches(Some(&shown))
                     .then(|| (query.score(&shown), path.clone(), record.size, record.modified))
@@ -805,6 +1072,20 @@ mod tests {
         die_once: Arc<AtomicBool>,
     }
 
+    /// «Модель звука»: всегда музыка.
+    struct FakeSound;
+
+    impl Engine for FakeSound {
+        fn spec(&self) -> Spec {
+            Spec { side: 0, outputs: 3, gpu: false }
+        }
+
+        fn run(&mut self, input: &[f32]) -> Result<Vec<f32>, RunError> {
+            assert_eq!(input.len(), sound_model::FRAMES * sound_model::MELS);
+            Ok(vec![3.0, -6.0, -6.0])
+        }
+    }
+
     impl Engine for Fake {
         fn spec(&self) -> Spec {
             Spec { side: 8, outputs: 5, gpu: false }
@@ -847,12 +1128,23 @@ mod tests {
         std::fs::create_dir_all(&models).unwrap();
         std::fs::write(models.join(model::MODEL_FILE), "m").unwrap();
         std::fs::write(models.join(model::TAGS_FILE), CSV).unwrap();
+        let sounds = data.join("models").join(model::model_folder(sound_model::SOUND_REPO));
+        std::fs::create_dir_all(sounds.join("onnx")).unwrap();
+        std::fs::write(sounds.join(&settings.sound_model), "m").unwrap();
+        std::fs::write(
+            sounds.join(sound_model::SOUND_CONFIG),
+            r#"{"id2label": {"0": "Music", "1": "Dog", "2": "Speech"}}"#,
+        )
+        .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let die_once = Arc::new(AtomicBool::new(false));
         let launches = Arc::new(AtomicUsize::new(0));
         let launcher: Launcher = {
             let (calls, die_once, launches) = (calls.clone(), die_once.clone(), launches.clone());
-            Arc::new(move |_, _, _| {
+            Arc::new(move |_, model: &Path, _, _| {
+                if model.to_string_lossy().contains("ast-finetuned") {
+                    return Ok(Box::new(FakeSound) as Box<dyn Engine>);
+                }
                 launches.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(Fake { calls: calls.clone(), die_once: die_once.clone() })
                     as Box<dyn Engine>)
@@ -981,11 +1273,71 @@ mod tests {
         f.tagger.shutdown(Duration::from_secs(5));
     }
 
+    /// WAV: тон 440 Гц, моно 16 бит.
+    fn tone(path: &Path, seconds: f64) -> Want {
+        let rate = 16_000u32;
+        let data: Vec<u8> = (0..(f64::from(rate) * seconds) as usize)
+            .flat_map(|i| {
+                let v = (0.3
+                    * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / 16_000.0).sin()
+                    * 32767.0) as i16;
+                v.to_le_bytes()
+            })
+            .collect();
+        let mut out = b"RIFF\0\0\0\0WAVEfmt ".to_vec();
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&[1, 0, 1, 0]);
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * 2).to_le_bytes());
+        out.extend_from_slice(&[2, 0, 16, 0]);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        std::fs::write(path, out).unwrap();
+        let meta = std::fs::metadata(path).unwrap();
+        Want {
+            path: path.to_path_buf(),
+            size: meta.len(),
+            modified: meta.modified().map_or(0, mh_files_core::index::unix),
+        }
+    }
+
+    #[test]
+    fn listens_to_sound() {
+        let f = fixture();
+        let wav = tone(&f.dir.path().join("мелодия.wav"), 3.0);
+        assert_eq!(f.tagger.wanted_parts(&wav.path, wav.size), PART_SOUND);
+        let Lookup::Ready(shown) = ask(&f.tagger, &wav) else { panic!("нет тегов") };
+        let heard: Vec<&str> = shown.sounds.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(heard, vec!["music"]);
+        assert!(shown.tags.is_empty() && shown.rating.is_none(), "у звука нет картинки");
+        assert_eq!(f.calls.load(Ordering::SeqCst), 0, "модель картинок не звалась");
+        // Подсказки: известные теги с числом файлов.
+        let started = Instant::now();
+        let known = loop {
+            if let Some(known) = f.tagger.known_tags()
+                && !known.is_empty()
+            {
+                break known;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(known.as_slice(), [("music".to_string(), 1)]);
+        // Звук выключили — звуковые теги не видны, и звук больше не нужен.
+        let quiet = TagSettings { sound: false, ..f.tagger.shared.settings().unwrap() };
+        f.tagger.configure(&quiet);
+        wait(&f.tagger, |s| s.state == TagState::Ready && !s.sound);
+        assert_eq!(f.tagger.wanted_parts(&wav.path, wav.size), 0);
+        assert_eq!(f.tagger.lookup(&wav.path, wav.size, wav.modified), Lookup::None);
+        f.tagger.shutdown(Duration::from_secs(5));
+    }
+
     #[test]
     fn disabled_tags_ask_nothing() {
         let (workers, _events) = Workers::new(mh_files_platform::no_waker());
         let dir = tempfile::tempdir().unwrap();
-        let launcher: Launcher = Arc::new(|_, _, _| Err("не должна запускаться".into()));
+        let launcher: Launcher = Arc::new(|_, _, _, _| Err("не должна запускаться".into()));
         let tagger = Tagger::new(workers, dir.path().to_path_buf(), launcher);
         tagger.configure(&TagSettings::default());
         assert_eq!(tagger.lookup(Path::new("a.jpg"), 1, 1), Lookup::None);
