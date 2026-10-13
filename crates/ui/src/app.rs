@@ -18,7 +18,7 @@ use mh_files_core::location::Location;
 use mh_files_core::session::{self, PaneSession, Session, TabSession, ViewMode, WindowGeometry};
 use mh_files_core::settings::Settings;
 use mh_files_core::sort::SortColumn;
-use mh_files_fs::{CancelToken, DirSize, Event, Indexer, Semantic, Ticket, Workers};
+use mh_files_fs::{CancelToken, DirSize, Event, Indexer, Semantic, Tagger, Ticket, Workers};
 use mh_files_platform::drives::{DriveInfo, DriveKind};
 use mh_files_platform::folders::KnownFolder;
 use mh_files_platform::ops::{Executor, FileOp, OpEvent};
@@ -127,11 +127,13 @@ pub struct Columns {
     pub modified: f32,
     pub kind: f32,
     pub size: f32,
+    /// «Теги» — когда автотеги включены.
+    pub tags: f32,
 }
 
 impl Default for Columns {
     fn default() -> Columns {
-        Columns { modified: 130.0, kind: 90.0, size: 86.0 }
+        Columns { modified: 130.0, kind: 90.0, size: 86.0, tags: 240.0 }
     }
 }
 
@@ -245,6 +247,8 @@ pub struct FilesApp {
     pub indexer: Indexer,
     /// Поиск по смыслу (EmbeddingGemma 2).
     pub semantic: Semantic,
+    /// Автотеги картинок и видео (WD Tagger v3).
+    pub tagger: Tagger,
     /// Замеры: запуск, чтение папок.
     pub diag: crate::diag::Diagnostics,
     /// Пути от следующих запусков программы.
@@ -353,6 +357,16 @@ impl FilesApp {
         indexer.configure(&settings.index);
         let semantic = Semantic::new(workers.clone(), storage::semantic_dir());
         semantic.configure(&settings.semantic);
+        // Модель теггера считает этот же exe, запущенный помощником (`--tagger-host`).
+        let host = mh_files_fs::tags::HostCommand::current().unwrap_or_else(|| {
+            mh_files_fs::tags::HostCommand { exe: "MH-Files.exe".into(), args: Vec::new() }
+        });
+        let tagger = Tagger::new(
+            workers.clone(),
+            storage::tags_dir(),
+            mh_files_fs::tags::host_launcher(host),
+        );
+        tagger.configure(&settings.tags);
 
         let mut images = ImageCache::new();
         images.system_icons = settings.appearance.system_icons;
@@ -367,6 +381,7 @@ impl FilesApp {
             workers,
             indexer,
             semantic,
+            tagger,
             column_cache: Default::default(),
             sorter: crate::sorter::Shared::load(&storage::config_dir()),
             diag: crate::diag::Diagnostics::new(startup.started),
@@ -729,6 +744,20 @@ impl FilesApp {
                         && tab.listing.state == LoadState::Done
                     {
                         self.indexer.observe(&dir, tab.listing.all());
+                        // Теги остальных картинок открытой папки — после видимых.
+                        if self.settings.tags.enabled
+                            && self.settings.tags.whole_folder
+                            && matches!(tab.location, Location::Dir(_))
+                        {
+                            let wants = tab
+                                .listing
+                                .all()
+                                .iter()
+                                .filter(|e| !e.is_dir())
+                                .map(mh_files_fs::Want::of)
+                                .collect();
+                            self.tagger.background(wants);
+                        }
                         let took = tab.load_started.elapsed();
                         self.diag.listing(dir, tab.listing.total_len(), took);
                         // Размеры вложенных папок — из индекса, без обращения к диску.
@@ -888,6 +917,8 @@ impl FilesApp {
                     }
                 }
             }
+            // Новые теги видны в следующем кадре: событие уже его вызвало.
+            Event::TagsChanged => {}
             Event::ExtractProgress { id, done, total } => self.on_extract_progress(id, done, total),
             Event::SortScanProgress { ticket, files } => self.on_sort_scan_progress(ticket, files),
             Event::SortScanned { ticket, plan } => self.on_sort_scanned(ticket, plan),
@@ -1152,6 +1183,8 @@ impl FilesApp {
             dialogs::show(&ctx, self);
         }
         settings_window::show(&ctx, self);
+        // Теги, которые спросили строки и Инспектор, — очередь видимого.
+        self.tagger.end_frame();
         crate::shell_menu::end_frame(self);
         crate::popup::end_frame(&ctx);
         crate::shell_menu::warm_up(&ctx, self);
@@ -1796,6 +1829,10 @@ impl FilesApp {
         self.images.thumbnails_enabled = settings.preview.thumbnails;
         self.indexer.configure(&settings.index);
         self.semantic.configure(&settings.semantic);
+        self.tagger.configure(&settings.tags);
+        if !settings.tags.whole_folder {
+            self.tagger.background(Vec::new());
+        }
         if settings.appearance.custom_title_bar != self.settings.appearance.custom_title_bar {
             ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(
                 !settings.appearance.custom_title_bar,
@@ -1869,6 +1906,7 @@ impl eframe::App for FilesApp {
         self.save_session_if_changed(true);
         self.indexer.shutdown(INDEX_SAVE_WAIT);
         self.semantic.shutdown(INDEX_SAVE_WAIT);
+        self.tagger.shutdown(INDEX_SAVE_WAIT);
         crate::crash::finish();
     }
 }

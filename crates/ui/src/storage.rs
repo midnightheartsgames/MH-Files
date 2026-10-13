@@ -17,6 +17,8 @@ pub struct DataDirs {
     pub index: PathBuf,
     /// Модель поиска по смыслу, llama.cpp и индекс векторов.
     pub semantic: PathBuf,
+    /// Модель автотегов, ONNX Runtime и посчитанные теги.
+    pub tags: PathBuf,
     pub portable: bool,
 }
 
@@ -40,6 +42,7 @@ fn detect(force_portable: bool) -> DataDirs {
             return DataDirs {
                 index: data.join("index"),
                 semantic: data.join("semantic"),
+                tags: data.join("tags"),
                 config: data,
                 portable: true,
             };
@@ -48,7 +51,8 @@ fn detect(force_portable: bool) -> DataDirs {
     let index = profile_index();
     // Рядом с индексом дисков: тоже данные машины (модель — около гигабайта).
     let semantic = index.parent().map_or_else(|| index.join("semantic"), |p| p.join("semantic"));
-    DataDirs { config: profile_config(), index, semantic, portable: false }
+    let tags = index.parent().map_or_else(|| index.join("tags"), |p| p.join("tags"));
+    DataDirs { config: profile_config(), index, semantic, tags, portable: false }
 }
 
 /// `%APPDATA%\MH Files` в Windows, `~/.config/mh-files` в остальных системах.
@@ -86,6 +90,10 @@ pub fn index_dir() -> PathBuf {
 
 pub fn semantic_dir() -> PathBuf {
     dirs().semantic.clone()
+}
+
+pub fn tags_dir() -> PathBuf {
+    dirs().tags.clone()
 }
 
 /// Новая версия программы запускается первый раз — сохранить настройки и сеанс прошлой

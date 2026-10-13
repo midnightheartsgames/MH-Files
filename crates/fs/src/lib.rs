@@ -37,18 +37,20 @@ pub mod semantic;
 pub mod shell;
 pub mod sizes;
 pub mod sorting;
+pub mod tags;
 pub mod transfer;
 pub mod watch;
 pub mod zip_write;
 
 pub use duplicates::{DuplicateOptions, DuplicateProgress, LinkReport};
-pub use images::{ImageKey, ImageKind, ImageResult};
+pub use images::{Frame, ImageKey, ImageKind, ImageResult};
 pub use indexer::{IndexResults, IndexStatus, Indexer, VolumeState, VolumeStatus};
 pub use preview::{Preview, PreviewRequest};
 pub use search::SearchQuery;
 pub use semantic::{Semantic, SemanticResults, SemanticState, SemanticStatus};
 pub use shell::ShellJob;
 pub use sizes::DirSize;
+pub use tags::{Lookup, TagState, TagStatus, Tagger, Want};
 pub use transfer::{Conflict, Transfer};
 pub use watch::DirWatch;
 
@@ -202,6 +204,8 @@ pub enum Event {
     SemanticChanged {
         content: bool,
     },
+    /// Автотеги: новые теги файлов или смена состояния (скачивание, очередь).
+    TagsChanged,
     /// Ход извлечения из архива.
     ExtractProgress {
         id: u64,

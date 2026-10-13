@@ -19,6 +19,57 @@ pub fn texture_of(ctx: &egui::Context, preview: &Preview, name: &str) -> Option<
     Some(ctx.load_texture(name, image, TextureOptions::LINEAR))
 }
 
+/// Есть ли у предпросмотра анимация.
+pub fn animated(preview: Option<&Preview>) -> bool {
+    matches!(preview, Some(Preview::Image { animation, .. }) if !animation.is_empty())
+}
+
+/// Проигрывание анимации предпросмотра (GIF, анимированные PNG и WebP): какой кадр в
+/// текстуре и когда показать следующий. Новый предпросмотр — новое проигрывание.
+#[derive(Debug, Default)]
+pub struct Playback {
+    index: usize,
+    /// Время egui, когда сменить кадр; 0 — проигрывание ещё не началось.
+    next: f64,
+    pub paused: bool,
+}
+
+impl Playback {
+    /// Сменить кадр в текстуре, если пора, и попросить перерисовку к следующему.
+    pub fn tick(
+        &mut self,
+        ctx: &egui::Context,
+        preview: Option<&Preview>,
+        texture: Option<&mut TextureHandle>,
+    ) {
+        let (Some(Preview::Image { animation, .. }), Some(texture)) = (preview, texture) else {
+            return;
+        };
+        if animation.is_empty() || self.paused {
+            return;
+        }
+        let now = ctx.input(|i| i.time);
+        if self.next == 0.0 {
+            self.next = now + animation[self.index].delay.as_secs_f64();
+        }
+        if now >= self.next {
+            self.index = (self.index + 1) % animation.len();
+            let frame = &animation[self.index];
+            let size = [frame.bitmap.width as usize, frame.bitmap.height as usize];
+            if frame.bitmap.rgba.len() == size[0] * size[1] * 4 {
+                let image = egui::ColorImage::from_rgba_unmultiplied(size, &frame.bitmap.rgba);
+                texture.set(image, TextureOptions::LINEAR);
+            }
+            self.next += frame.delay.as_secs_f64();
+            // Окно было свёрнуто или кадр рисовался долго — не догонять, а идти дальше.
+            if self.next < now {
+                self.next = now + frame.delay.as_secs_f64();
+            }
+        }
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64((self.next - now).max(0.0)));
+    }
+}
+
 /// Рисует предпросмотр в доступной области. `max_height` ограничивает картинку и текст.
 /// Возвращает страницу, на которую попросили перейти (у PDF).
 pub fn show(

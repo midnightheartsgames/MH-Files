@@ -256,9 +256,162 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
 }
 
+/// Кадр анимации и сколько его показывать.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub bitmap: Bitmap,
+    pub delay: std::time::Duration,
+}
+
+/// Сторона кадров анимации не больше: кадров много, и все они в памяти.
+pub const ANIMATION_SIDE: u32 = 1024;
+/// Памяти на кадры не больше: у длинной анимации показываются первые кадры.
+const ANIMATION_BYTES: usize = 256 << 20;
+const ANIMATION_FRAMES: usize = 2000;
+
+/// Бывает ли у такого файла анимация: GIF, анимированные PNG и WebP.
+pub fn animatable(ext: &str) -> bool {
+    matches!(ext, "gif" | "png" | "apng" | "webp")
+}
+
+/// Кадры анимированной картинки, уменьшенные до `max_side` (не больше [`ANIMATION_SIDE`]).
+/// Пусто — картинка не анимирована, не читается или её прервали (`cancelled`): тогда
+/// показывается обычный кадр.
+pub fn decode_animation(
+    path: &Path,
+    max_side: u32,
+    limit: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<Frame> {
+    let Ok(file) = std::fs::File::open(path) else { return Vec::new() };
+    if file.metadata().map_or(true, |m| m.len() > limit) {
+        return Vec::new();
+    }
+    animation_frames(std::io::BufReader::new(file), max_side, cancelled)
+}
+
+/// То же для картинки в памяти (из архива).
+pub fn animation_from_bytes(
+    bytes: &[u8],
+    max_side: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<Frame> {
+    animation_frames(std::io::Cursor::new(bytes), max_side, cancelled)
+}
+
+fn animation_frames<R: std::io::BufRead + std::io::Seek>(
+    reader: R,
+    max_side: u32,
+    cancelled: &dyn Fn() -> bool,
+) -> Vec<Frame> {
+    use image::AnimationDecoder;
+    use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
+    // Расширение может врать (WebP с именем .gif): формат — по содержимому.
+    let Ok(reader) = image::ImageReader::new(reader).with_guessed_format() else {
+        return Vec::new();
+    };
+    let format = reader.format();
+    let reader = reader.into_inner();
+    let frames = match format {
+        Some(image::ImageFormat::Gif) => GifDecoder::new(reader).map(|d| d.into_frames()),
+        Some(image::ImageFormat::Png) => match PngDecoder::new(reader) {
+            Ok(decoder) if decoder.is_apng().unwrap_or(false) => {
+                decoder.apng().map(|d| d.into_frames())
+            }
+            _ => return Vec::new(),
+        },
+        Some(image::ImageFormat::WebP) => match WebPDecoder::new(reader) {
+            Ok(decoder) if decoder.has_animation() => Ok(decoder.into_frames()),
+            _ => return Vec::new(),
+        },
+        _ => return Vec::new(),
+    };
+    let Ok(frames) = frames else { return Vec::new() };
+    let side = max_side.clamp(1, ANIMATION_SIDE);
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    for frame in frames {
+        if cancelled() {
+            return Vec::new();
+        }
+        // Битый кадр посреди файла — показываем то, что успели прочитать.
+        let Ok(frame) = frame else { break };
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let ms = numer.checked_div(denom).unwrap_or(0);
+        // Как в браузерах: задержка 0–10 мс — это «как получится», то есть 100 мс.
+        let ms = if ms <= 10 { 100 } else { ms };
+        let buffer = frame.into_buffer();
+        let (width, height) = buffer.dimensions();
+        let buffer = if width.max(height) > side {
+            let scale = side as f32 / width.max(height) as f32;
+            let w = ((width as f32 * scale).round() as u32).max(1);
+            let h = ((height as f32 * scale).round() as u32).max(1);
+            image::imageops::thumbnail(&buffer, w, h)
+        } else {
+            buffer
+        };
+        bytes += buffer.as_raw().len();
+        if bytes > ANIMATION_BYTES || out.len() >= ANIMATION_FRAMES {
+            break;
+        }
+        let (width, height) = buffer.dimensions();
+        out.push(Frame {
+            bitmap: Bitmap { width, height, rgba: buffer.into_raw() },
+            delay: std::time::Duration::from_millis(u64::from(ms)),
+        });
+    }
+    // Один кадр — не анимация.
+    if out.len() < 2 {
+        out.clear();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn gif(frames: &[([u8; 4], u16)], width: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut out);
+            encoder.set_repeat(image::codecs::gif::Repeat::Infinite).unwrap();
+            for &(color, delay_ms) in frames {
+                let buffer = image::RgbaImage::from_pixel(width, width / 2, image::Rgba(color));
+                let delay = image::Delay::from_numer_denom_ms(u32::from(delay_ms), 1);
+                encoder.encode_frame(image::Frame::from_parts(buffer, 0, 0, delay)).unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn animated_gif_gives_all_frames() {
+        let bytes =
+            gif(&[([255, 0, 0, 255], 50), ([0, 0, 255, 255], 0), ([0, 255, 0, 255], 200)], 40);
+        let frames = animation_from_bytes(&bytes, 2048, &|| false);
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].delay, std::time::Duration::from_millis(50));
+        assert_eq!(
+            frames[1].delay,
+            std::time::Duration::from_millis(100),
+            "0 мс — как в браузерах"
+        );
+        assert_eq!(&frames[1].bitmap.rgba[..4], &[0, 0, 255, 255]);
+        assert_eq!((frames[2].bitmap.width, frames[2].bitmap.height), (40, 20));
+        // Уменьшаются, как и обычные картинки.
+        let small = animation_from_bytes(&bytes, 10, &|| false);
+        assert_eq!((small[0].bitmap.width, small[0].bitmap.height), (10, 5));
+        // Один кадр, не GIF, прерванное — не анимация.
+        assert!(animation_from_bytes(&gif(&[([1, 2, 3, 255], 50)], 8), 64, &|| false).is_empty());
+        assert!(animation_from_bytes(b"not a picture", 64, &|| false).is_empty());
+        assert!(animation_from_bytes(&bytes, 64, &|| true).is_empty());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("кот.gif");
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(decode_animation(&path, 64, u64::MAX, &|| false).len(), 3);
+        assert!(decode_animation(&path, 64, 10, &|| false).is_empty(), "больше предела");
+    }
 
     #[test]
     fn svg_renders_to_fit_and_keeps_its_size() {

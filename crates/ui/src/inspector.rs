@@ -37,6 +37,8 @@ pub struct State {
     handler_rect: Option<(PathBuf, egui::Rect)>,
     /// Размер выбранной папки считается сам: какой папки и как отменить.
     sizing: Option<(PathBuf, CancelToken)>,
+    /// Кадр анимации (GIF) и когда следующий.
+    playback: preview_ui::Playback,
 }
 
 impl State {
@@ -59,6 +61,7 @@ impl State {
         }
         self.texture = preview_ui::texture_of(ctx, &preview, "inspector");
         self.preview = Some(preview);
+        self.playback = preview_ui::Playback::default();
         self.cancel = None;
     }
 }
@@ -179,6 +182,7 @@ fn request(app: &mut FilesApp) {
         text_limit: app.settings.preview.text_limit_kb as usize * 1024,
         image_limit: u64::from(app.settings.preview.image_limit_mb) * 1024 * 1024,
         page: state.page,
+        animate: true,
     };
     let ticket = Ticket { owner: OWNER_INSPECTOR, generation: state.generation };
     state.cancel = Some(app.workers.preview(ticket, request));
@@ -270,6 +274,8 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
     let handler = wants_handler(app, &path, is_dir);
     ScrollArea::vertical().id_salt("inspector").auto_shrink([false, false]).show(ui, |ui| {
         let max = (ui.available_height() * 0.5).clamp(160.0, 420.0);
+        let state = &mut app.inspector;
+        state.playback.tick(ui.ctx(), state.preview.as_ref(), state.texture.as_mut());
         if handler {
             // Место под окно обработчика: оно встанет сюда после кадра.
             let (rect, _) =
@@ -347,6 +353,9 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             if !attributes.is_empty() {
                 field(ui, "Атрибуты", &attributes.join(", "));
             }
+            if !entry.is_dir() && crate::pane_view::real_files(&app.tab().location) {
+                tags(ui, app, entry);
+            }
         }
         // Папка: размер целиком — по запросу, обход может быть долгим.
         let in_archive =
@@ -369,6 +378,97 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
             app.actions.push(Action::Status("путь скопирован".into(), crate::app::Level::Info));
         }
     });
+}
+
+/// Раздел «Теги»: что на картинке или кадре видео. Щелчок по тегу — копия в буфер.
+fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
+    let name = entry.name.as_str();
+    if !mh_files_fs::tags::picture::taggable(&mh_files_core::entry::extension_of(name)) {
+        return;
+    }
+    let label = |ui: &mut Ui, text: &str| {
+        ui.label(RichText::new(text).font(theme::regular(12.5)).color(theme::TEXT_DISABLED));
+    };
+    if !app.settings.tags.enabled {
+        label(ui, "Теги");
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("автотеги выключены").color(theme::TEXT_SECONDARY));
+            if ui.small_button("Включить…").clicked() {
+                app.settings_window.open_tags(&app.settings, &app.sorter.config);
+            }
+        });
+        ui.add_space(4.0);
+        return;
+    }
+    let modified = entry.modified.map_or(0, mh_files_core::index::unix);
+    let shown = match app.tagger.lookup(&entry.path(), entry.size, modified) {
+        mh_files_fs::Lookup::Ready(shown) => shown,
+        mh_files_fs::Lookup::Pending => {
+            field(ui, "Теги", "определяются…");
+            return;
+        }
+        mh_files_fs::Lookup::None => {
+            if let mh_files_fs::TagState::Failed(error) = app.tagger.status().state {
+                label(ui, "Теги");
+                ui.add(egui::Label::new(RichText::new(error).color(theme::WARN)).wrap());
+                ui.add_space(4.0);
+            }
+            return;
+        }
+    };
+    if app.settings.tags.rating
+        && let Some(rating) = &shown.rating
+    {
+        let text = format!(
+            "{} · {:.0}%",
+            mh_files_core::tags::rating_label(&rating.name),
+            rating.score * 100.0
+        );
+        field(ui, "Рейтинг", &text);
+    }
+    ui.horizontal(|ui| {
+        label(ui, &format!("Теги · {}", shown.tags.len()));
+        if !shown.tags.is_empty()
+            && ui.small_button("Копировать").on_hover_text("Все теги через запятую").clicked()
+        {
+            ui.ctx().copy_text(shown.line.clone());
+            app.actions.push(Action::Status("теги скопированы".into(), crate::app::Level::Info));
+        }
+    });
+    if shown.tags.is_empty() {
+        ui.label(RichText::new("модель ничего уверенно не узнала").color(theme::TEXT_SECONDARY));
+        ui.add_space(4.0);
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        for tag in &shown.tags {
+            // Персонажи — цветом акцента: их меньше, и они важнее.
+            let color = if tag.kind == mh_files_core::tags::TagKind::Character {
+                theme::accent()
+            } else {
+                theme::TEXT_PRIMARY
+            };
+            let chip =
+                egui::Button::new(RichText::new(&tag.name).font(theme::regular(13.0)).color(color))
+                    .fill(theme::FIELD)
+                    .stroke(egui::Stroke::new(1.0, theme::CARD_STROKE))
+                    .corner_radius(egui::CornerRadius::same(4));
+            let hint = if tag.kind == mh_files_core::tags::TagKind::Character {
+                format!("персонаж · уверенность {:.0}% · щелчок — скопировать", tag.score * 100.0)
+            } else {
+                format!("уверенность {:.0}% · щелчок — скопировать", tag.score * 100.0)
+            };
+            if ui.add(chip).on_hover_text(hint).clicked() {
+                ui.ctx().copy_text(tag.name.clone());
+                app.actions.push(Action::Status(
+                    format!("тег «{}» скопирован", tag.name),
+                    crate::app::Level::Info,
+                ));
+            }
+        }
+    });
+    ui.add_space(8.0);
 }
 
 fn field(ui: &mut Ui, label: &str, value: &str) {

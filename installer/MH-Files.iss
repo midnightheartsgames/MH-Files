@@ -4,7 +4,8 @@
 ; Ставится для текущего пользователя, без прав администратора: в
 ; %LOCALAPPDATA%\Programs\MH Files. Настройки (%APPDATA%\MH Files) при удалении остаются —
 ; их удаляет только сам пользователь. Модель поиска по смыслу и llama.cpp (около гигабайта,
-; %LOCALAPPDATA%\MH Files\semantic) удаляются вместе с программой: их можно скачать заново.
+; %LOCALAPPDATA%\MH Files\semantic) и автотегов с ONNX Runtime (%LOCALAPPDATA%\MH Files\tags)
+; удаляются вместе с программой: их можно скачать заново.
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
@@ -99,9 +100,11 @@ Root: HKCU; Subkey: "Software\Classes\.zip\OpenWithProgids"; ValueType: none; Va
 Root: HKCU; Subkey: "Software\Classes\.7z\OpenWithProgids"; ValueType: none; ValueName: "MHFiles.Archive"; Flags: uninsdeletevalue; Tasks: archives
 Root: HKCU; Subkey: "Software\Classes\.rar\OpenWithProgids"; ValueType: none; ValueName: "MHFiles.Archive"; Flags: uninsdeletevalue; Tasks: archives
 
-; Модель поиска по смыслу (около гигабайта) — с программой; в переносном режиме она в data.
+; Модели поиска по смыслу и автотегов (около гигабайта каждая) — с программой; в переносном
+; режиме они в data.
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\MH Files\semantic"
+Type: filesandordirs; Name: "{localappdata}\MH Files\tags"
 
 ; Пункт меню, папки по умолчанию и архивы мог включить и сам пользователь из настроек (без
 ; задачи установщика) — при удалении программы всё это убирается в любом случае.

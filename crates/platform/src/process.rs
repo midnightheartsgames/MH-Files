@@ -1,9 +1,9 @@
-//! Фоновый процесс-помощник (`llama-server` поиска по смыслу): без окна консоли, с низким
+//! Фоновый процесс-помощник (`llama-server` поиска по смыслу, теггер автотегов): без окна консоли, с низким
 //! приоритетом, и в Windows — в задании (job), которое убивает его вместе с MH Files, даже
 //! если программа упала: брошенный процесс держал бы гигабайт памяти.
 
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 /// Запущенный процесс. Уничтожение объекта завершает процесс.
 pub struct Background {
@@ -20,19 +20,46 @@ impl Background {
         args: &[String],
         log: Option<&Path>,
     ) -> Result<Background, String> {
+        Background::start(program, args, log, false).map(|(background, _)| background)
+    }
+
+    /// Запустить помощника, с которым говорят через его stdin и stdout (автотеги); stderr
+    /// дописывается в `log`.
+    pub fn spawn_piped(
+        program: &Path,
+        args: &[String],
+        log: Option<&Path>,
+    ) -> Result<(Background, ChildStdin, ChildStdout), String> {
+        let (background, pipes) = Background::start(program, args, log, true)?;
+        let (stdin, stdout) = pipes.ok_or_else(|| format!("{} без каналов", program.display()))?;
+        Ok((background, stdin, stdout))
+    }
+
+    fn start(
+        program: &Path,
+        args: &[String],
+        log: Option<&Path>,
+        piped: bool,
+    ) -> Result<(Background, Option<(ChildStdin, ChildStdout)>), String> {
         let mut command = Command::new(program);
-        command.args(args).stdin(Stdio::null());
+        command.args(args).stdin(if piped { Stdio::piped() } else { Stdio::null() });
         if let Some(dir) = program.parent().filter(|d| !d.as_os_str().is_empty()) {
             command.current_dir(dir);
         }
         let open = |path: &Path| std::fs::OpenOptions::new().create(true).append(true).open(path);
         match log.map(open) {
             Some(Ok(file)) => {
-                let copy = file.try_clone().map_err(|e| e.to_string())?;
-                command.stdout(Stdio::from(copy)).stderr(Stdio::from(file));
+                if piped {
+                    command.stdout(Stdio::piped()).stderr(Stdio::from(file));
+                } else {
+                    let copy = file.try_clone().map_err(|e| e.to_string())?;
+                    command.stdout(Stdio::from(copy)).stderr(Stdio::from(file));
+                }
             }
             _ => {
-                command.stdout(Stdio::null()).stderr(Stdio::null());
+                command
+                    .stdout(if piped { Stdio::piped() } else { Stdio::null() })
+                    .stderr(Stdio::null());
             }
         }
         #[cfg(windows)]
@@ -40,16 +67,17 @@ impl Background {
             use std::os::windows::process::CommandExt;
             command.creation_flags(crate::win::process::CREATION_FLAGS);
         }
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|error| format!("{} не запущен: {error}", program.display()))?;
+        let pipes = child.stdin.take().zip(child.stdout.take());
         #[cfg(windows)]
         {
             let job = crate::win::process::Job::adopt(&child);
-            Ok(Background { child, _job: job })
+            Ok((Background { child, _job: job }, pipes))
         }
         #[cfg(not(windows))]
-        Ok(Background { child })
+        Ok((Background { child }, pipes))
     }
 
     /// Процесс уже завершился: с каким кодом.
@@ -153,6 +181,25 @@ mod tests {
         drop(slow);
         assert!(!Path::new(&format!("/proc/{pid}")).exists(), "завершён и прибран");
         assert!(Background::spawn(&dir.join("нет такой программы"), &[], None).is_err());
+        // Помощник с каналами: строка туда — та же строка обратно, ошибки — в журнал.
+        let (mut echo, mut stdin, stdout) = Background::spawn_piped(
+            Path::new("/bin/sh"),
+            &["-c".into(), "read line; echo \"$line\"; echo журнал >&2".into()],
+            Some(&log),
+        )
+        .unwrap();
+        {
+            use std::io::{BufRead, Write};
+            writeln!(stdin, "эхо").unwrap();
+            let mut answer = String::new();
+            std::io::BufReader::new(stdout).read_line(&mut answer).unwrap();
+            assert_eq!(answer.trim(), "эхо");
+        }
+        let started = std::time::Instant::now();
+        while echo.exited().is_none() && started.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(std::fs::read_to_string(&log).unwrap().contains("журнал"));
         let both = capture(
             Path::new("/bin/sh"),
             &["-c", "echo один; echo два >&2"],

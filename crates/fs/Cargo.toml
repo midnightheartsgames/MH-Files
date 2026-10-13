@@ -23,6 +23,7 @@ walkdir.workspace = true
 infer.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+ort.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

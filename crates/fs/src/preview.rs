@@ -7,7 +7,8 @@ use mh_files_platform::thumbs::{self, Bitmap, ImageMode};
 use mh_files_platform::{media, pdf};
 
 use crate::images::{
-    decodable, decode_bytes, decode_scaled, dimensions, render_svg, render_svg_file, vector,
+    Frame, animatable, animation_from_bytes, decodable, decode_animation, decode_bytes,
+    decode_scaled, dimensions, render_svg, render_svg_file, vector,
 };
 use crate::{CancelToken, archive};
 
@@ -23,6 +24,8 @@ pub struct PreviewRequest {
     pub image_limit: u64,
     /// Страница многостраничного документа (PDF), с нуля.
     pub page: u32,
+    /// Все кадры анимации (GIF, анимированные PNG и WebP), а не только первый.
+    pub animate: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +38,8 @@ pub enum Preview {
         pages: Option<(u32, u32)>,
         /// Свойства из Windows: длительность, кадр, исполнитель, камера…
         info: Vec<(String, String)>,
+        /// Кадры анимации, первый — `bitmap`; пусто — картинка неподвижная.
+        animation: Vec<Frame>,
     },
     /// Картинки нет, но есть свойства (аудио без обложки, документ).
     Info(Vec<(String, String)>),
@@ -91,6 +96,7 @@ pub fn load(request: &PreviewRequest, cancel: &CancelToken) -> Preview {
                     dimensions: Some(size),
                     pages: None,
                     info: Vec::new(),
+                    animation: Vec::new(),
                 };
             }
             // Не разобрался — покажем текст: SVG остаётся текстовым форматом.
@@ -98,13 +104,26 @@ pub fn load(request: &PreviewRequest, cancel: &CancelToken) -> Preview {
         }
     }
     if decodable(&ext) {
-        return match decode_scaled(&request.path, request.max_side, request.image_limit) {
-            Ok(bitmap) => Preview::Image {
-                bitmap,
-                dimensions: dimensions(&request.path),
-                pages: None,
-                info: info(&request.path, &ext),
-            },
+        let animation = if request.animate && animatable(&ext) {
+            let cancelled = || cancel.is_cancelled();
+            decode_animation(&request.path, request.max_side, request.image_limit, &cancelled)
+        } else {
+            Vec::new()
+        };
+        let first = match animation.first() {
+            Some(frame) => Ok(frame.bitmap.clone()),
+            None => decode_scaled(&request.path, request.max_side, request.image_limit),
+        };
+        return match first {
+            Ok(bitmap) => {
+                let dimensions = dimensions(&request.path);
+                let mut info = info(&request.path, &ext);
+                // Размер картинки уже показан под ней — второй строкой из Windows не нужен.
+                if dimensions.is_some() {
+                    info.retain(|(label, _)| label != media::DIMENSIONS);
+                }
+                Preview::Image { bitmap, dimensions, pages: None, info, animation }
+            }
             Err(error) => Preview::Error(error),
         };
     }
@@ -128,7 +147,9 @@ pub fn load(request: &PreviewRequest, cancel: &CancelToken) -> Preview {
     // Видео, аудио, документы — эскиз Shell (кадр, обложка, первая страница) и свойства.
     let info = info(&request.path, &ext);
     match thumbs::shell_image(&request.path, request.max_side, ImageMode::Thumbnail) {
-        Ok(bitmap) => Preview::Image { bitmap, dimensions: None, pages: None, info },
+        Ok(bitmap) => {
+            Preview::Image { bitmap, dimensions: None, pages: None, info, animation: Vec::new() }
+        }
         Err(_) if !info.is_empty() => Preview::Info(info),
         Err(_) => Preview::None("предпросмотр для этого типа не поддерживается".into()),
     }
@@ -195,7 +216,13 @@ fn pdf_page(request: &PreviewRequest) -> Result<Preview, String> {
     let bitmap = decode_bytes(&png, request.max_side)?;
     let page = request.page.min(count.saturating_sub(1));
     let info = info(&request.path, "pdf");
-    Ok(Preview::Image { bitmap, dimensions: None, pages: Some((page, count)), info })
+    Ok(Preview::Image {
+        bitmap,
+        dimensions: None,
+        pages: Some((page, count)),
+        info,
+        animation: Vec::new(),
+    })
 }
 
 /// Предпросмотр записи архива: картинки и текст читаются в память, остальное — после
@@ -220,15 +247,34 @@ fn in_archive(request: &PreviewRequest, archive: &Path, inner: &str) -> Preview 
         && let Ok((bitmap, size)) = archive::read(archive, inner, request.image_limit.min(16 << 20))
             .and_then(|bytes| render_svg(&bytes, request.max_side))
     {
-        return Preview::Image { bitmap, dimensions: Some(size), pages: None, info: Vec::new() };
+        return Preview::Image {
+            bitmap,
+            dimensions: Some(size),
+            pages: None,
+            info: Vec::new(),
+            animation: Vec::new(),
+        };
     }
     if decodable(&ext) {
-        return match archive::read(archive, inner, request.image_limit)
-            .and_then(|bytes| decode_bytes(&bytes, request.max_side))
-        {
-            Ok(bitmap) => {
-                Preview::Image { bitmap, dimensions: None, pages: None, info: Vec::new() }
-            }
+        return match archive::read(archive, inner, request.image_limit).and_then(|bytes| {
+            let animation = if request.animate && animatable(&ext) {
+                animation_from_bytes(&bytes, request.max_side, &|| false)
+            } else {
+                Vec::new()
+            };
+            let bitmap = match animation.first() {
+                Some(frame) => frame.bitmap.clone(),
+                None => decode_bytes(&bytes, request.max_side)?,
+            };
+            Ok((bitmap, animation))
+        }) {
+            Ok((bitmap, animation)) => Preview::Image {
+                bitmap,
+                dimensions: None,
+                pages: None,
+                info: Vec::new(),
+                animation,
+            },
             Err(error) => Preview::Error(error),
         };
     }
@@ -438,6 +484,7 @@ mod tests {
             text_limit: 5,
             image_limit: 1 << 20,
             page: 0,
+            animate: false,
         };
         let cancel = CancelToken::default();
         match load(&request(dir.clone(), true), &cancel) {
@@ -449,6 +496,29 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(matches!(load(&request(dir.join("noext"), false), &cancel), Preview::Text { .. }));
+        // GIF: в быстром просмотре — все кадры, в Инспекторе — первый.
+        let gif = dir.join("кот.gif");
+        {
+            let mut encoder =
+                image::codecs::gif::GifEncoder::new(std::fs::File::create(&gif).unwrap());
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                let frame = image::RgbaImage::from_pixel(8, 8, image::Rgba(color));
+                let delay = image::Delay::from_numer_denom_ms(70, 1);
+                encoder.encode_frame(image::Frame::from_parts(frame, 0, 0, delay)).unwrap();
+            }
+        }
+        let animated = PreviewRequest { animate: true, ..request(gif.clone(), false) };
+        match load(&animated, &cancel) {
+            Preview::Image { animation, bitmap, .. } => {
+                assert_eq!(animation.len(), 2);
+                assert_eq!(bitmap, animation[0].bitmap);
+            }
+            other => panic!("{other:?}"),
+        }
+        match load(&request(gif, false), &cancel) {
+            Preview::Image { animation, .. } => assert!(animation.is_empty()),
+            other => panic!("{other:?}"),
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
