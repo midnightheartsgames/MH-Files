@@ -28,6 +28,7 @@ pub mod session;
 pub mod settings;
 pub mod sort;
 pub mod sorting;
+pub mod tags;
 pub mod update;
 
 pub use entry::{Attributes, Entry, EntryKind};

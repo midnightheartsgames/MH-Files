@@ -34,6 +34,8 @@ pub struct Settings {
     pub index: IndexSettings,
     /// Поиск по смыслу (EmbeddingGemma 2).
     pub semantic: SemanticSettings,
+    /// Автотеги картинок и видео (WD Tagger v3).
+    pub tags: TagSettings,
     /// Сохранённые поиски по дискам, показываются в боковой панели.
     pub saved_searches: Vec<SavedSearch>,
     pub sorting: SortSettings,
@@ -245,6 +247,60 @@ impl Default for SemanticSettings {
     }
 }
 
+/// Автотеги: что изображено на картинках и кадрах видео — столбец «Теги» и раздел Инспектора.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TagSettings {
+    /// Выключено, пока пользователь не согласится скачать модель (0,4–1,3 ГБ).
+    pub enabled: bool,
+    /// Репозиторий модели на Hugging Face (`model.onnx` и `selected_tags.csv` WD Tagger v3).
+    pub model: String,
+    /// Порог обычных тегов, проценты уверенности.
+    pub general: u32,
+    /// Порог персонажей, проценты.
+    pub character: u32,
+    /// Показывать рейтинг в Инспекторе.
+    pub rating: bool,
+    /// Считать теги всех картинок открытой папки, а не только видимых.
+    pub whole_folder: bool,
+    /// Файлы больше, МБ, не смотрятся.
+    pub max_file_mb: u32,
+    /// Своя библиотека ONNX Runtime; пусто — скачанная MH Files.
+    pub runtime: PathBuf,
+}
+
+impl TagSettings {
+    /// Ниже — теги не хранятся ([`crate::tags::FLOOR`]).
+    pub const MIN_THRESHOLD: u32 = 20;
+
+    pub fn thresholds(&self) -> crate::tags::Thresholds {
+        crate::tags::Thresholds {
+            general: self.general as f32 / 100.0,
+            character: self.character as f32 / 100.0,
+        }
+    }
+
+    /// Настройки без того, что влияет только на показ: их смена модель не трогает.
+    pub fn for_engine(&self) -> TagSettings {
+        TagSettings { general: 0, character: 0, rating: false, whole_folder: false, ..self.clone() }
+    }
+}
+
+impl Default for TagSettings {
+    fn default() -> TagSettings {
+        TagSettings {
+            enabled: false,
+            model: crate::tags::DEFAULT_MODEL.into(),
+            general: 35,
+            character: 85,
+            rating: true,
+            whole_folder: true,
+            max_file_mb: 64,
+            runtime: PathBuf::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedSearch {
     pub name: String,
@@ -379,6 +435,7 @@ impl Default for Settings {
             terminal: String::new(),
             index: IndexSettings::default(),
             semantic: SemanticSettings::default(),
+            tags: TagSettings::default(),
             saved_searches: Vec::new(),
             sorting: SortSettings::default(),
             system: SystemSettings::default(),
@@ -499,6 +556,13 @@ impl Settings {
         if semantic.quant.trim().is_empty() {
             semantic.quant = crate::semantic::model::DEFAULT_QUANT.into();
         }
+        let tags = &mut self.tags;
+        tags.general = tags.general.clamp(TagSettings::MIN_THRESHOLD, 99);
+        tags.character = tags.character.clamp(TagSettings::MIN_THRESHOLD, 99);
+        tags.max_file_mb = tags.max_file_mb.clamp(1, 4096);
+        if tags.model.trim().is_empty() {
+            tags.model = crate::tags::DEFAULT_MODEL.into();
+        }
         self.version = SETTINGS_VERSION;
         self
     }
@@ -556,6 +620,10 @@ mod tests {
             Settings::parse(r#"{"appearance":{"font_scale":9.0},"panes":{"sidebar_width":-5}}"#);
         assert_eq!(settings.appearance.font_scale, MAX_FONT_SCALE);
         assert_eq!(settings.panes.sidebar_width, MIN_SIDE_WIDTH);
+        let (settings, _) =
+            Settings::parse(r#"{"tags":{"general":3,"character":250,"model":" "}}"#);
+        assert_eq!((settings.tags.general, settings.tags.character), (20, 99));
+        assert_eq!(settings.tags.model, crate::tags::DEFAULT_MODEL);
         let (_, notice) = Settings::parse(r#"{"version":99}"#);
         assert!(notice.is_some());
     }

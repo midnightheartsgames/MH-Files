@@ -1294,6 +1294,11 @@ fn item_menu(ui: &mut Ui, app: &mut FilesApp, is_dir: bool, many: bool, targets:
     menu_item(ui, app, CommandId::Properties);
 }
 
+/// Файлы места лежат на диске по своим путям: в архиве и корзине — нет, теги им не считаются.
+pub(crate) fn real_files(location: &Location) -> bool {
+    !matches!(location, Location::Archive { .. } | Location::RecycleBin | Location::Computer)
+}
+
 pub(crate) fn row_height(app: &FilesApp) -> f32 {
     let base = if app.settings.appearance.compact { 22.0 } else { 27.0 };
     (base * app.settings.appearance.list_scale).round()
@@ -1356,13 +1361,15 @@ fn details(
     update_band(ui, tab, output.inner_rect, Geometry::Rows { height: row_height });
 }
 
-/// Положение столбцов в строке шириной `width`. В узкой панели сначала прячется «Тип»,
-/// потом «Изменён»: имя и размер важнее.
+/// Положение столбцов в строке шириной `width`. В узкой панели сначала прячутся «Теги»,
+/// потом «Тип» и «Изменён»: имя и размер важнее.
 struct ColumnLayout {
     name: (f32, f32),
     modified: Option<(f32, f32)>,
     kind: Option<(f32, f32)>,
     size: (f32, f32),
+    /// Только когда автотеги включены.
+    tags: Option<(f32, f32)>,
 }
 
 const MIN_NAME: f32 = 180.0;
@@ -1370,11 +1377,14 @@ const MIN_NAME: f32 = 180.0;
 fn column_layout(app: &FilesApp, left: f32, width: f32, search: bool) -> ColumnLayout {
     let c = app.columns;
     let kind_width = if search { c.kind * 2.2 } else { c.kind };
+    let show_tags = app.settings.tags.enabled
+        && width - (c.modified + kind_width + c.size + c.tags) >= MIN_NAME;
     let show_kind = width - (c.modified + kind_width + c.size) >= MIN_NAME;
     let show_modified = width - (c.modified + c.size) >= MIN_NAME;
     let fixed = c.size
         + if show_modified { c.modified } else { 0.0 }
-        + if show_kind { kind_width } else { 0.0 };
+        + if show_kind { kind_width } else { 0.0 }
+        + if show_tags { c.tags } else { 0.0 };
     let name_width = (width - fixed).max(80.0);
     let mut x = left;
     let mut take = |w: f32| {
@@ -1385,7 +1395,9 @@ fn column_layout(app: &FilesApp, left: f32, width: f32, search: bool) -> ColumnL
     let name = take(name_width);
     let modified = show_modified.then(|| take(c.modified));
     let kind = show_kind.then(|| take(kind_width));
-    ColumnLayout { name, modified, kind, size: take(c.size) }
+    let size = take(c.size);
+    let tags = show_tags.then(|| take(c.tags));
+    ColumnLayout { name, modified, kind, size, tags }
 }
 
 fn header(
@@ -1403,11 +1415,17 @@ fn header(
     let layout = column_layout(app, rect.left(), rect.width() - 12.0, search);
     let order = tab.listing.options().sort;
     let recycle = tab.location == Location::RecycleBin;
+    // По тегам не сортируется: у столбца нет порядка.
     let columns = [
-        (SortColumn::Name, Some(layout.name), "Имя", false),
-        (SortColumn::Modified, layout.modified, if recycle { "Удалён" } else { "Изменён" }, false),
+        (Some(SortColumn::Name), Some(layout.name), "Имя", false),
         (
-            SortColumn::Type,
+            Some(SortColumn::Modified),
+            layout.modified,
+            if recycle { "Удалён" } else { "Изменён" },
+            false,
+        ),
+        (
+            Some(SortColumn::Type),
             layout.kind,
             if recycle {
                 "Откуда"
@@ -1418,7 +1436,8 @@ fn header(
             },
             false,
         ),
-        (SortColumn::Size, Some(layout.size), "Размер", true),
+        (Some(SortColumn::Size), Some(layout.size), "Размер", true),
+        (None, layout.tags, "Теги", false),
     ];
     for (index, (column, span, title, right)) in columns.into_iter().enumerate() {
         let Some((x0, x1)) = span else { continue };
@@ -1427,7 +1446,7 @@ fn header(
         if response.hovered() {
             painter.rect_filled(cell, CornerRadius::ZERO, theme::CARD);
         }
-        let active = order.column == column;
+        let active = column == Some(order.column);
         let color = if active { theme::TEXT_PRIMARY } else { theme::TEXT_SECONDARY };
         let (anchor, x) = if right {
             (Align2::RIGHT_CENTER, x1 - 22.0)
@@ -1443,7 +1462,9 @@ fn header(
                 vec![center + vec2(-4.0, base), center + vec2(4.0, base), center + vec2(0.0, tip)];
             painter.add(egui::Shape::convex_polygon(points, theme::accent(), Stroke::NONE));
         }
-        if response.clicked() && !(search && column == SortColumn::Type) {
+        if let Some(column) = column.filter(|&c| !(search && c == SortColumn::Type))
+            && response.clicked()
+        {
             app.actions.push(Action::SetSort { pane, column });
         }
         // Граница столбца тянется за левый край: ширина фиксированного столбца меняется.
@@ -1464,9 +1485,10 @@ fn header(
                 let width = match index {
                     1 => &mut app.columns.modified,
                     2 => &mut app.columns.kind,
-                    _ => &mut app.columns.size,
+                    3 => &mut app.columns.size,
+                    _ => &mut app.columns.tags,
                 };
-                *width = (*width + delta).clamp(50.0, 400.0);
+                *width = (*width + delta).clamp(50.0, if index == 4 { 900.0 } else { 400.0 });
             }
         }
     }
@@ -1627,7 +1649,26 @@ pub(crate) fn item(
             };
             if let Some(size) = size {
                 let at = pos2(layout.size.1 - 10.0, rect.center().y);
-                painter.text(at, Align2::RIGHT_CENTER, size, font, secondary);
+                painter.text(at, Align2::RIGHT_CENTER, size, font.clone(), secondary);
+            }
+            if let Some((x0, x1)) = layout.tags
+                && !entry.is_dir()
+                && real_files(&tab.location)
+            {
+                let modified = entry.modified.map_or(0, mh_files_core::index::unix);
+                let (text, color) = match app.tagger.lookup(&path, entry.size, modified) {
+                    mh_files_fs::Lookup::Ready(shown) => (shown.line.clone(), secondary),
+                    mh_files_fs::Lookup::Pending => ("…".to_string(), theme::TEXT_DISABLED),
+                    mh_files_fs::Lookup::None => (String::new(), secondary),
+                };
+                if !text.is_empty() {
+                    let galley = elided(ui, &text, font, color, x1 - x0 - 16.0);
+                    painter.galley(
+                        pos2(x0 + 8.0, rect.center().y - galley.size().y / 2.0),
+                        galley,
+                        color,
+                    );
+                }
             }
             name_end = layout.name.1;
         }

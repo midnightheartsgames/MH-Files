@@ -26,6 +26,7 @@ enum Page {
     Preview,
     Index,
     Semantic,
+    Tags,
     Sorting,
     System,
     Keys,
@@ -33,13 +34,14 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [Page; 10] = [
+    const ALL: [Page; 11] = [
         Page::General,
         Page::Appearance,
         Page::Files,
         Page::Preview,
         Page::Index,
         Page::Semantic,
+        Page::Tags,
         Page::Sorting,
         Page::System,
         Page::Keys,
@@ -54,6 +56,7 @@ impl Page {
             Page::Preview => "Предпросмотр",
             Page::Index => "Поиск по дискам",
             Page::Semantic => "Поиск по смыслу",
+            Page::Tags => "Автотеги",
             Page::Sorting => "Сортировка",
             Page::System => "Система",
             Page::Keys => "Горячие клавиши",
@@ -114,6 +117,12 @@ impl State {
     ) {
         self.open(settings, categories);
         self.page = Page::Semantic;
+    }
+
+    /// Открыть сразу на странице автотегов (кнопка в Инспекторе).
+    pub fn open_tags(&mut self, settings: &Settings, categories: &mh_files_core::sorting::Config) {
+        self.open(settings, categories);
+        self.page = Page::Tags;
     }
 
     /// Набранный, но не добавленный кнопкой путь индекса тоже идёт в список: иначе
@@ -185,6 +194,8 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
     let mut rescan = false;
     let semantic_status = app.semantic.status();
     let mut semantic_action = None;
+    let tags_status = app.tagger.status();
+    let mut tags_action = None;
     let sort_info = SortInfo {
         path: app.sorter.path.clone(),
         history: app.sorter.history.clone(),
@@ -198,6 +209,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         config: dirs.config.clone(),
         index: dirs.index.clone(),
         semantic: dirs.semantic.clone(),
+        tags: dirs.tags.clone(),
         portable: dirs.portable,
         integration: app.integration,
         crashed: app.previous.crashed,
@@ -303,6 +315,10 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                                 SemanticInfo { status: &semantic_status, dir: &dirs.semantic };
                             semantic_action = semantic(ui, state, &info);
                         }
+                        Page::Tags => {
+                            let info = TagsInfo { status: &tags_status, dir: &dirs.tags };
+                            tags_action = tags(ui, &mut state.draft, &info);
+                        }
                         Page::Sorting => {
                             sort_action =
                                 sorting(ui, &mut state.draft, &mut state.categories, &sort_info)
@@ -331,6 +347,21 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
             app.workers.shell(mh_files_fs::ShellJob::Open(path))
         }
         Some(SemanticAction::Open(path)) => {
+            let _ = std::fs::create_dir_all(&path);
+            app.actions.push(crate::app::Action::Open {
+                location: mh_files_core::location::Location::Dir(path),
+                target: crate::app::Target::NewTab,
+            });
+        }
+        None => {}
+    }
+    match tags_action {
+        Some(TagsAction::Forget) => {
+            app.tagger.forget();
+            app.settings_window.status = Some(("теги посчитаются заново".into(), false));
+        }
+        Some(TagsAction::OpenFile(path)) => app.workers.shell(mh_files_fs::ShellJob::Open(path)),
+        Some(TagsAction::Open(path)) => {
             let _ = std::fs::create_dir_all(&path);
             app.actions.push(crate::app::Action::Open {
                 location: mh_files_core::location::Location::Dir(path),
@@ -384,7 +415,9 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         }
         None => {}
     }
-    if app.settings_window.open && (index_status.busy() || semantic_status.busy()) {
+    if app.settings_window.open
+        && (index_status.busy() || semantic_status.busy() || tags_status.busy())
+    {
         ctx.request_repaint_after(std::time::Duration::from_millis(500));
     }
     if close {
@@ -655,6 +688,7 @@ struct SystemInfo {
     config: std::path::PathBuf,
     index: std::path::PathBuf,
     semantic: std::path::PathBuf,
+    tags: std::path::PathBuf,
     portable: bool,
     integration: Option<mh_files_platform::integration::Status>,
     crashed: bool,
@@ -737,6 +771,7 @@ fn system(ui: &mut Ui, s: &mut Settings, info: &SystemInfo) -> Option<SystemActi
         );
         widgets::hint(ui, &format!("Индекс дисков: {}", info.index.display()));
         widgets::hint(ui, &format!("Поиск по смыслу: {}", info.semantic.display()));
+        widgets::hint(ui, &format!("Автотеги: {}", info.tags.display()));
         if ui.button("Открыть папку данных").clicked() {
             action = Some(SystemAction::Open(info.config.clone()));
         }
@@ -1039,6 +1074,154 @@ fn index(ui: &mut Ui, state: &mut State, info: &IndexInfo) -> bool {
 struct SemanticInfo<'a> {
     status: &'a mh_files_fs::SemanticStatus,
     dir: &'a std::path::Path,
+}
+
+struct TagsInfo<'a> {
+    status: &'a mh_files_fs::TagStatus,
+    dir: &'a std::path::Path,
+}
+
+enum TagsAction {
+    Forget,
+    Open(std::path::PathBuf),
+    OpenFile(std::path::PathBuf),
+}
+
+fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
+    use mh_files_core::tags::{MODELS, model_info};
+    let t = &mut s.tags;
+    let mut action = None;
+    card(ui, "Автотеги", |ui| {
+        widgets::hint(
+            ui,
+            "Модель WD Tagger v3 смотрит на картинки и кадры видео и подписывает, что на них: предметы, место, вид кадра, персонажей аниме и игр — словами Danbooru (около 10 800 тегов, по-английски). Теги видны в столбце «Теги» таблицы и в Инспекторе: сначала у видимых файлов, потом у остальных картинок открытой папки. Всё считается на этом компьютере: файлы никуда не отправляются.",
+        );
+        switch_row(
+            ui,
+            "Включить",
+            Some(
+                "При включении скачиваются модель с Hugging Face (0,4–1,3 ГБ) и ONNX Runtime с GitHub (80 МБ). Нужны библиотеки Microsoft Visual C++ (x64) — обычно они уже стоят. Модель выгружается из памяти через пять минут без дела.",
+            ),
+            &mut t.enabled,
+        );
+        switch_row(
+            ui,
+            "Всю открытую папку",
+            Some(
+                "После видимых файлов — остальные картинки и видео папки, в фоне. Выключено — только то, что на экране.",
+            ),
+            &mut t.whole_folder,
+        );
+        row(ui, "Состояние", |ui| {
+            let status = info.status;
+            let mut text = format!(
+                "{} · с тегами {}",
+                status.describe(),
+                mh_files_core::format::items(status.tagged)
+            );
+            if status.loaded {
+                text.push_str(" · модель в памяти");
+            }
+            if let Some(last) = status.last {
+                text.push_str(&format!(" · {:.1} с на файл", last.as_secs_f32()));
+            }
+            let color = match status.state {
+                mh_files_fs::TagState::Failed(_) => theme::WARN,
+                _ => theme::TEXT_SECONDARY,
+            };
+            ui.add(egui::Label::new(RichText::new(text).color(color)).truncate());
+        });
+        ui.horizontal(|ui| {
+            if ui
+                .button("Пересчитать все теги")
+                .on_hover_text("Забыть посчитанное: файлы посмотрятся заново, когда их откроют")
+                .clicked()
+            {
+                action = Some(TagsAction::Forget);
+            }
+            if ui.button("Открыть папку модели").clicked() {
+                action = Some(TagsAction::Open(info.dir.to_path_buf()));
+            }
+            if ui
+                .button("Открыть журнал")
+                .on_hover_text("Вывод ONNX Runtime: почему модель не запустилась")
+                .clicked()
+            {
+                action = Some(TagsAction::OpenFile(info.dir.join("tagger.log")));
+            }
+        });
+        if let mh_files_fs::TagState::Failed(error) = &info.status.state {
+            ui.add(egui::Label::new(RichText::new(error).color(theme::WARN)).wrap());
+        }
+        if info.status.skipped > 0 {
+            widgets::hint(ui, &format!("Модель отказалась от файлов: {}.", info.status.skipped));
+        }
+    });
+    card(ui, "Модель", |ui| {
+        row(ui, "Модель", |ui| {
+            let selected = model_info(&t.model)
+                .map_or_else(|| t.model.clone(), |m| format!("{} ({})", m.title, m.size));
+            egui::ComboBox::from_id_salt("tags-model")
+                .selected_text(selected)
+                .width(300.0)
+                .show_ui(ui, |ui| {
+                    for model in MODELS {
+                        let label = format!("{} ({})", model.title, model.size);
+                        if ui
+                            .selectable_label(t.model.eq_ignore_ascii_case(model.repo), label)
+                            .clicked()
+                        {
+                            t.model = model.repo.to_string();
+                        }
+                    }
+                });
+        });
+        widgets::hint(
+            ui,
+            &format!(
+                "SmilingWolf WD Tagger v3 с Hugging Face: {}. Другая модель — теги считаются заново, прежняя удаляется с диска.",
+                t.model
+            ),
+        );
+        row(ui, "Свой ONNX Runtime", |ui| {
+            let mut text = t.runtime.display().to_string();
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut text)
+                    .hint_text("пусто — скачанный MH Files")
+                    .desired_width(300.0),
+            );
+            if edit.changed() {
+                t.runtime = std::path::PathBuf::from(text.trim().trim_matches('"'));
+            }
+        });
+        widgets::hint(ui, &format!("Файлы: {}", info.dir.display()));
+    });
+    card(ui, "Показ", |ui| {
+        widgets::hint(
+            ui,
+            "Тег виден, если модель в нём уверена не меньше порога. Ниже — больше тегов, но и ошибок больше. Меняется без пересчёта.",
+        );
+        use mh_files_core::settings::TagSettings;
+        row(ui, "Порог тегов", |ui| {
+            ui.add(egui::Slider::new(&mut t.general, TagSettings::MIN_THRESHOLD..=95).suffix("%"));
+            ui.label(RichText::new("по умолчанию 35%").color(theme::TEXT_SECONDARY));
+        });
+        row(ui, "Порог персонажей", |ui| {
+            ui.add(egui::Slider::new(&mut t.character, 50..=99).suffix("%"));
+            ui.label(RichText::new("по умолчанию 85%").color(theme::TEXT_SECONDARY));
+        });
+        switch_row(
+            ui,
+            "Рейтинг в Инспекторе",
+            Some("Обычный, чувствительный, сомнительный или откровенный — как его видит модель."),
+            &mut t.rating,
+        );
+        row(ui, "Файлы больше", |ui| {
+            ui.add(egui::DragValue::new(&mut t.max_file_mb).range(1..=4096).suffix(" МБ"));
+            ui.label(RichText::new("— без тегов").color(theme::TEXT_SECONDARY));
+        });
+    });
+    action
 }
 
 enum SemanticAction {

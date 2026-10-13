@@ -38,6 +38,11 @@ use eframe::egui::{IconData, ViewportBuilder};
 
 fn main() -> eframe::Result {
     let started = std::time::Instant::now();
+    // Помощник автотегов: модель в этом же exe, но без окна и всего остального.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some(mh_files_fs::tags::HOST_FLAG) {
+        std::process::exit(mh_files_fs::tags::host::main(&args[1..]));
+    }
     let line = mh_files_core::cli::CommandLine::parse(std::env::args().skip(1));
     if line.version {
         println!("MH Files {}", env!("CARGO_PKG_VERSION"));

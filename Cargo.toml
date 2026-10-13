@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/core", "crates/fs", "crates/platform", "crates/ui"]
 
 [workspace.package]
-version = "1.2.4"
+version = "1.3.0"
 edition = "2024"
 license = "MIT"
 # Крейты не публикуются: дистрибутив — один exe.
@@ -41,6 +41,9 @@ zip = { version = "8", default-features = false, features = ["deflate-flate2-zli
 sevenz-rust2 = { version = "0.23", default-features = false, features = ["util", "bzip2", "deflate", "ppmd"] }
 # Хэш для поиска дубликатов; `pure` — без C и ассемблера в сборке.
 blake3 = { version = "1", default-features = false, features = ["std", "pure"] }
+# Автотеги: ONNX Runtime через свою DLL, скачанную по согласию пользователя (`load-dynamic` —
+# в сборке нет ни C++, ни загрузки библиотек). Выпуск-кандидат — версия закреплена точно.
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "load-dynamic"] }
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 raw-window-handle = "0.6"
 windows = "0.62"
