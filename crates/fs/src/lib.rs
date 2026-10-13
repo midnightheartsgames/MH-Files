@@ -43,7 +43,7 @@ pub mod watch;
 pub mod zip_write;
 
 pub use duplicates::{DuplicateOptions, DuplicateProgress, LinkReport};
-pub use images::{ImageKey, ImageKind, ImageResult};
+pub use images::{Frame, ImageKey, ImageKind, ImageResult};
 pub use indexer::{IndexResults, IndexStatus, Indexer, VolumeState, VolumeStatus};
 pub use preview::{Preview, PreviewRequest};
 pub use search::SearchQuery;

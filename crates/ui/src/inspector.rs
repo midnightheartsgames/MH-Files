@@ -37,6 +37,8 @@ pub struct State {
     handler_rect: Option<(PathBuf, egui::Rect)>,
     /// Размер выбранной папки считается сам: какой папки и как отменить.
     sizing: Option<(PathBuf, CancelToken)>,
+    /// Кадр анимации (GIF) и когда следующий.
+    playback: preview_ui::Playback,
 }
 
 impl State {
@@ -59,6 +61,7 @@ impl State {
         }
         self.texture = preview_ui::texture_of(ctx, &preview, "inspector");
         self.preview = Some(preview);
+        self.playback = preview_ui::Playback::default();
         self.cancel = None;
     }
 }
@@ -179,6 +182,7 @@ fn request(app: &mut FilesApp) {
         text_limit: app.settings.preview.text_limit_kb as usize * 1024,
         image_limit: u64::from(app.settings.preview.image_limit_mb) * 1024 * 1024,
         page: state.page,
+        animate: true,
     };
     let ticket = Ticket { owner: OWNER_INSPECTOR, generation: state.generation };
     state.cancel = Some(app.workers.preview(ticket, request));
@@ -270,6 +274,8 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
     let handler = wants_handler(app, &path, is_dir);
     ScrollArea::vertical().id_salt("inspector").auto_shrink([false, false]).show(ui, |ui| {
         let max = (ui.available_height() * 0.5).clamp(160.0, 420.0);
+        let state = &mut app.inspector;
+        state.playback.tick(ui.ctx(), state.preview.as_ref(), state.texture.as_mut());
         if handler {
             // Место под окно обработчика: оно встанет сюда после кадра.
             let (rect, _) =

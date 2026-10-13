@@ -21,6 +21,8 @@ pub struct State {
     texture: Option<TextureHandle>,
     /// Страница PDF.
     page: u32,
+    /// Кадр анимации (GIF) и когда следующий; Enter — пауза.
+    playback: preview_ui::Playback,
     /// Видео или звук: проигрыватель создаётся в первом кадре (ему нужен контекст окна).
     wants_player: bool,
     player: Option<mh_files_platform::player::Player>,
@@ -43,6 +45,7 @@ impl State {
             preview: None,
             texture: None,
             page: 0,
+            playback: preview_ui::Playback::default(),
             wants_player: false,
             player: None,
             frame: None,
@@ -73,6 +76,7 @@ impl State {
         self.path = Some(path.clone());
         self.preview = None;
         self.texture = None;
+        self.playback = preview_ui::Playback::default();
         let is_dir = tab.entry(&path).is_some_and(Entry::is_dir);
         self.player = None;
         self.frame = None;
@@ -91,6 +95,7 @@ impl State {
             text_limit: app.settings.preview.text_limit_kb as usize * 1024 * 4,
             image_limit: u64::from(app.settings.preview.image_limit_mb) * 1024 * 1024,
             page: self.page,
+            animate: true,
         };
         let ticket = Ticket { owner: OWNER_QUICK, generation: self.generation };
         self.cancel = Some(app.workers.preview(ticket, request));
@@ -108,6 +113,7 @@ impl State {
         }
         self.texture = preview_ui::texture_of(ctx, &preview, "quick");
         self.preview = Some(preview);
+        self.playback = preview_ui::Playback::default();
     }
 }
 
@@ -194,6 +200,8 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                             tab.listing.len(),
                             if quick.player.is_some() {
                                 "Enter — пауза, Shift+стрелки — перемотка, "
+                            } else if preview_ui::animated(quick.preview.as_ref()) {
+                                "Enter — пауза, "
                             } else {
                                 ""
                             }
@@ -213,6 +221,7 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
                     ui.label(RichText::new(error).color(theme::TEXT_DISABLED));
                     ui.add_space(6.0);
                 }
+                quick.playback.tick(ui.ctx(), quick.preview.as_ref(), quick.texture.as_mut());
                 turn = preview_ui::show(
                     ui,
                     quick.preview.as_ref(),
@@ -248,6 +257,13 @@ pub fn show(ctx: &egui::Context, app: &mut FilesApp) {
         if save {
             app.save_settings();
         }
+    }
+    // GIF: Enter — пауза.
+    if quick.player.is_none()
+        && preview_ui::animated(quick.preview.as_ref())
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter))
+    {
+        quick.playback.paused = !quick.playback.paused;
     }
     // Enter — пауза, Shift+стрелки — на 5 секунд назад и вперёд.
     if let Some(player) = &quick.player {

@@ -118,7 +118,7 @@ pub fn preview(data: Vec<u8>, max_side: u32, languages: &[String]) -> Result<Pre
     if !missing.is_empty() {
         info.push(("Нет букв".into(), missing.join(", ")));
     }
-    Ok(Preview::Image { bitmap, dimensions: None, pages: None, info })
+    Ok(Preview::Image { bitmap, dimensions: None, pages: None, info, animation: Vec::new() })
 }
 
 /// «Обычный», «Полужирный курсив» и т. п.
