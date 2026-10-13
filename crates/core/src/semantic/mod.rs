@@ -8,6 +8,7 @@
 //! ([`model`]). Модель работает в отдельном процессе `llama-server` (llama.cpp) — им
 //! управляет `mh-files-fs`.
 
+pub mod bank;
 pub mod model;
 pub mod store;
 

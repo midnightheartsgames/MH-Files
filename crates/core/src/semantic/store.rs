@@ -64,13 +64,28 @@ pub struct Part {
     pub snippet: String,
     scale: f32,
     vector: Box<[i8]>,
+    /// Сходство с обычными запросами ([`super::bank`]): среднее и разброс. Не хранится на
+    /// диске — считается, когда мерка известна ([`Store::set_bank`]).
+    typical: Option<(f32, f32)>,
 }
 
 impl Part {
     /// Часть с вектором длины [`DIMS`] (уже нормированным).
     pub fn new(kind: PartKind, number: u16, snippet: String, vector: &[f32]) -> Part {
         let (scale, vector) = quantize(vector);
-        Part { kind, number, snippet, scale, vector }
+        Part { kind, number, snippet, scale, vector, typical: None }
+    }
+
+    fn measure(&mut self, bank: &[Vec<f32>]) {
+        self.typical = (!bank.is_empty()).then(|| {
+            let mut stats = Stats::default();
+            for query in bank {
+                stats.add(self.score(query));
+            }
+            let mean = stats.mean();
+            let variance = (stats.squares / stats.n - mean * mean).max(0.0);
+            (mean as f32, (variance.sqrt() as f32).max(MIN_TYPICAL_SPREAD))
+        });
     }
 
     /// Близость к запросу (косинус: оба вектора длины 1).
@@ -133,19 +148,22 @@ impl Hit {
 }
 
 /// Сырое сходство у модели не говорит, «похоже» это или нет: у EmbeddingGemma 2 любой запрос
-/// похож на любой файл на 0,5–0,7, а текст с текстом сходится сильнее, чем текст с картинкой.
-/// Поэтому часть оценивается тем, насколько она выделяется: из сходства вычитается среднее её
-/// вида (тексты, картинки, звук), и разница делится на общий для всех видов разброс. Разброс
-/// у каждого вида свой давал бы «узким» видам лишний вес: так раньше выделялись имена файлов,
-/// похожие друг на друга. Показывается только выделяющееся не меньше чем на `min_rank`
-/// отклонений (настройка «Отбор»; по умолчанию — столько).
-pub const MIN_RANK: f32 = 2.0;
+/// похож на любой файл на 0,5–0,7. Поэтому часть оценивается тем, насколько запрос подходит
+/// ей лучше обычных запросов ([`super::bank`]): (сходство − среднее) / разброс. Показывается
+/// только подходящее не меньше чем на `min_rank` отклонений (настройка «Отбор»; по умолчанию —
+/// столько).
+pub const MIN_RANK: f32 = 3.0;
+/// Разброс сходства части с обычными запросами — не меньше этого (у настоящих частей —
+/// 0,02–0,03).
+const MIN_TYPICAL_SPREAD: f32 = 0.01;
 /// Вес совпадения слов запроса со словами имени файла (и его папки), рядом с выделением по
 /// смыслу: имя, где есть все слова, прибавляет столько. Файл, в имени которого хотя бы
 /// половина слов запроса, виден при любом отборе.
 pub const WORD_WEIGHT: f32 = 2.0;
-/// Разброс считается не меньше этого: в индексе из похожих файлов любое отличие в сотых
-/// «выделялось» бы на много отклонений.
+/// Пока мерки нет (модель только запускается), часть оценивается выделением среди частей
+/// своего вида (тексты, картинки, звук): сходство минус среднее вида, делённое на общий
+/// разброс, — так, как ищет DigUp. Разброс считается не меньше этого: в индексе из похожих
+/// файлов любое отличие в сотых «выделялось» бы на много отклонений.
 const MIN_SPREAD: f32 = 0.02;
 /// В виде частей меньше — его среднее берётся по всем частям; всего меньше — порог не
 /// применяется (индекс слишком мал для статистики), только порядок.
@@ -232,11 +250,13 @@ pub struct Store {
     /// Чем считались векторы: файл модели, подсказки, длина. Другая модель — другой индекс.
     pub model: String,
     docs: HashMap<PathBuf, Doc>,
+    /// Векторы обычных запросов ([`super::bank`]); пусто — мерка ещё не посчитана.
+    bank: Vec<Vec<f32>>,
 }
 
 impl Store {
     pub fn new(model: &str) -> Store {
-        Store { model: model.to_string(), docs: HashMap::new() }
+        Store { model: model.to_string(), docs: HashMap::new(), bank: Vec::new() }
     }
 
     /// Файлов.
@@ -262,8 +282,37 @@ impl Store {
         self.docs.get(path).is_some_and(|d| d.size == size && d.modified == modified)
     }
 
-    pub fn insert(&mut self, path: PathBuf, doc: Doc) {
+    pub fn insert(&mut self, path: PathBuf, mut doc: Doc) {
+        for part in &mut doc.parts {
+            part.measure(&self.bank);
+        }
         self.docs.insert(path, doc);
+    }
+
+    /// Мерка посчитана ([`Self::set_bank`]).
+    pub fn has_bank(&self) -> bool {
+        !self.bank.is_empty()
+    }
+
+    /// Векторы обычных запросов: по ним меряется каждая часть (по потокам — частей бывают
+    /// сотни тысяч).
+    pub fn set_bank(&mut self, bank: Vec<Vec<f32>>) {
+        self.bank = bank;
+        let bank = &self.bank;
+        let mut docs: Vec<&mut Doc> = self.docs.values_mut().collect();
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+        let per = docs.len().div_ceil(threads).max(256);
+        std::thread::scope(|scope| {
+            for slice in docs.chunks_mut(per) {
+                scope.spawn(move || {
+                    for doc in slice {
+                        for part in &mut doc.parts {
+                            part.measure(bank);
+                        }
+                    }
+                });
+            }
+        });
     }
 
     pub fn remove(&mut self, path: &Path) -> bool {
@@ -342,10 +391,16 @@ impl Store {
         let scores = chunks.into_iter().flat_map(|(scores, _)| scores);
         for ((path, doc), scores) in docs.iter().zip(scores) {
             let best = doc.parts.iter().zip(&scores).filter_map(|(part, &score)| {
-                modality(part.kind).map(|m| (part, score, scale.rank(m, score)))
+                let rank = match part.typical {
+                    Some((mean, spread)) => (score - mean) / spread,
+                    None => scale.rank(modality(part.kind)?, score),
+                };
+                modality(part.kind).map(|_| (part, score, rank))
             });
             let best = best.max_by(|a, b| a.2.total_cmp(&b.2));
             let meaning = best.map_or(f32::NEG_INFINITY, |(_, _, rank)| rank);
+            // Без мерки и статистики (крошечный индекс) — только порядок.
+            let enough = enough || best.is_some_and(|(part, _, _)| part.typical.is_some());
             let coverage = if words.is_empty() {
                 0.0
             } else {
@@ -459,7 +514,7 @@ impl Store {
                     reader.take(DIMS).ok_or_else(broken)?.iter().map(|&b| b as i8).collect();
                 // Векторы имён из индексов 1.2.0–1.2.3 при поиске не нужны.
                 if kind != PartKind::Name {
-                    parts.push(Part { kind, number, snippet, scale, vector });
+                    parts.push(Part { kind, number, snippet, scale, vector, typical: None });
                 }
             }
             docs.insert(path, Doc { size, modified, parts });
@@ -467,7 +522,7 @@ impl Store {
         if reader.at != payload.len() {
             return Err(broken());
         }
-        Ok(Store { model, docs })
+        Ok(Store { model, docs, bank: Vec::new() })
     }
 }
 
@@ -517,8 +572,9 @@ mod tests {
         at(1.0, 1)
     }
 
-    /// Фон: по 60 имён (сходство около 0,3 — как у модели с любым именем), текстов (около
-    /// 0,45) и картинок (около 0,2: текст с картинкой сходится слабее), плюс три файла.
+    /// Фон: по 60 имён (векторы из индексов 1.2.0–1.2.3: при поиске не учитываются), текстов
+    /// (около 0,45) и картинок (около 0,2: текст с картинкой сходится слабее), плюс три файла.
+    /// Мерки нет — оценка по выделению среди своего вида.
     fn sample() -> Store {
         let mut store = Store::new("model|v1");
         for i in 0..60 {
@@ -619,18 +675,69 @@ mod tests {
     }
 
     #[test]
-    fn name_match_lifts_a_file() {
+    fn words_of_the_name_find_a_file() {
         let mut store = sample();
-        store.insert(
-            "/bg/кошка.lnk".into(),
-            doc(vec![Part::new(PartKind::Name, 0, String::new(), &at(0.29, 400))]),
-        );
+        store.insert("/bg/Кошки на даче.lnk".into(), doc(Vec::new()));
+        store.insert("/bg/Ночной кошмар.png".into(), doc(Vec::new()));
         let plain = store.search(&query(), &[], MIN_RANK, 300, |_| true);
-        assert!(plain.iter().all(|h| h.path != Path::new("/bg/кошка.lnk")));
-        let words = ["кошка".to_string()];
-        let lifted = store.search(&query(), &words, 4.0, 300, |_| true);
-        // Даже при строгом отборе: имя с самими словами запроса видно всегда.
-        assert!(lifted.iter().any(|h| h.path == Path::new("/bg/кошка.lnk")), "{lifted:?}");
+        assert!(plain.iter().all(|h| !h.path.starts_with("/bg")));
+        let words = super::super::query_words("кошка на диване");
+        let found = store.search(&query(), &words, 100.0, 300, |_| true);
+        // Половина слов в имени — виден при любом отборе; «кошмар» — не «кошка».
+        let names: Vec<_> = found.iter().map(|h| h.path.to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["/bg/Кошки на даче.lnk"]);
+        assert_eq!(found[0].reason(), "по имени");
+        // Найденное по смыслу и по имени — выше такой же картинки, найденной только по смыслу.
+        store.insert(
+            "/photos/кошка.jpg".into(),
+            doc(vec![Part::new(PartKind::Image, 0, String::new(), &at(0.32, 401))]),
+        );
+        let hits = store.search(&query(), &words, MIN_RANK, 300, |_| true);
+        let place = |p: &str| hits.iter().position(|h| h.path == Path::new(p)).unwrap();
+        assert!(place("/photos/кошка.jpg") < place("/photos/cat.jpg"), "{hits:?}");
+        assert_eq!(hits[place("/photos/кошка.jpg")].kind, PartKind::Image);
+    }
+
+    /// Мерка обычными запросами: картинка, похожая на любой запрос (как скриншот с текстом),
+    /// не находится, хотя сырое сходство у неё выше, чем у настоящей находки.
+    #[test]
+    fn parts_that_match_any_query_are_not_found() {
+        // Общее направление «похоже на всё» — ось 1: в нём и запрос, и обычные запросы.
+        let blend = |axis: usize, weight: f32| {
+            let mut v = vec![0.0; DIMS];
+            v[axis] = 1.0;
+            v[1] = weight;
+            super::super::prepare(&v).unwrap()
+        };
+        let query = blend(0, 1.0);
+        let bank: Vec<Vec<f32>> = (0..40).map(|i| blend(400 + i, 0.8 + 0.01 * i as f32)).collect();
+        let mut store = Store::new("m");
+        for i in 0..30 {
+            let part = Part::new(PartKind::Image, 0, String::new(), &at(0.0, 100 + i));
+            store.insert(PathBuf::from(format!("/bg/{i:02}.jpg")), doc(vec![part]));
+        }
+        let sticky = Part::new(PartKind::Image, 0, String::new(), &blend(300, 3.0));
+        store.insert("/shots/sticky.png".into(), doc(vec![sticky]));
+        let cat = Part::new(PartKind::Image, 0, String::new(), &blend(0, 0.2));
+        store.insert("/photos/cat.jpg".into(), doc(vec![cat]));
+        let sticky_score =
+            store.get(Path::new("/shots/sticky.png")).unwrap().parts[0].score(&query);
+        let cat_score = store.get(Path::new("/photos/cat.jpg")).unwrap().parts[0].score(&query);
+        assert!(sticky_score > 0.6, "{sticky_score}");
+        // Без мерки «липкая» картинка выделяется среди фона так же, как настоящая.
+        let before = store.search(&query, &[], MIN_RANK, 10, |_| true);
+        assert_eq!(before.len(), 2, "{before:?}");
+        store.set_bank(bank.clone());
+        assert!(store.has_bank());
+        let hits = store.search(&query, &[], MIN_RANK, 10, |_| true);
+        let paths: Vec<_> = hits.iter().map(|h| h.path.to_string_lossy().into_owned()).collect();
+        assert_eq!(paths, ["/photos/cat.jpg"]);
+        assert!((hits[0].score - cat_score).abs() < 1e-6);
+        // Добавленное после мерки меряется сразу.
+        let late = Part::new(PartKind::Text, 0, String::new(), &blend(300, 3.0));
+        store.insert("/docs/late.txt".into(), doc(vec![late]));
+        let hits = store.search(&query, &[], MIN_RANK, 10, |_| true);
+        assert_eq!(hits.len(), 1, "{hits:?}");
     }
 
     #[test]
@@ -677,6 +784,9 @@ mod tests {
         let loaded = Store::read(&bytes).unwrap();
         assert_eq!(loaded.model, "model|v1");
         assert_eq!(loaded.len(), store.len());
+        // Векторы имён из старых индексов при чтении отбрасываются.
+        assert!(loaded.get(Path::new("/bg/name01.lnk")).unwrap().parts.is_empty());
+        assert_eq!(loaded.get(Path::new("/photos/cat.jpg")).unwrap().parts.len(), 1);
         assert_eq!(
             loaded.get(Path::new("/docs/lease.docx")),
             store.get(Path::new("/docs/lease.docx"))

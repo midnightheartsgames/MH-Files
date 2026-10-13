@@ -517,6 +517,15 @@ fn activate(
         *shared.store.write() = store;
         *loaded_model = Some(id);
     }
+    if !shared.store.read().has_bank() {
+        match bank(shared, &model_files::model_id(&file)) {
+            Ok(bank) => shared.store.write().set_bank(bank),
+            Err(error) => {
+                shared.set_state(SemanticState::Failed(error));
+                return (None, false);
+            }
+        }
+    }
     {
         let store = shared.store.read();
         let (files, parts) = (store.len(), store.parts());
@@ -745,6 +754,25 @@ fn flush(
         store.insert(path, Doc { size, modified, parts });
     }
     Ok(())
+}
+
+/// Векторы обычных запросов ([`semantic_model::bank`]) — из `bank.bin` или от модели (две
+/// сотни коротких текстов: секунды на процессоре).
+fn bank(shared: &Shared, model: &str) -> Result<Vec<Vec<f32>>, String> {
+    use semantic_model::bank;
+    let key = format!("{model}|{:016x}", bank::fingerprint());
+    let path = shared.dir.join("bank.bin");
+    if let Some(vectors) = std::fs::read(&path).ok().and_then(|bytes| bank::read(&bytes, &key)) {
+        return Ok(vectors);
+    }
+    let mut vectors = Vec::with_capacity(bank::QUERIES.len());
+    for chunk in bank::QUERIES.chunks(BATCH_INPUTS) {
+        let inputs: Vec<Input> =
+            chunk.iter().map(|q| Input::Text(semantic_model::query_prompt(q))).collect();
+        vectors.extend(shared.embed(&inputs).map_err(|e| e.to_string())?);
+    }
+    let _ = std::fs::write(&path, bank::write(&key, &vectors));
+    Ok(vectors)
 }
 
 /// Поиск: вектор запроса, близкие файлы, их свежие записи с диска.
