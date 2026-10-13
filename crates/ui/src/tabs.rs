@@ -390,7 +390,7 @@ impl Tab {
                 self.recycled = Some(HashMap::new());
                 self.cancel = Some(workers.list_recycle_bin(ticket));
             }
-            Location::Index { query } | Location::Semantic { query } => {
+            Location::Index { query } | Location::Semantic { query } | Location::Tags { query } => {
                 // Сам поиск запускает окно в конце кадра: у вкладки нет доступа к индексу.
                 self.watch = None;
                 self.staging = None;
@@ -511,6 +511,7 @@ impl Tab {
         }
         let location = match self.location {
             Location::Semantic { .. } => Location::Semantic { query },
+            Location::Tags { .. } => Location::Tags { query },
             _ => Location::Index { query },
         };
         if self.location != location {
@@ -528,12 +529,16 @@ impl Tab {
         &mut self,
         indexer: &Indexer,
         semantic: &Semantic,
+        tagger: &mh_files_fs::Tagger,
         show_hidden: bool,
     ) {
-        let (Location::Index { query } | Location::Semantic { query }) = &self.location else {
+        let (Location::Index { query } | Location::Semantic { query } | Location::Tags { query }) =
+            &self.location
+        else {
             return;
         };
         let meaning = matches!(self.location, Location::Semantic { .. });
+        let tags = matches!(self.location, Location::Tags { .. });
         let Some(view) = &mut self.index else { return };
         if !view.pending {
             return;
@@ -548,7 +553,9 @@ impl Tab {
         }
         self.generation += 1;
         let ticket = self.ticket();
-        self.cancel = Some(if meaning {
+        self.cancel = Some(if tags {
+            tagger.search(ticket, query)
+        } else if meaning {
             semantic.search(ticket, query)
         } else {
             indexer.search(ticket, query, show_hidden)
@@ -836,13 +843,16 @@ impl Tab {
 fn ranked(location: &Location) -> bool {
     matches!(
         location,
-        Location::Index { .. } | Location::Semantic { .. } | Location::Duplicates { .. }
+        Location::Index { .. }
+            | Location::Semantic { .. }
+            | Location::Tags { .. }
+            | Location::Duplicates { .. }
     )
 }
 
-/// Поиск по дискам или по смыслу: поле запроса во вкладке.
+/// Поиск по дискам, по смыслу или по тегам: поле запроса во вкладке.
 pub fn everywhere(location: &Location) -> bool {
-    matches!(location, Location::Index { .. } | Location::Semantic { .. })
+    matches!(location, Location::Index { .. } | Location::Semantic { .. } | Location::Tags { .. })
 }
 
 fn options_for(location: &Location, mut options: ViewOptions) -> ViewOptions {

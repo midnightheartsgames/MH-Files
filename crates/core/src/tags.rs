@@ -359,6 +359,216 @@ pub fn input_side(shape: &[i64]) -> Result<usize, String> {
     }
 }
 
+/// Рейтинги модели: имя в словаре и подпись на плашке.
+pub const RATINGS: [(&str, &str); 4] = [
+    ("general", "Обычный"),
+    ("sensitive", "Чувствительный"),
+    ("questionable", "Сомнительный"),
+    ("explicit", "18+"),
+];
+
+/// Имя рейтинга из запроса: `explicit`, `18+`, `обычный`… `None` — не рейтинг.
+fn rating_name(word: &str) -> Option<&'static str> {
+    let word = word.trim().to_lowercase();
+    let found = match word.as_str() {
+        "general" | "обычный" | "g" => "general",
+        "sensitive" | "чувствительный" | "s" => "sensitive",
+        "questionable" | "сомнительный" | "q" => "questionable",
+        "explicit" | "откровенный" | "18+" | "e" => "explicit",
+        _ => return None,
+    };
+    Some(found)
+}
+
+/// Тег в запросе — как имя тега для показа: `long_hair` → `long hair`, без регистра.
+fn tag_pattern(word: &str) -> String {
+    display_name(word.trim()).to_lowercase()
+}
+
+/// Слова запроса; `"long hair"` в кавычках — одно слово.
+fn query_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    for c in text.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            c => word.push(c),
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// Запрос по тегам: какие теги нужны, каких быть не должно, какие рейтинги показывать.
+///
+/// * `tag:cat` — нужен тег `cat`; `-tag:dog` — без тега `dog`; `long_hair` или `"long hair"` —
+///   тег с пробелом; `*hair` — маска по имени тега;
+/// * `rating:explicit` — только этот рейтинг, `-rating:18+` — без него (рейтинги: `general`,
+///   `sensitive`, `questionable`, `explicit` или по-русски);
+/// * в поиске по тегам и голые слова — теги (`cat outdoors -dog`), в фильтре папки они
+///   остаются словами имени.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TagQuery {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    /// Только эти рейтинги (пусто — любые).
+    pub only_ratings: Vec<&'static str>,
+    pub hide_ratings: Vec<&'static str>,
+}
+
+impl TagQuery {
+    /// Разобрать запрос. `bare` — голые слова тоже теги. Возвращает запрос по тегам и
+    /// остаток текста — то, что к тегам не относится.
+    pub fn parse(text: &str, bare: bool) -> (TagQuery, String) {
+        let mut query = TagQuery::default();
+        let mut rest = Vec::new();
+        for word in query_words(text) {
+            let (negative, body) = match word.strip_prefix('-') {
+                Some(body) if !body.is_empty() => (true, body),
+                _ => (false, word.as_str()),
+            };
+            let lower = body.to_lowercase();
+            if let Some(value) = lower.strip_prefix("rating:") {
+                let ratings = value.split(',').filter_map(rating_name);
+                if negative {
+                    query.hide_ratings.extend(ratings);
+                } else {
+                    query.only_ratings.extend(ratings);
+                }
+                continue;
+            }
+            let tag = match lower.strip_prefix("tag:") {
+                Some(tag) => tag.to_string(),
+                None if bare => lower,
+                None => {
+                    rest.push(if word.contains(char::is_whitespace) {
+                        format!("\"{word}\"")
+                    } else {
+                        word
+                    });
+                    continue;
+                }
+            };
+            if tag.is_empty() {
+                continue;
+            }
+            let pattern = tag_pattern(&tag);
+            if negative { query.exclude.push(pattern) } else { query.include.push(pattern) }
+        }
+        query.only_ratings.dedup();
+        query.hide_ratings.dedup();
+        (query, rest.join(" "))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.include.is_empty()
+            && self.exclude.is_empty()
+            && self.only_ratings.is_empty()
+            && self.hide_ratings.is_empty()
+    }
+
+    /// Есть что искать: нужные теги или рейтинги (одни исключения — это всё подряд).
+    pub fn selects(&self) -> bool {
+        !self.include.is_empty() || !self.only_ratings.is_empty()
+    }
+
+    /// Подходит ли файл. `None` — тегов у файла нет (не картинка или ещё не посчитаны): такой
+    /// не подходит, если нужен тег или рейтинг, и не мешает исключениям.
+    pub fn matches(&self, shown: Option<&Shown>) -> bool {
+        let Some(shown) = shown else {
+            return self.include.is_empty() && self.only_ratings.is_empty();
+        };
+        let has = |pattern: &String| {
+            shown.tags.iter().any(|tag| {
+                let name = tag.name.to_lowercase();
+                if pattern.contains(['*', '?']) {
+                    let pattern: Vec<char> = pattern.chars().collect();
+                    let name: Vec<char> = name.chars().collect();
+                    crate::filter::glob_match(&pattern, &name)
+                } else {
+                    name == *pattern
+                }
+            })
+        };
+        let rating = shown.rating.as_ref().map(|r| r.name.as_str());
+        self.include.iter().all(has)
+            && !self.exclude.iter().any(has)
+            && (self.only_ratings.is_empty()
+                || rating.is_some_and(|r| self.only_ratings.contains(&r)))
+            && !rating.is_some_and(|r| self.hide_ratings.contains(&r))
+    }
+}
+
+impl TagQuery {
+    /// Насколько файл подходит: сумма уверенности нужных тегов — для порядка выдачи.
+    pub fn score(&self, shown: &Shown) -> f32 {
+        self.include
+            .iter()
+            .map(|pattern| {
+                shown
+                    .tags
+                    .iter()
+                    .filter(|tag| {
+                        let name = tag.name.to_lowercase();
+                        if pattern.contains(['*', '?']) {
+                            let p: Vec<char> = pattern.chars().collect();
+                            crate::filter::glob_match(&p, &name.chars().collect::<Vec<_>>())
+                        } else {
+                            name == *pattern
+                        }
+                    })
+                    .map(|tag| tag.score)
+                    .fold(0.0, f32::max)
+            })
+            .sum()
+    }
+}
+
+/// Тег для запроса: `long hair` → `long_hair` (без пробелов — одно слово).
+pub fn query_token(name: &str) -> String {
+    name.trim().replace(' ', "_")
+}
+
+/// Скрыт ли рейтинг в запросе (`-rating:…`).
+pub fn rating_hidden(text: &str, rating: &str) -> bool {
+    TagQuery::parse(text, false).0.hide_ratings.contains(&rating)
+}
+
+/// Скрыть рейтинг в запросе или вернуть: `-rating:explicit` дописывается или убирается.
+pub fn toggle_rating(text: &str, rating: &str) -> String {
+    let token = format!("-rating:{rating}");
+    if rating_hidden(text, rating) {
+        // Убрать все слова, которые прячут этот рейтинг (в любом написании).
+        query_words(text)
+            .into_iter()
+            .filter(|word| {
+                let lower = word.to_lowercase();
+                !lower
+                    .strip_prefix("-rating:")
+                    .is_some_and(|v| v.split(',').filter_map(rating_name).any(|r| r == rating))
+            })
+            .map(
+                |word| {
+                    if word.contains(char::is_whitespace) { format!("\"{word}\"") } else { word }
+                },
+            )
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else if text.trim().is_empty() {
+        token
+    } else {
+        format!("{} {token}", text.trim_end())
+    }
+}
+
 const MAGIC: &[u8; 8] = b"MHFTAGS\n";
 const VERSION: u32 = 1;
 
@@ -407,6 +617,10 @@ impl TagStore {
 
     pub fn clear(&mut self) {
         self.records.clear();
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&PathBuf, &Record)> {
+        self.records.iter()
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -576,6 +790,44 @@ mod tests {
         assert!(TagStore::read(&bad).is_err());
         assert!(TagStore::read(b"nonsense").is_err());
         assert_eq!(store.write(), bytes, "одинаковые теги — одинаковый файл");
+    }
+
+    #[test]
+    fn tag_queries() {
+        let v = vocabulary();
+        let tags =
+            FileTags::from_scores(&[0.9, 0.0, 0.0, 0.1, 0.99, 0.5, 0.1, 0.3, 0.97], &v).unwrap();
+        let shown = show(&tags, &v, Thresholds { general: 0.25, character: 0.85 });
+        let found = |text: &str, bare: bool| TagQuery::parse(text, bare).0.matches(Some(&shown));
+        assert!(found("1girl long_hair", true));
+        assert!(found("\"long hair\" -tag:dog", true));
+        assert!(found("tag:*hair", false), "маска");
+        assert!(!found("1girl -cat", true), "исключённый тег есть");
+        assert!(!found("dog", true));
+        assert!(found("POWER_(chainsaw_man)", true), "персонажи — тоже теги");
+        assert!(found("rating:general", true) && !found("rating:explicit", true));
+        assert!(found("-rating:18+", true) && !found("-rating:обычный", true));
+        // Фильтр папки: голые слова — имя, теги — только с `tag:`.
+        let (query, rest) = TagQuery::parse("отпуск tag:cat -rating:explicit *.jpg", false);
+        assert_eq!(rest, "отпуск *.jpg");
+        assert_eq!(query.include, vec!["cat"]);
+        assert_eq!(query.hide_ratings, vec!["explicit"]);
+        assert!(query.selects());
+        // Без тегов: исключения не мешают, нужные теги — не найдены.
+        assert!(TagQuery::parse("-rating:explicit -tag:dog", false).0.matches(None));
+        assert!(!TagQuery::parse("tag:cat", false).0.matches(None));
+        assert!(!TagQuery::parse("cat", false).0.selects());
+        assert_eq!(query_token("long hair"), "long_hair");
+    }
+
+    #[test]
+    fn rating_toggles() {
+        let hidden = toggle_rating("cat", "explicit");
+        assert_eq!(hidden, "cat -rating:explicit");
+        assert!(rating_hidden(&hidden, "explicit") && !rating_hidden(&hidden, "general"));
+        assert_eq!(toggle_rating(&hidden, "explicit"), "cat");
+        assert_eq!(toggle_rating("-rating:18+ \"long hair\"", "explicit"), "\"long hair\"");
+        assert_eq!(toggle_rating("", "questionable"), "-rating:questionable");
     }
 
     #[test]

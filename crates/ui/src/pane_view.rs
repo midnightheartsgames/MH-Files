@@ -169,6 +169,7 @@ fn tab_strip(ui: &mut Ui, pane: &mut Pane, app: &mut FilesApp, focused: bool) {
             Location::Search { .. } => icons::search(&painter, icon, theme::TEXT_SECONDARY),
             Location::Index { .. } => icons::search(&painter, icon, theme::accent()),
             Location::Semantic { .. } => icons::sparkle(&painter, icon, theme::accent()),
+            Location::Tags { .. } => icons::tag(&painter, icon, theme::accent()),
             Location::Archive { .. } => icons::archive(&painter, icon, theme::accent()),
             Location::Duplicates { .. } => icons::duplicates(&painter, icon, theme::accent()),
             Location::Sort { .. } => icons::sort(&painter, icon, theme::accent()),
@@ -553,18 +554,56 @@ fn filter_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     ui.add_space(22.0);
     let id = Id::new(("filter", tab.id));
     let mut text = tab.filter.clone();
+    let tags = app.settings.tags.enabled;
+    let (hint, reserve) = if tags {
+        ("Фильтр: слова, маска *.png, теги tag:cat -tag:dog", 260.0)
+    } else {
+        ("Фильтр: слова в любом порядке или маска *.png", 160.0)
+    };
     let response = ui.add(
         egui::TextEdit::singleline(&mut text)
             .id(id)
-            .desired_width((ui.available_width() - 160.0).max(100.0))
-            .hint_text("Фильтр: слова в любом порядке или маска *.png")
+            .desired_width((ui.available_width() - reserve).max(100.0))
+            .hint_text(hint)
             .margin(egui::Margin::symmetric(6, 3)),
     );
     if std::mem::take(&mut tab.focus_filter) {
         response.request_focus();
     }
     if response.changed() {
-        tab.set_filter(text);
+        tab.set_filter(text.clone());
+    }
+    // Рейтинг автотегов: какие показывать в папке (`-rating:…` в тексте фильтра).
+    if tags {
+        let hidden = mh_files_core::tags::RATINGS
+            .iter()
+            .filter(|(name, _)| mh_files_core::tags::rating_hidden(&text, name))
+            .count();
+        let title = if hidden > 0 {
+            format!("Рейтинг · скрыто {hidden}")
+        } else {
+            "Рейтинг".into()
+        };
+        let mut changed = None;
+        ui.menu_button(title, |ui| {
+            for (name, label) in mh_files_core::tags::RATINGS {
+                let mut shown = !mh_files_core::tags::rating_hidden(&text, name);
+                if ui.checkbox(&mut shown, label).changed() {
+                    changed = Some(mh_files_core::tags::toggle_rating(&text, name));
+                }
+            }
+            ui.separator();
+            ui.label(
+                RichText::new("Файлы без посчитанных тегов не скрываются")
+                    .font(theme::regular(12.0))
+                    .color(theme::TEXT_DISABLED),
+            );
+        })
+        .response
+        .on_hover_text("Скрыть в папке картинки по рейтингу автотегов: 18+, сомнительные…");
+        if let Some(text) = changed {
+            tab.set_filter(text);
+        }
     }
     if response.has_focus() {
         let (down, up, enter, escape) = ui.input(|i| {
@@ -655,16 +694,17 @@ fn search_header(
     widgets::category_chips(&mut row, category, !content)
 }
 
-/// Поле поиска по дискам или по смыслу и итог: сколько найдено, за сколько, в каком
-/// состоянии индекс.
+/// Поле поиска по дискам, по смыслу или по тегам и итог: сколько найдено, за сколько, в
+/// каком состоянии индекс.
 fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     let meaning = matches!(tab.location, Location::Semantic { .. });
+    let by_tags = matches!(tab.location, Location::Tags { .. });
     let Some(view) = &mut tab.index else { return };
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 90.0), Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::ZERO, theme::WINDOW_BACKGROUND);
     let field = Rect::from_min_size(
         rect.min + vec2(10.0, 6.0),
-        vec2((rect.width() - 345.0).max(160.0), 30.0),
+        vec2((rect.width() - 425.0).max(160.0), 30.0),
     );
     ui.painter().rect_filled(field, CornerRadius::same(5), theme::CARD);
     ui.painter().rect_stroke(
@@ -675,14 +715,18 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     );
     let icon =
         Rect::from_center_size(pos2(field.left() + 15.0, field.center().y), vec2(14.0, 14.0));
-    if meaning {
+    if by_tags {
+        icons::tag(ui.painter(), icon, theme::accent());
+    } else if meaning {
         icons::sparkle(ui.painter(), icon, theme::accent());
     } else {
         icons::search(ui.painter(), icon, theme::accent());
     }
     let edit_rect = Rect::from_min_max(field.min + vec2(30.0, 0.0), field.max - vec2(8.0, 0.0));
     let mut text = view.text.clone();
-    let hint = if meaning {
+    let hint = if by_tags {
+        "Теги: cat outdoors -dog, long_hair, *hair, rating:general"
+    } else if meaning {
         "Опишите словами: кошка на диване, договор аренды, презентация о продажах"
     } else {
         "Имя, маска или фильтры: ext:pdf size:>10mb dm:неделя kind:видео in:\"C:\\Проекты\""
@@ -700,22 +744,27 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     if std::mem::take(&mut view.focus) {
         edit.request_focus();
     }
-    // Режим: по имени (индекс дисков) или по смыслу (EmbeddingGemma 2).
+    // Режим: по имени (индекс дисков), по смыслу (EmbeddingGemma 2) или по автотегам.
     let modes =
-        Rect::from_min_size(pos2(field.right() + 8.0, field.top() + 4.0), vec2(190.0, 22.0));
+        Rect::from_min_size(pos2(field.right() + 8.0, field.top() + 4.0), vec2(270.0, 22.0));
     let mut mode_row = ui.new_child(
         egui::UiBuilder::new().max_rect(modes).layout(Layout::left_to_right(Align::Center)),
     );
     mode_row.spacing_mut().item_spacing = vec2(4.0, 0.0);
-    let by_name = widgets::chip(&mut mode_row, "По имени", !meaning)
+    let by_name = widgets::chip(&mut mode_row, "По имени", !meaning && !by_tags)
         .on_hover_text("Индекс имён всех дисков — за миллисекунды (Ctrl+E)");
     let by_meaning = widgets::chip(&mut mode_row, "По смыслу", meaning).on_hover_text(
         "EmbeddingGemma 2 на этом компьютере: текст, картинки и звук по описанию (Ctrl+Shift+Space)",
     );
-    let switch = if by_name.clicked() && meaning {
-        Some(Location::Index { query: text.trim().to_string() })
+    let tag_mode = widgets::chip(&mut mode_row, "По тегам", by_tags)
+        .on_hover_text("Автотеги картинок и видео: файлы, у которых теги уже посчитаны");
+    let query = text.trim().to_string();
+    let switch = if by_name.clicked() && (meaning || by_tags) {
+        Some(Location::Index { query })
     } else if by_meaning.clicked() && !meaning {
-        Some(Location::Semantic { query: text.trim().to_string() })
+        Some(Location::Semantic { query })
+    } else if tag_mode.clicked() && !by_tags {
+        Some(Location::Tags { query })
     } else {
         None
     };
@@ -723,14 +772,32 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
     let mut row = ui.new_child(
         egui::UiBuilder::new().max_rect(chips).layout(Layout::left_to_right(Align::Min)),
     );
-    if let Some(picked) = widgets::category_chips(&mut row, category::kind_of(&text), !meaning) {
+    if by_tags {
+        // Рейтинги: выделенные показываются, щелчок прячет или возвращает (`-rating:…`).
+        row.spacing_mut().item_spacing = vec2(4.0, 0.0);
+        for (name, label) in mh_files_core::tags::RATINGS {
+            let shown = !mh_files_core::tags::rating_hidden(&text, name);
+            let hint = if shown {
+                "Скрыть файлы с этим рейтингом"
+            } else {
+                "Показать снова"
+            };
+            if widgets::chip(&mut row, label, shown).on_hover_text(hint).clicked() {
+                text = mh_files_core::tags::toggle_rating(&text, name);
+            }
+        }
+    } else if let Some(picked) =
+        widgets::category_chips(&mut row, category::kind_of(&text), !meaning)
+    {
         text = category::with_kind(&text, picked);
     }
     let leave = edit.has_focus()
         && ui.input(|i| i.key_pressed(egui::Key::Enter) || i.key_pressed(egui::Key::ArrowDown));
     let button_rect =
         Rect::from_min_size(pos2(modes.right() + 8.0, field.top()), vec2(130.0, 30.0));
-    let (label, tip) = if meaning {
+    let (label, tip) = if by_tags {
+        ("Настроить…", "Модель, пороги, видеокарта — «Настройки › Автотеги»")
+    } else if meaning {
         ("Настроить…", "Папки, модель, картинки и звук — «Настройки › Поиск по смыслу»")
     } else {
         ("Сохранить поиск", "В боковую панель, раздел «Поиски»")
@@ -741,14 +808,18 @@ fn index_bar(ui: &mut Ui, tab: &mut Tab, app: &mut FilesApp) {
             .corner_radius(CornerRadius::same(5)),
     );
     if button.on_hover_text(tip).clicked() {
-        if meaning {
+        if by_tags {
+            app.settings_window.open_tags(&app.settings, &app.sorter.config);
+        } else if meaning {
             app.settings_window.open_semantic(&app.settings, &app.sorter.config);
         } else if !text.trim().is_empty() {
             app.actions.push(Action::Run(CommandId::SaveSearch));
         }
     }
 
-    let (line, color) = if meaning {
+    let (line, color) = if by_tags {
+        tags_line(view, &text, tab.listing.len(), app)
+    } else if meaning {
         semantic_line(view, &text, tab.selection.cursor(), tab.listing.len(), app)
     } else {
         index_line(view, &text, tab.listing.len(), app)
@@ -807,6 +878,37 @@ fn index_line(
         }
         (line, if status.busy() { theme::accent() } else { theme::TEXT_SECONDARY })
     }
+}
+
+/// Итог поиска по тегам одной строкой.
+fn tags_line(
+    view: &crate::tabs::IndexView,
+    text: &str,
+    shown: usize,
+    app: &FilesApp,
+) -> (String, Color32) {
+    let status = app.tagger.status();
+    if status.state == mh_files_fs::TagState::Off {
+        return (
+            "Автотеги выключены. «Настроить…» — включить: модель WD Tagger работает на этом компьютере, файлы никуда не отправляются".to_string(),
+            theme::WARN,
+        );
+    }
+    if let Some(error) = &view.error {
+        return (error.clone(), theme::WARN);
+    }
+    let still = status.busy().then(|| format!(" · {} — результаты неполные", status.describe()));
+    if !mh_files_core::tags::TagQuery::parse(text, true).0.selects() {
+        let line = format!(
+            "Теги посчитаны у {} — ищется среди них · впишите теги: cat, long_hair, *hair; -dog — без тега{}",
+            format::items(status.tagged),
+            still.clone().unwrap_or_default()
+        );
+        return (line, theme::TEXT_SECONDARY);
+    }
+    let mut line = format!("Найдено: {} · {} мс", format::count(shown), view.elapsed.as_millis());
+    line.push_str(&still.clone().unwrap_or_default());
+    (line, if still.is_some() { theme::accent() } else { theme::TEXT_SECONDARY })
 }
 
 /// Итог поиска по смыслу одной строкой; у объекта под курсором — почему он найден.
@@ -1087,6 +1189,25 @@ fn list_view(
             LoadState::Failed(error) => Some((error.clone(), theme::CRITICAL)),
             LoadState::Done if tab.listing.has_filter() => {
                 Some(("Ничего не подходит под фильтр".to_string(), theme::TEXT_SECONDARY))
+            }
+            LoadState::Done if matches!(tab.location, Location::Tags { .. }) => {
+                let empty = matches!(&tab.location, Location::Tags { query }
+                    if !mh_files_core::tags::TagQuery::parse(query, true).0.selects());
+                let searching = tab.index.as_ref().is_some_and(|v| v.searching || v.pending);
+                if empty {
+                    Some((
+                        "Поиск по тегам: впишите теги через пробел — cat outdoors; long_hair — тег с пробелом; -dog — без тега"
+                            .to_string(),
+                        theme::TEXT_DISABLED,
+                    ))
+                } else if searching || tab.index.as_ref().is_some_and(|v| v.error.is_some()) {
+                    None
+                } else {
+                    Some((
+                        "Ничего не нашлось среди файлов с посчитанными тегами".to_string(),
+                        theme::TEXT_DISABLED,
+                    ))
+                }
             }
             LoadState::Done if matches!(tab.location, Location::Semantic { .. }) => {
                 let empty = matches!(&tab.location, Location::Semantic { query } if query.trim().is_empty());

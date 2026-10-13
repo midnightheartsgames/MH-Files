@@ -30,6 +30,10 @@ pub enum Location {
     Semantic {
         query: String,
     },
+    /// Поиск по автотегам: `cat outdoors -dog -rating:explicit` (`tags::TagQuery`).
+    Tags {
+        query: String,
+    },
     /// Папка внутри архива: `inner` — путь в архиве через `/`, пусто — корень архива.
     Archive {
         archive: PathBuf,
@@ -57,6 +61,7 @@ pub struct Crumb {
 pub const COMPUTER_TITLE: &str = "Этот компьютер";
 pub const INDEX_TITLE: &str = "Поиск по дискам";
 pub const SEMANTIC_TITLE: &str = "Поиск по смыслу";
+pub const TAGS_TITLE: &str = "Поиск по тегам";
 pub const DUPLICATES_TITLE: &str = "Дубликаты";
 pub const SORT_TITLE: &str = "Разложить";
 pub const RECYCLE_BIN_TITLE: &str = "Корзина";
@@ -78,6 +83,7 @@ impl Location {
             Location::Search { .. }
                 | Location::Index { .. }
                 | Location::Semantic { .. }
+                | Location::Tags { .. }
                 | Location::Duplicates { .. }
                 | Location::RecycleBin
         )
@@ -162,6 +168,8 @@ impl Location {
             Location::Index { query } => format!("Везде: {query}"),
             Location::Semantic { query } if query.is_empty() => SEMANTIC_TITLE.to_string(),
             Location::Semantic { query } => format!("Смысл: {query}"),
+            Location::Tags { query } if query.is_empty() => TAGS_TITLE.to_string(),
+            Location::Tags { query } => format!("Теги: {query}"),
             Location::Archive { archive, inner } => match inner.rsplit('/').find(|p| !p.is_empty())
             {
                 Some(name) => name.to_string(),
@@ -184,7 +192,9 @@ impl Location {
                 Some(path.parent().map_or(Location::Computer, |p| Location::Dir(p.to_path_buf())))
             }
             Location::Search { root, .. } => Some(Location::Dir(root.clone())),
-            Location::Index { .. } | Location::Semantic { .. } => Some(Location::Computer),
+            Location::Index { .. } | Location::Semantic { .. } | Location::Tags { .. } => {
+                Some(Location::Computer)
+            }
             Location::Archive { archive, inner } => {
                 let inner = inner.trim_matches('/');
                 if inner.is_empty() {
@@ -238,6 +248,15 @@ impl Location {
                     INDEX_TITLE.to_string()
                 } else {
                     format!("{INDEX_TITLE} «{query}»")
+                };
+                crumbs.push(Crumb { label, location: self.clone() });
+                return crumbs;
+            }
+            Location::Tags { query } => {
+                let label = if query.is_empty() {
+                    TAGS_TITLE.to_string()
+                } else {
+                    format!("{TAGS_TITLE} «{query}»")
                 };
                 crumbs.push(Crumb { label, location: self.clone() });
                 return crumbs;
@@ -388,6 +407,11 @@ mod tests {
         assert_eq!(meaning.title(), "Смысл: кошка на диване");
         assert_eq!(Location::Semantic { query: String::new() }.title(), SEMANTIC_TITLE);
         assert!(meaning.is_search() && meaning.dir().is_none());
+        let tags = Location::Tags { query: "cat -rating:explicit".into() };
+        let labels: Vec<String> = tags.crumbs().into_iter().map(|c| c.label).collect();
+        assert_eq!(labels, [COMPUTER_TITLE, "Поиск по тегам «cat -rating:explicit»"]);
+        assert_eq!(tags.title(), "Теги: cat -rating:explicit");
+        assert!(tags.is_search() && tags.parent() == Some(Location::Computer));
     }
 
     #[test]

@@ -3,11 +3,15 @@
 //! Правила простые и предсказуемые:
 //! * `*` и `?` — маска по всему имени (`*.png`, `IMG_????.jpg`);
 //! * иначе каждое слово запроса должно встретиться в имени, без учёта регистра и порядка
-//!   (`qwen gguf` находит `Qwen2.5-7B.Q4.gguf`).
+//!   (`qwen gguf` находит `Qwen2.5-7B.Q4.gguf`);
+//! * автотеги: `tag:cat`, `-tag:dog`, `rating:general`, `-rating:18+` ([`TagQuery`]).
+
+use crate::tags::{Shown, TagQuery};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Filter {
     kind: Kind,
+    tags: TagQuery,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -20,7 +24,8 @@ enum Kind {
 
 impl Filter {
     pub fn new(query: &str) -> Filter {
-        let query = query.trim();
+        let (tags, rest) = TagQuery::parse(query, false);
+        let query = rest.trim();
         let kind = if query.is_empty() {
             Kind::All
         } else if query.contains(['*', '?']) {
@@ -28,11 +33,21 @@ impl Filter {
         } else {
             Kind::Words(query.to_lowercase().split_whitespace().map(str::to_string).collect())
         };
-        Filter { kind }
+        Filter { kind, tags }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.kind == Kind::All
+        self.kind == Kind::All && self.tags.is_empty()
+    }
+
+    /// В запросе есть теги или рейтинги: для отбора нужны теги файлов.
+    pub fn needs_tags(&self) -> bool {
+        !self.tags.is_empty()
+    }
+
+    /// Имя и теги файла (`None` — тегов нет или они ещё не посчитаны).
+    pub fn matches_tagged(&self, name: &str, tags: Option<&Shown>) -> bool {
+        self.matches(name) && self.tags.matches(tags)
     }
 
     pub fn matches(&self, name: &str) -> bool {

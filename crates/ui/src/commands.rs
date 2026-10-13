@@ -64,6 +64,7 @@ commands! {
     SearchMeaning => "Поиск по смыслу", ["semantic", "смысл", "ai", "ии", "нейросеть", "embeddinggemma", "похожие", "описание"], ["Ctrl+Shift+Space"];
     SaveSearch => "Сохранить поиск", ["save search", "запомнить"], [];
     Reindex => "Переиндексировать диски", ["reindex", "rescan", "индекс"], [];
+    SearchTags => "Поиск по тегам", ["tags", "теги", "тег", "tag", "автотеги", "danbooru"], [];
     ReindexMeaning => "Пересканировать папки поиска по смыслу", ["semantic reindex", "смысл", "индекс"], [];
     Copy => "Копировать", ["copy"], ["Ctrl+C"];
     Cut => "Вырезать", ["cut"], ["Ctrl+X"];

@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use crate::entry::Entry;
 use crate::filter::Filter;
 use crate::sort::{SortOrder, compare};
+use crate::tags::Shown;
 
 /// Как показывать список. Меняется настройками и щелчками по заголовкам.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,7 +53,22 @@ pub struct Listing {
     index: OnceCell<HashMap<PathBuf, usize>>,
     options: ViewOptions,
     filter: Filter,
+    /// Теги записей для фильтра `tag:` и `rating:` — у кого они есть (автотеги).
+    tag_source: Option<TagSource>,
     pub state: LoadState,
+}
+
+/// Теги записи: посчитанные автотегами или `None`. Только память — зовётся на каждую запись.
+#[derive(Clone)]
+pub struct TagSource(pub std::sync::Arc<TagsOf>);
+
+/// Функция «теги записи» для [`TagSource`].
+pub type TagsOf = dyn Fn(&Entry) -> Option<std::sync::Arc<Shown>> + Send + Sync;
+
+impl std::fmt::Debug for TagSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TagSource")
+    }
 }
 
 /// Итоги для строки состояния.
@@ -124,17 +140,32 @@ impl Listing {
         !self.filter.is_empty()
     }
 
+    /// Фильтр отбирает по тегам: новые теги файлов меняют список.
+    pub fn filters_by_tags(&self) -> bool {
+        self.filter.needs_tags()
+    }
+
+    pub fn set_tag_source(&mut self, source: Option<TagSource>) {
+        self.tag_source = source;
+    }
+
     /// Пересчитывает видимые строки: фильтр, скрытые, сортировка.
     pub fn refresh(&mut self) {
         let options = self.options;
         let filter = &self.filter;
         let entries = &self.entries;
+        let tags = self.tag_source.as_ref().filter(|_| filter.needs_tags());
         self.view = (0..entries.len())
             .filter(|&i| {
                 let entry = &entries[i];
                 (options.show_hidden || !entry.hidden())
                     && (options.show_system || !(entry.attributes.system() && entry.hidden()))
-                    && filter.matches(&entry.name)
+                    && match tags {
+                        Some(source) => {
+                            filter.matches_tagged(&entry.name, (source.0)(entry).as_deref())
+                        }
+                        None => filter.matches_tagged(&entry.name, None),
+                    }
             })
             .collect();
         self.view.sort_by(|&a, &b| {
@@ -284,6 +315,45 @@ mod tests {
         l.set_options(options);
         assert_eq!(names(&l), ["src", "b.txt", "a10.txt", "a2.txt"]);
         assert_eq!(l.totals(), Totals { dirs: 1, files: 3, bytes: 3 });
+    }
+
+    #[test]
+    fn filter_by_tags_and_rating() {
+        use crate::tags::{Tag, TagKind};
+        let mut l = listing(&[
+            ("кот.jpg", EntryKind::File),
+            ("пёс.jpg", EntryKind::File),
+            ("ещё не смотрели.jpg", EntryKind::File),
+            ("заметки.txt", EntryKind::File),
+        ]);
+        let tag = |name: &str, kind| Tag { name: name.into(), kind, score: 0.9 };
+        let shown = |tags: &[&str], rating: &str| Shown {
+            tags: tags.iter().map(|t| tag(t, TagKind::General)).collect(),
+            rating: Some(tag(rating, TagKind::Rating)),
+            line: String::new(),
+        };
+        let cat = std::sync::Arc::new(shown(&["cat", "indoors"], "general"));
+        let dog = std::sync::Arc::new(shown(&["dog"], "explicit"));
+        l.set_tag_source(Some(TagSource(std::sync::Arc::new(move |entry: &Entry| {
+            match entry.name.as_str() {
+                "кот.jpg" => Some(cat.clone()),
+                "пёс.jpg" => Some(dog.clone()),
+                _ => None,
+            }
+        }))));
+        l.set_filter("tag:cat");
+        assert!(l.filters_by_tags());
+        assert_eq!(names(&l), ["кот.jpg"]);
+        l.set_filter("-rating:18+");
+        assert_eq!(
+            names(&l),
+            ["ещё не смотрели.jpg", "заметки.txt", "кот.jpg"],
+            "без тегов — не скрыты"
+        );
+        l.set_filter("jpg -tag:cat");
+        assert_eq!(names(&l), ["ещё не смотрели.jpg", "пёс.jpg"]);
+        l.set_filter("кот");
+        assert!(!l.filters_by_tags());
     }
 
     #[test]

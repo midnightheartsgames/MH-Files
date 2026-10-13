@@ -50,7 +50,7 @@ pub use search::SearchQuery;
 pub use semantic::{Semantic, SemanticResults, SemanticState, SemanticStatus};
 pub use shell::ShellJob;
 pub use sizes::DirSize;
-pub use tags::{Lookup, TagState, TagStatus, Tagger, Want};
+pub use tags::{Lookup, TagResults, TagState, TagStatus, Tagger, Want};
 pub use transfer::{Conflict, Transfer};
 pub use watch::DirWatch;
 
@@ -206,6 +206,11 @@ pub enum Event {
     },
     /// Автотеги: новые теги файлов или смена состояния (скачивание, очередь).
     TagsChanged,
+    /// Итог поиска по тегам.
+    TagResults {
+        ticket: Ticket,
+        result: Result<tags::TagResults, String>,
+    },
     /// Ход извлечения из архива.
     ExtractProgress {
         id: u64,
