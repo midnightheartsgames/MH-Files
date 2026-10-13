@@ -28,6 +28,7 @@ pub mod session;
 pub mod settings;
 pub mod sort;
 pub mod sorting;
+pub mod sound;
 pub mod tags;
 pub mod update;
 

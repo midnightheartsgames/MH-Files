@@ -2,6 +2,7 @@
 
 pub mod clipboard;
 pub mod com;
+pub mod decode;
 pub mod dnd;
 pub mod drives;
 pub mod files;

@@ -6,11 +6,15 @@
 //! видов: обычные (что на картинке), персонажи и рейтинг (один из четырёх, по наибольшей
 //! уверенности). Здесь — словарь, выбор тегов по порогам, вход модели и снимок тегов на
 //! диске; без ввода-вывода.
+//!
+//! С 1.3.3 у файла ещё и звуковые теги ([`crate::sound`]): у аудио и у звуковой дорожки
+//! видео. Их номера в снимке — от [`SOUND_BASE`], видео смотрится по нескольким кадрам.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::index::snapshot::{Reader, fnv};
+use crate::sound::{SOUND_FLOOR, SoundVocabulary};
 
 /// Готовые модели: репозиторий Hugging Face, название, размер. У всех — `model.onnx` и
 /// `selected_tags.csv` одного формата.
@@ -130,6 +134,8 @@ pub enum TagKind {
     Character,
     /// Рейтинг: general, sensitive, questionable, explicit.
     Rating,
+    /// Что слышно: звуковой тег AudioSet.
+    Sound,
 }
 
 impl TagKind {
@@ -231,6 +237,9 @@ impl Vocabulary {
     }
 }
 
+/// Номера звуковых тегов в снимке: `SOUND_BASE + класс`. Тегов картинок меньше.
+pub const SOUND_BASE: u32 = 1 << 24;
+
 /// Уверенность 0..1 байтом: точности в полпроцента для порогов хватает.
 fn quantize(score: f32) -> u8 {
     (score.clamp(0.0, 1.0) * 255.0).round() as u8
@@ -274,10 +283,112 @@ impl FileTags {
         if let Some((index, score)) = rating {
             kept.push((index as u32, quantize(score)));
         }
-        // Самые уверенные первыми: так строка столбца собирается без сортировки.
-        kept.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        Ok(FileTags { scores: kept })
+        let mut tags = FileTags { scores: kept };
+        tags.sort();
+        Ok(tags)
     }
+
+    /// Самые уверенные первыми: так строка столбца собирается без сортировки.
+    fn sort(&mut self) {
+        self.scores.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    }
+
+    /// Звуковые теги вместо прежних: уверенность каждого класса (0..1, см.
+    /// [`crate::sound::combine_clips`]). Пусто — звука нет или он не разобрался.
+    pub fn set_sound(&mut self, scores: &[f32], sounds: &SoundVocabulary) -> Result<(), String> {
+        if !scores.is_empty() && scores.len() != sounds.len() {
+            return Err(format!(
+                "модель звука дала {} оценок, а классов {}",
+                scores.len(),
+                sounds.len()
+            ));
+        }
+        self.scores.retain(|&(index, _)| index < SOUND_BASE);
+        for (index, &score) in scores.iter().enumerate() {
+            if score.is_finite() && score >= SOUND_FLOOR {
+                self.scores.push((SOUND_BASE + index as u32, quantize(score)));
+            }
+        }
+        self.sort();
+        Ok(())
+    }
+
+    /// Теги картинки вместо прежних (звуковые остаются).
+    pub fn set_image(&mut self, image: &FileTags) {
+        self.scores.retain(|&(index, _)| index >= SOUND_BASE);
+        self.scores.extend(image.scores.iter().copied().filter(|&(i, _)| i < SOUND_BASE));
+        self.sort();
+    }
+
+    /// Без звуковых тегов.
+    pub fn without_sound(&self) -> FileTags {
+        FileTags { scores: self.scores.iter().copied().filter(|&(i, _)| i < SOUND_BASE).collect() }
+    }
+}
+
+/// Уверенность тегов видео по кадрам — вход для [`FileTags::from_scores`]. Тег — по самому
+/// уверенному кадру, но если кадров три и больше, он должен быть хотя бы на двух (одиночный
+/// кадр — часто ошибка). Рейтинг — самый строгий из тех, что выиграли на кадрах: один
+/// откровенный кадр делает откровенным всё видео.
+pub fn combine_frames(frames: &[Vec<f32>], vocabulary: &Vocabulary) -> Vec<f32> {
+    let len = vocabulary.len();
+    let frames: Vec<&Vec<f32>> = frames.iter().filter(|f| f.len() == len).collect();
+    let mut out = vec![0.0f32; len];
+    if frames.is_empty() {
+        return out;
+    }
+    let need_two = frames.len() >= 3;
+    let severity = |index: usize| {
+        RATINGS.iter().position(|(name, _)| *name == vocabulary.name(index)).unwrap_or(0)
+    };
+    // Рейтинг: (строгость, номер, уверенность) победителя каждого кадра — берётся строжайший.
+    let mut rating: Option<(usize, usize, f32)> = None;
+    for frame in &frames {
+        let winner = (0..len)
+            .filter(|&i| vocabulary.kind(i) == TagKind::Rating)
+            .max_by(|&a, &b| frame[a].total_cmp(&frame[b]));
+        if let Some(index) = winner {
+            let candidate = (severity(index), index, frame[index]);
+            if rating.is_none_or(|(s, _, score)| {
+                candidate.0 > s || (candidate.0 == s && candidate.2 > score)
+            }) {
+                rating = Some(candidate);
+            }
+        }
+    }
+    for (index, slot) in out.iter_mut().enumerate() {
+        if vocabulary.kind(index) == TagKind::Rating {
+            continue;
+        }
+        let (mut best, mut second) = (0.0f32, 0.0f32);
+        for frame in &frames {
+            let score = if frame[index].is_finite() { frame[index] } else { 0.0 };
+            if score > best {
+                second = best;
+                best = score;
+            } else if score > second {
+                second = score;
+            }
+        }
+        *slot = if need_two && second < FLOOR { 0.0 } else { best };
+    }
+    if let Some((_, index, score)) = rating {
+        out[index] = score;
+    }
+    out
+}
+
+/// Когда брать кадры видео длиной `duration` секунд: каждые `step` секунд (середины
+/// промежутков), но не больше `max` — тогда равномерно по всей длине. Длина неизвестна —
+/// один кадр с начала.
+pub fn frame_times(duration: f64, step: f64, max: usize) -> Vec<f64> {
+    if duration.is_nan() || duration <= 0.0 || max == 0 {
+        return vec![0.0];
+    }
+    let step = step.max(0.5).max(duration / max as f64);
+    let count = ((duration / step).floor() as usize).clamp(1, max);
+    let step = duration / count as f64;
+    (0..count).map(|i| (i as f64 + 0.5) * step).collect()
 }
 
 /// Пороги показа: тег виден, если уверенность не ниже порога своего вида.
@@ -285,12 +396,13 @@ impl FileTags {
 pub struct Thresholds {
     pub general: f32,
     pub character: f32,
+    pub sound: f32,
 }
 
 impl Default for Thresholds {
-    /// Как у SmilingWolf/wd-tagger: 0,35 и 0,85.
+    /// Как у SmilingWolf/wd-tagger: 0,35 и 0,85; звук — 0,1.
     fn default() -> Thresholds {
-        Thresholds { general: 0.35, character: 0.85 }
+        Thresholds { general: 0.35, character: 0.85, sound: 0.1 }
     }
 }
 
@@ -307,16 +419,41 @@ pub struct Shown {
     /// Персонажи, затем обычные теги; внутри — по уверенности.
     pub tags: Vec<Tag>,
     pub rating: Option<Tag>,
+    /// Что слышно: по уверенности.
+    pub sounds: Vec<Tag>,
     /// Строка для столбца «Теги»: имена через запятую.
     pub line: String,
 }
 
-/// Теги файла по порогам.
-pub fn show(file: &FileTags, vocabulary: &Vocabulary, thresholds: Thresholds) -> Shown {
+impl Shown {
+    /// Все теги: картинки и звука.
+    pub fn all(&self) -> impl Iterator<Item = &Tag> {
+        self.tags.iter().chain(&self.sounds)
+    }
+}
+
+/// Теги файла по порогам. `sounds` — классы модели звука (нет — звуковые теги не видны).
+pub fn show(
+    file: &FileTags,
+    vocabulary: &Vocabulary,
+    sounds: Option<&SoundVocabulary>,
+    thresholds: Thresholds,
+) -> Shown {
     let mut characters = Vec::new();
     let mut general = Vec::new();
+    let mut heard = Vec::new();
     let mut rating = None;
     for &(index, score) in &file.scores {
+        if index >= SOUND_BASE {
+            let score = dequantize(score);
+            if let Some(sounds) = sounds
+                && score >= thresholds.sound
+                && let Some(name) = sounds.names().get((index - SOUND_BASE) as usize)
+            {
+                heard.push(Tag { name: name.clone(), kind: TagKind::Sound, score });
+            }
+            continue;
+        }
         let index = index as usize;
         if index >= vocabulary.len() {
             continue;
@@ -333,9 +470,11 @@ pub fn show(file: &FileTags, vocabulary: &Vocabulary, thresholds: Thresholds) ->
     let by_score = |a: &Tag, b: &Tag| b.score.total_cmp(&a.score).then(a.name.cmp(&b.name));
     characters.sort_by(by_score);
     general.sort_by(by_score);
+    heard.sort_by(by_score);
     characters.extend(general);
-    let line = characters.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
-    Shown { tags: characters, rating, line }
+    let line =
+        characters.iter().chain(&heard).map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ");
+    Shown { tags: characters, rating, sounds: heard, line }
 }
 
 /// Вход модели: картинка `side`×`side` в RGB (строки сверху вниз) → числа в порядке
@@ -410,7 +549,8 @@ fn query_words(text: &str) -> Vec<String> {
 /// Запрос по тегам: какие теги нужны, каких быть не должно, какие рейтинги показывать.
 ///
 /// * `tag:cat` — нужен тег `cat`; `-tag:dog` — без тега `dog`; `long_hair` или `"long hair"` —
-///   тег с пробелом; `*hair` — маска по имени тега;
+///   тег с пробелом; `*hair` — маска по имени тега; `cat|dog` — любой из них; звуковые теги
+///   (`music`, `speech`) — такие же;
 /// * `rating:explicit` — только этот рейтинг, `-rating:18+` — без него (рейтинги: `general`,
 ///   `sensitive`, `questionable`, `explicit` или по-русски);
 /// * в поиске по тегам и голые слова — теги (`cat outdoors -dog`), в фильтре папки они
@@ -486,18 +626,7 @@ impl TagQuery {
         let Some(shown) = shown else {
             return self.include.is_empty() && self.only_ratings.is_empty();
         };
-        let has = |pattern: &String| {
-            shown.tags.iter().any(|tag| {
-                let name = tag.name.to_lowercase();
-                if pattern.contains(['*', '?']) {
-                    let pattern: Vec<char> = pattern.chars().collect();
-                    let name: Vec<char> = name.chars().collect();
-                    crate::filter::glob_match(&pattern, &name)
-                } else {
-                    name == *pattern
-                }
-            })
-        };
+        let has = |pattern: &String| shown.all().any(|tag| tag_matches(pattern, &tag.name));
         let rating = shown.rating.as_ref().map(|r| r.name.as_str());
         self.include.iter().all(has)
             && !self.exclude.iter().any(has)
@@ -514,22 +643,28 @@ impl TagQuery {
             .iter()
             .map(|pattern| {
                 shown
-                    .tags
-                    .iter()
-                    .filter(|tag| {
-                        let name = tag.name.to_lowercase();
-                        if pattern.contains(['*', '?']) {
-                            let p: Vec<char> = pattern.chars().collect();
-                            crate::filter::glob_match(&p, &name.chars().collect::<Vec<_>>())
-                        } else {
-                            name == *pattern
-                        }
-                    })
+                    .all()
+                    .filter(|tag| tag_matches(pattern, &tag.name))
                     .map(|tag| tag.score)
                     .fold(0.0, f32::max)
             })
             .sum()
     }
+}
+
+/// Подходит ли тег под слово запроса: имя целиком, маска (`*hair`) или одно из
+/// перечисленных через `|` (`cat|dog`).
+fn tag_matches(pattern: &str, name: &str) -> bool {
+    let name = name.to_lowercase();
+    pattern.split('|').filter(|p| !p.is_empty()).any(|pattern| {
+        if pattern.contains(['*', '?']) {
+            let pattern: Vec<char> = pattern.chars().collect();
+            let name: Vec<char> = name.chars().collect();
+            crate::filter::glob_match(&pattern, &name)
+        } else {
+            name == pattern
+        }
+    })
 }
 
 /// Тег для запроса: `long hair` → `long_hair` (без пробелов — одно слово).
@@ -570,13 +705,20 @@ pub fn toggle_rating(text: &str, rating: &str) -> String {
 }
 
 const MAGIC: &[u8; 8] = b"MHFTAGS\n";
-const VERSION: u32 = 1;
+/// 2 — звук (1.3.3): ключ модели звука и посчитанные части у каждого файла.
+const VERSION: u32 = 2;
+
+/// Части разбора файла в [`Record::parts`].
+pub const PART_IMAGE: u8 = 1;
+pub const PART_SOUND: u8 = 2;
 
 /// Теги файла и размер с временем, при которых они посчитаны.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
     pub size: u64,
     pub modified: i64,
+    /// Что уже посмотрено: [`PART_IMAGE`], [`PART_SOUND`] (даже если тегов не нашлось).
+    pub parts: u8,
     pub tags: FileTags,
 }
 
@@ -585,17 +727,36 @@ pub struct Record {
 pub struct TagStore {
     /// Модель и словарь: `<репозиторий>|<отпечаток словаря>`. Другие — теги не подходят.
     pub model: String,
+    /// Модель звука так же; пусто — звуковых тегов нет.
+    pub sound: String,
     records: HashMap<PathBuf, Record>,
 }
 
 impl TagStore {
     pub fn new(model: &str) -> TagStore {
-        TagStore { model: model.to_string(), records: HashMap::new() }
+        TagStore { model: model.to_string(), sound: String::new(), records: HashMap::new() }
     }
 
     /// Ключ модели для [`TagStore::model`].
     pub fn model_key(repo: &str, vocabulary: &Vocabulary) -> String {
         format!("{repo}|{:016x}", vocabulary.fingerprint())
+    }
+
+    /// Ключ модели звука для [`TagStore::sound`].
+    pub fn sound_key(file: &str, sounds: &SoundVocabulary) -> String {
+        format!("{}/{file}|{:016x}", crate::sound::SOUND_REPO, sounds.fingerprint())
+    }
+
+    /// Другая модель звука: её теги не подходят — забыть их (теги картинок остаются).
+    pub fn set_sound_model(&mut self, key: &str) {
+        if self.sound == key {
+            return;
+        }
+        self.sound = key.to_string();
+        for record in self.records.values_mut() {
+            record.tags = record.tags.without_sound();
+            record.parts &= !PART_SOUND;
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -608,7 +769,17 @@ impl TagStore {
 
     /// Теги, если файл не менялся с тех пор, как они посчитаны.
     pub fn fresh(&self, path: &Path, size: u64, modified: i64) -> Option<&FileTags> {
-        self.records.get(path).filter(|r| r.size == size && r.modified == modified).map(|r| &r.tags)
+        self.record(path, size, modified).map(|r| &r.tags)
+    }
+
+    /// Запись файла, если он не менялся.
+    pub fn record(&self, path: &Path, size: u64, modified: i64) -> Option<&Record> {
+        self.records.get(path).filter(|r| r.size == size && r.modified == modified)
+    }
+
+    /// Каких частей из `wanted` у файла ещё нет (0 — всё посчитано).
+    pub fn missing(&self, path: &Path, size: u64, modified: i64, wanted: u8) -> u8 {
+        wanted & !self.record(path, size, modified).map_or(0, |r| r.parts)
     }
 
     pub fn insert(&mut self, path: PathBuf, record: Record) {
@@ -628,6 +799,7 @@ impl TagStore {
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&VERSION.to_le_bytes());
         put_str(&mut out, &self.model);
+        put_str(&mut out, &self.sound);
         out.extend_from_slice(&(self.records.len() as u32).to_le_bytes());
         // Порядок — по пути: одинаковые теги дают одинаковый файл.
         let mut paths: Vec<&PathBuf> = self.records.keys().collect();
@@ -637,6 +809,7 @@ impl TagStore {
             put_str(&mut out, &path.to_string_lossy());
             out.extend_from_slice(&record.size.to_le_bytes());
             out.extend_from_slice(&record.modified.to_le_bytes());
+            out.push(record.parts);
             let count = record.tags.scores.len().min(u16::MAX as usize);
             out.extend_from_slice(&(count as u16).to_le_bytes());
             for &(index, score) in &record.tags.scores[..count] {
@@ -649,6 +822,8 @@ impl TagStore {
         out
     }
 
+    /// Прочитать снимок. Версия 1 (до 1.3.3) читается без видео: они смотрелись по одному
+    /// кадру эскиза и посчитаются заново — по кадрам и со звуком.
     pub fn read(bytes: &[u8]) -> Result<TagStore, String> {
         let broken = || "файл тегов повреждён".to_string();
         if bytes.len() < MAGIC.len() + 8 || &bytes[..MAGIC.len()] != MAGIC {
@@ -660,16 +835,21 @@ impl TagStore {
         }
         let mut reader = Reader { bytes: payload, at: MAGIC.len() };
         let version = reader.u32().ok_or_else(broken)?;
-        if version != VERSION {
+        if version != VERSION && version != 1 {
             return Err(format!("файл тегов версии {version} — теги посчитаются заново"));
         }
         let model = get_str(&mut reader).ok_or_else(broken)?;
+        let sound =
+            if version >= 2 { get_str(&mut reader).ok_or_else(broken)? } else { String::new() };
         let count = reader.u32().ok_or_else(broken)? as usize;
         let mut records = HashMap::with_capacity(count.min(1 << 20));
+        let video = crate::category::Category::Video.extensions();
         for _ in 0..count {
             let path = PathBuf::from(get_str(&mut reader).ok_or_else(broken)?);
             let size = reader.u64().ok_or_else(broken)?;
             let modified = reader.i64().ok_or_else(broken)?;
+            let parts =
+                if version >= 2 { reader.take(1).ok_or_else(broken)?[0] } else { PART_IMAGE };
             let tags = reader.u16().ok_or_else(broken)? as usize;
             let mut scores = Vec::with_capacity(tags);
             for _ in 0..tags {
@@ -677,12 +857,16 @@ impl TagStore {
                 let score = reader.take(1).ok_or_else(broken)?[0];
                 scores.push((index, score));
             }
-            records.insert(path, Record { size, modified, tags: FileTags { scores } });
+            let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+            if version == 1 && video.contains(&crate::entry::extension_of(&name).as_str()) {
+                continue;
+            }
+            records.insert(path, Record { size, modified, parts, tags: FileTags { scores } });
         }
         if reader.at != payload.len() {
             return Err(broken());
         }
-        Ok(TagStore { model, records })
+        Ok(TagStore { model, sound, records })
     }
 }
 
@@ -743,14 +927,14 @@ mod tests {
         let kept: Vec<u32> = tags.scores.iter().map(|&(i, _)| i).collect();
         assert_eq!(kept, vec![4, 8, 0, 5, 7], "по уверенности, ниже 0,2 — нет, рейтинг один");
         assert!(FileTags::from_scores(&scores[..3], &v).is_err(), "не тот размер выхода");
-        let shown = show(&tags, &v, Thresholds::default());
+        let shown = show(&tags, &v, None, Thresholds::default());
         let names: Vec<&str> = shown.tags.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["power (chainsaw man)", "1girl", "long hair"]);
         assert_eq!(shown.line, "power (chainsaw man), 1girl, long hair");
         assert_eq!(shown.rating.as_ref().map(|t| t.name.as_str()), Some("general"));
         assert!((shown.tags[1].score - 0.99).abs() < 0.01);
         // Порог ниже — виден и «cat», выше — только самые уверенные.
-        let low = show(&tags, &v, Thresholds { general: 0.2, character: 0.99 });
+        let low = show(&tags, &v, None, Thresholds { general: 0.2, character: 0.99, sound: 0.1 });
         assert_eq!(low.line, "1girl, long hair, cat");
         // NaN от модели — не тег.
         let mut odd = scores;
@@ -777,9 +961,14 @@ mod tests {
         let tags =
             FileTags::from_scores(&[0.9, 0.0, 0.0, 0.0, 0.8, 0.0, 0.0, 0.3, 0.0], &v).unwrap();
         let path = PathBuf::from("C:\\Фото\\кот.jpg");
-        store.insert(path.clone(), Record { size: 10, modified: 5, tags: tags.clone() });
-        store
-            .insert("C:\\b.png".into(), Record { size: 1, modified: 2, tags: FileTags::default() });
+        store.insert(
+            path.clone(),
+            Record { size: 10, modified: 5, parts: PART_IMAGE, tags: tags.clone() },
+        );
+        store.insert(
+            "C:\\b.png".into(),
+            Record { size: 1, modified: 2, parts: PART_IMAGE, tags: FileTags::default() },
+        );
         let bytes = store.write();
         let read = TagStore::read(&bytes).unwrap();
         assert_eq!(read, store);
@@ -790,6 +979,96 @@ mod tests {
         assert!(TagStore::read(&bad).is_err());
         assert!(TagStore::read(b"nonsense").is_err());
         assert_eq!(store.write(), bytes, "одинаковые теги — одинаковый файл");
+        assert_eq!(read.missing(&path, 10, 5, PART_IMAGE | PART_SOUND), PART_SOUND);
+        assert_eq!(read.missing(&path, 11, 5, PART_IMAGE), PART_IMAGE, "изменился — всё заново");
+    }
+
+    /// Снимок версии 1 (до 1.3.3): видео забываются — их смотрят заново по кадрам.
+    #[test]
+    fn reads_version_one_without_videos() {
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&1u32.to_le_bytes());
+        put_str(&mut out, "m|1");
+        out.extend_from_slice(&2u32.to_le_bytes());
+        for name in ["C:\\кот.jpg", "C:\\отпуск.mp4"] {
+            put_str(&mut out, name);
+            out.extend_from_slice(&7u64.to_le_bytes());
+            out.extend_from_slice(&8i64.to_le_bytes());
+            out.extend_from_slice(&1u16.to_le_bytes());
+            out.extend_from_slice(&4u32.to_le_bytes());
+            out.push(200);
+        }
+        let checksum = fnv(&out);
+        out.extend_from_slice(&checksum.to_le_bytes());
+        let store = TagStore::read(&out).unwrap();
+        assert_eq!(store.len(), 1);
+        let record = store.record(Path::new("C:\\кот.jpg"), 7, 8).unwrap();
+        assert_eq!((record.parts, record.tags.scores.clone()), (PART_IMAGE, vec![(4, 200)]));
+        assert!(store.sound.is_empty());
+    }
+
+    #[test]
+    fn sound_tags() {
+        let v = vocabulary();
+        let sounds = SoundVocabulary::from_labels(&["Music".into(), "Dog".into(), "Speech".into()]);
+        let mut tags =
+            FileTags::from_scores(&[0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0], &v).unwrap();
+        tags.set_sound(&[0.6, 0.12, 0.01], &sounds).unwrap();
+        assert!(tags.set_sound(&[0.5], &sounds).is_err(), "не тот размер");
+        let shown = show(&tags, &v, Some(&sounds), Thresholds::default());
+        let heard: Vec<&str> = shown.sounds.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(heard, vec!["music", "dog"], "ниже порога 0,1 — нет");
+        assert_eq!(shown.line, "cat, music, dog");
+        assert!(TagQuery::parse("cat music", true).0.matches(Some(&shown)));
+        assert!(TagQuery::parse("speech|dog", true).0.matches(Some(&shown)), "любой из");
+        assert!(!TagQuery::parse("-tag:dog|horse", false).0.matches(Some(&shown)));
+        assert!(show(&tags, &v, None, Thresholds::default()).sounds.is_empty());
+        // Новая модель звука — звуковые теги забываются, теги картинки остаются.
+        let mut store = TagStore::new("m");
+        store.insert(
+            "a.mp4".into(),
+            Record { size: 1, modified: 1, parts: PART_IMAGE | PART_SOUND, tags: tags.clone() },
+        );
+        store.set_sound_model("other");
+        let record = store.record(Path::new("a.mp4"), 1, 1).unwrap();
+        assert_eq!(record.parts, PART_IMAGE);
+        assert!(record.tags.scores.iter().all(|&(i, _)| i < SOUND_BASE));
+        assert_eq!(TagStore::read(&store.write()).unwrap(), store);
+    }
+
+    #[test]
+    fn video_frames_combine() {
+        let v = vocabulary();
+        // general, sensitive, questionable, explicit, 1girl, long_hair, ^_^, cat, power.
+        let frame = |rating: [f32; 4], girl: f32, cat: f32| {
+            let mut f = vec![0.0; 9];
+            f[..4].copy_from_slice(&rating);
+            f[4] = girl;
+            f[7] = cat;
+            f
+        };
+        let frames = vec![
+            frame([0.9, 0.1, 0.0, 0.0], 0.9, 0.0),
+            frame([0.2, 0.1, 0.0, 0.7], 0.8, 0.95),
+            frame([0.9, 0.1, 0.0, 0.0], 0.0, 0.1),
+        ];
+        let tags = FileTags::from_scores(&combine_frames(&frames, &v), &v).unwrap();
+        let shown = show(&tags, &v, None, Thresholds::default());
+        assert_eq!(shown.line, "1girl", "кошка — на одном кадре из трёх");
+        assert_eq!(shown.rating.as_ref().map(|r| r.name.as_str()), Some("explicit"));
+        assert!((shown.tags[0].score - 0.9).abs() < 0.01, "уверенность — по лучшему кадру");
+        let two = FileTags::from_scores(&combine_frames(&frames[..2], &v), &v).unwrap();
+        assert!(
+            show(&two, &v, None, Thresholds::default()).line.contains("cat"),
+            "двух кадров мало для правила"
+        );
+        assert_eq!(frame_times(0.0, 10.0, 16), vec![0.0]);
+        assert_eq!(frame_times(30.0, 10.0, 16), vec![5.0, 15.0, 25.0]);
+        let long = frame_times(3600.0, 10.0, 16);
+        assert_eq!(long.len(), 16);
+        assert!((long[15] - (3600.0 - 112.5)).abs() < 1e-9, "равномерно по всей длине");
+        assert_eq!(frame_times(4.0, 10.0, 16), vec![2.0], "короче шага — середина");
     }
 
     #[test]
@@ -797,7 +1076,8 @@ mod tests {
         let v = vocabulary();
         let tags =
             FileTags::from_scores(&[0.9, 0.0, 0.0, 0.1, 0.99, 0.5, 0.1, 0.3, 0.97], &v).unwrap();
-        let shown = show(&tags, &v, Thresholds { general: 0.25, character: 0.85 });
+        let shown =
+            show(&tags, &v, None, Thresholds { general: 0.25, character: 0.85, sound: 0.1 });
         let found = |text: &str, bare: bool| TagQuery::parse(text, bare).0.matches(Some(&shown));
         assert!(found("1girl long_hair", true));
         assert!(found("\"long hair\" -tag:dog", true));

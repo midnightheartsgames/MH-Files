@@ -28,6 +28,7 @@ pub mod font;
 pub mod images;
 pub mod indexer;
 pub mod listing;
+pub mod peek;
 pub mod preview;
 pub mod read;
 pub mod recycle;

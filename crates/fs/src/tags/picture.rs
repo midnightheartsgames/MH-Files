@@ -15,6 +15,33 @@ pub fn taggable(ext: &str) -> bool {
     Category::Images.extensions().contains(&ext) || Category::Video.extensions().contains(&ext)
 }
 
+pub fn is_video(ext: &str) -> bool {
+    Category::Video.extensions().contains(&ext)
+}
+
+/// Кадры видео для модели — RGB `side`×`side`: каждые `step` секунд, не больше `max`
+/// ([`mh_files_core::tags::frame_times`]). Media Foundation не открыла файл (нет кодека) —
+/// один кадр эскиза Windows, как до 1.3.3.
+pub fn video_frames(path: &Path, side: usize, step: f64, max: usize) -> Vec<Vec<u8>> {
+    let mut frames = Vec::new();
+    if let Ok(mut reader) = mh_files_platform::decode::VideoReader::open(path) {
+        let duration = reader.duration().unwrap_or(0.0);
+        for at in mh_files_core::tags::frame_times(duration, step, max) {
+            if let Some(rgb) = reader.frame(at).ok().as_ref().and_then(|b| square(b, side)) {
+                frames.push(rgb);
+            }
+        }
+    }
+    if frames.is_empty()
+        && let Ok(bitmap) =
+            mh_files_platform::thumbs::shell_image(path, side as u32, ImageMode::Thumbnail)
+        && let Some(rgb) = square(&bitmap, side)
+    {
+        frames.push(rgb);
+    }
+    frames
+}
+
 /// Картинка файла в RGB для модели. `None` — не картинка, не читается или значок.
 pub fn load(path: &Path, ext: &str, side: usize) -> Option<Vec<u8>> {
     let side32 = side as u32;

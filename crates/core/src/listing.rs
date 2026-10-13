@@ -330,6 +330,7 @@ mod tests {
         let shown = |tags: &[&str], rating: &str| Shown {
             tags: tags.iter().map(|t| tag(t, TagKind::General)).collect(),
             rating: Some(tag(rating, TagKind::Rating)),
+            sounds: Vec::new(),
             line: String::new(),
         };
         let cat = std::sync::Arc::new(shown(&["cat", "indoors"], "general"));

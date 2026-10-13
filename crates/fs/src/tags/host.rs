@@ -4,10 +4,13 @@
 //! не роняет окно, а гигабайт модели уходит из памяти вместе с процессом.
 //!
 //! Протокол — кадры «вид (байт), длина (u32 LE), данные». Помощник первым шлёт `H` со
-//! стороной картинки, числом тегов и устройством — `gpu` или `cpu` (или `E` с причиной и
-//! выходит); дальше на каждый `I`
-//! (числа f32 LE: картинка NHWC) отвечает `O` (уверенность каждого тега) или `E`.
-//! Закрытый вход — конец работы.
+//! стороной картинки, числом тегов и устройством — `gpu` или `cpu` (у модели звука вместо
+//! стороны — `sound`; или `E` с причиной и выходит); дальше на каждый `I` (числа f32 LE:
+//! картинка NHWC или спектрограмма 1024×128) отвечает `O` (уверенность или логит каждого
+//! тега) или `E`. Закрытый вход — конец работы.
+//!
+//! Модель звука (1.3.3) — в своём помощнике: тот же exe, другой `model.onnx`; какая это
+//! модель, помощник понимает по форме входа.
 
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -57,12 +60,37 @@ fn from_bytes(bytes: &[u8]) -> Option<Vec<f32>> {
 /// Что модель берёт и отдаёт.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spec {
-    /// Сторона картинки на входе.
+    /// Сторона картинки на входе; 0 — модель звука (вход — спектрограмма
+    /// [`mh_files_core::sound::FRAMES`] × [`mh_files_core::sound::MELS`]).
     pub side: usize,
     /// Оценок на выходе; 0 — модель не сказала заранее.
     pub outputs: usize,
     /// Модель работает на видеокарте (DirectML).
     pub gpu: bool,
+}
+
+impl Spec {
+    pub fn sound(&self) -> bool {
+        self.side == 0
+    }
+
+    /// Чисел на входе.
+    pub fn input_len(&self) -> usize {
+        if self.sound() {
+            mh_files_core::sound::FRAMES * mh_files_core::sound::MELS
+        } else {
+            self.side * self.side * 3
+        }
+    }
+
+    fn hello(&self) -> String {
+        let device = if self.gpu { "gpu" } else { "cpu" };
+        if self.sound() {
+            format!("sound {} {device}", self.outputs)
+        } else {
+            format!("{} {} {device}", self.side, self.outputs)
+        }
+    }
 }
 
 /// Модель внутри помощника: вход — картинка, выход — уверенность каждого тега.
@@ -80,8 +108,7 @@ pub fn serve(
         Ok(spec) => spec,
         Err(error) => return write_frame(output, FAIL, error.as_bytes()),
     };
-    let device = if spec.gpu { "gpu" } else { "cpu" };
-    write_frame(output, HELLO, format!("{} {} {device}", spec.side, spec.outputs).as_bytes())?;
+    write_frame(output, HELLO, spec.hello().as_bytes())?;
     loop {
         let (kind, payload) = match read_frame(input) {
             Ok(frame) => frame,
@@ -164,7 +191,17 @@ fn load(
             .unwrap_or_default()
     };
     let spec_of = |session: &ort::session::Session, gpu: bool| -> Result<Spec, String> {
-        let side = input_side(&shape(session.inputs()))?;
+        let input = shape(session.inputs());
+        let side = match input.as_slice() {
+            // Спектрограмма AST: [N, 1024, 128].
+            [_, frames, mels]
+                if *frames == mh_files_core::sound::FRAMES as i64
+                    && *mels == mh_files_core::sound::MELS as i64 =>
+            {
+                0
+            }
+            _ => input_side(&input)?,
+        };
         let outputs =
             shape(session.outputs()).last().copied().filter(|&n| n > 0).unwrap_or(0) as usize;
         Ok(Spec { side, outputs, gpu })
@@ -174,7 +211,7 @@ fn load(
         // процессор; причина — в журнале.
         let attempt = directml_session(&environment, model).and_then(|mut session| {
             let spec = spec_of(&session, true)?;
-            infer(&mut session, spec, &vec![255.0; spec.side * spec.side * 3])?;
+            infer(&mut session, spec, &vec![255.0; spec.input_len()])?;
             Ok((session, spec))
         });
         match attempt {
@@ -213,13 +250,24 @@ fn infer(
     spec: Spec,
     values: &[f32],
 ) -> Result<Vec<f32>, String> {
-    if values.len() != spec.side * spec.side * 3 {
-        return Err(format!("картинка не {0}×{0}", spec.side));
+    if values.len() != spec.input_len() {
+        return Err(if spec.sound() {
+            "спектрограмма не того размера".to_string()
+        } else {
+            format!("картинка не {0}×{0}", spec.side)
+        });
     }
-    let tensor =
-        ort::value::TensorRef::from_array_view(([1usize, spec.side, spec.side, 3], values))
-            .map_err(|e| e.to_string())?;
-    let outputs = session.run(ort::inputs![tensor]).map_err(|e| e.to_string())?;
+    let outputs = if spec.sound() {
+        let shape = [1usize, mh_files_core::sound::FRAMES, mh_files_core::sound::MELS];
+        let tensor =
+            ort::value::TensorRef::from_array_view((shape, values)).map_err(|e| e.to_string())?;
+        session.run(ort::inputs![tensor]).map_err(|e| e.to_string())?
+    } else {
+        let tensor =
+            ort::value::TensorRef::from_array_view(([1usize, spec.side, spec.side, 3], values))
+                .map_err(|e| e.to_string())?;
+        session.run(ort::inputs![tensor]).map_err(|e| e.to_string())?
+    };
     let (_, scores) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
     Ok(scores.to_vec())
 }
@@ -267,12 +315,17 @@ impl<R: Read, W: Write> Channel<R, W> {
         match read_frame(&mut input) {
             Ok((HELLO, payload)) => {
                 let text = String::from_utf8_lossy(&payload);
-                let mut words = text.split_whitespace();
+                let mut words = text.split_whitespace().peekable();
+                let sound = words.peek() == Some(&"sound");
+                if sound {
+                    words.next();
+                }
                 let mut number = || words.next().and_then(|n| n.parse::<usize>().ok());
-                let (side, outputs) = (number(), number());
-                let gpu = text.split_whitespace().nth(2) == Some("gpu");
+                let (side, outputs) =
+                    if sound { (Some(0), number()) } else { (number(), number()) };
+                let gpu = text.split_whitespace().last() == Some("gpu");
                 match (side, outputs) {
-                    (Some(side), Some(outputs)) if side > 0 => {
+                    (Some(side), Some(outputs)) if side > 0 || sound => {
                         Ok(Channel { input, output, spec: Spec { side, outputs, gpu } })
                     }
                     _ => Err(RunError::Died(format!("странное приветствие помощника: {text}"))),
@@ -399,6 +452,10 @@ mod tests {
             "отказ на одну картинку — не смерть помощника"
         );
         assert_eq!(channel.run(&[0.5]).unwrap(), vec![0.5, 1.0]);
+        let sound = connect(Ok(Spec { side: 0, outputs: 527, gpu: false })).unwrap();
+        assert!(sound.spec.sound() && !sound.spec.gpu, "модель звука");
+        assert_eq!(sound.spec.outputs, 527);
+        assert_eq!(sound.spec.input_len(), 1024 * 128);
     }
 
     #[test]

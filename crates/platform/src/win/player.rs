@@ -29,7 +29,7 @@ use windows::Win32::System::Com::{
 use windows::core::{BSTR, Interface, implement};
 
 use crate::Waker;
-use crate::player::{Command, Frame, Shared};
+use crate::player::{Command, Frame, Shared, Sound};
 
 /// Как часто спрашивать движок о новом кадре и времени.
 const TICK: Duration = Duration::from_millis(8);
@@ -39,7 +39,7 @@ const CLOCK_EVERY: Duration = Duration::from_millis(250);
 pub fn run(
     path: &Path,
     max_side: u32,
-    volume: f64,
+    sound: Sound,
     shared: &Arc<Shared>,
     commands: &Receiver<Command>,
     waker: &Waker,
@@ -56,7 +56,7 @@ pub fn run(
     if let Err(error) = unsafe { MFStartup(MF_VERSION, MFSTARTUP_FULL) } {
         fail(format!("Media Foundation недоступна: {error}"));
     } else {
-        match Engine::new(path, volume) {
+        match Engine::new(path, sound) {
             Ok(mut engine) => engine.play_loop(max_side, shared, commands, waker),
             Err(error) => fail(error),
         }
@@ -96,7 +96,7 @@ struct Engine {
 }
 
 impl Engine {
-    fn new(path: &Path, volume: f64) -> Result<Engine, String> {
+    fn new(path: &Path, sound: Sound) -> Result<Engine, String> {
         let (device, context) = create_device()?;
         let error = Arc::new(Mutex::new(None));
         let notify: IMFMediaEngineNotify = Notify { error: error.clone() }.into();
@@ -127,8 +127,13 @@ impl Engine {
                     .map_err(text)?;
             let engine = factory.CreateInstance(0, &attributes).map_err(text)?;
             engine.SetSource(&BSTR::from(path.to_string_lossy().as_ref())).map_err(text)?;
-            // Сохранённая громкость — до первого звука.
-            let _ = engine.SetVolume(volume.clamp(0.0, 1.0));
+            // Сохранённые громкость, тишина и скорость — до первого звука.
+            let _ = engine.SetVolume(sound.volume.clamp(0.0, 1.0));
+            let _ = engine.SetMuted(sound.muted);
+            if (sound.rate - 1.0).abs() > 1e-3 {
+                let _ = engine.SetDefaultPlaybackRate(sound.rate);
+                let _ = engine.SetPlaybackRate(sound.rate);
+            }
             engine.Play().map_err(text)?;
             Ok(Engine { engine, device, context, error, target: None })
         }
@@ -163,6 +168,12 @@ impl Engine {
                                 volume = value;
                                 self.engine.SetVolume(value)
                             }
+                            Command::Muted(muted) => self.engine.SetMuted(muted),
+                            // «По умолчанию» — чтобы скорость пережила паузу и повтор.
+                            Command::Rate(rate) => self
+                                .engine
+                                .SetDefaultPlaybackRate(rate)
+                                .and_then(|()| self.engine.SetPlaybackRate(rate)),
                         };
                     }
                     last_clock -= CLOCK_EVERY;
@@ -181,7 +192,7 @@ impl Engine {
                 break;
             }
             // SAFETY: обычные вызовы движка в его потоке.
-            let (has_video, has_audio, duration, position, paused, ended) = unsafe {
+            let (has_video, has_audio, duration, position, paused, ended, muted, rate) = unsafe {
                 (
                     self.engine.HasVideo().as_bool(),
                     self.engine.HasAudio().as_bool(),
@@ -189,6 +200,8 @@ impl Engine {
                     self.engine.GetCurrentTime(),
                     self.engine.IsPaused().as_bool(),
                     self.engine.IsEnded().as_bool(),
+                    self.engine.GetMuted().as_bool(),
+                    self.engine.GetPlaybackRate(),
                 )
             };
             let mut new_frame = false;
@@ -213,6 +226,8 @@ impl Engine {
                 state.has_video = has_video;
                 state.has_audio = has_audio;
                 state.volume = volume;
+                state.muted = muted;
+                state.rate = if rate.is_finite() && rate > 0.0 { rate } else { 1.0 };
             }
             if new_frame || last_clock.elapsed() >= CLOCK_EVERY {
                 last_clock = Instant::now();

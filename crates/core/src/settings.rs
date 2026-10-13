@@ -265,26 +265,53 @@ pub struct TagSettings {
     pub whole_folder: bool,
     /// Считать на видеокарте (DirectML), если она подходит; иначе — на процессоре.
     pub gpu: bool,
-    /// Файлы больше, МБ, не смотрятся.
+    /// Картинки больше, МБ, не смотрятся (видео и звук читаются кусками — любые).
     pub max_file_mb: u32,
     /// Своя библиотека ONNX Runtime; пусто — скачанная MH Files.
     pub runtime: PathBuf,
+    /// Звуковые теги (1.3.3): у аудио и звуковой дорожки видео, модель AST.
+    pub sound: bool,
+    /// Файл модели звука в репозитории ([`crate::sound::SOUND_MODELS`]).
+    pub sound_model: String,
+    /// Порог звуковых тегов, проценты.
+    pub sound_threshold: u32,
+    /// Отрезков по 10 секунд с одной записи.
+    pub sound_clips: u32,
+    /// Кадр видео — каждые столько секунд…
+    pub video_step: u32,
+    /// …но не больше стольких кадров (тогда — равномерно по всему видео).
+    pub video_frames: u32,
 }
 
 impl TagSettings {
     /// Ниже — теги не хранятся ([`crate::tags::FLOOR`]).
     pub const MIN_THRESHOLD: u32 = 20;
+    /// Ниже — звуковые теги не хранятся ([`crate::sound::SOUND_FLOOR`]).
+    pub const MIN_SOUND_THRESHOLD: u32 = 5;
 
     pub fn thresholds(&self) -> crate::tags::Thresholds {
         crate::tags::Thresholds {
             general: self.general as f32 / 100.0,
             character: self.character as f32 / 100.0,
+            sound: self.sound_threshold as f32 / 100.0,
         }
     }
 
-    /// Настройки без того, что влияет только на показ: их смена модель не трогает.
+    /// Настройки без того, что влияет только на показ и на разбор следующих файлов: их
+    /// смена модель не трогает.
     pub fn for_engine(&self) -> TagSettings {
-        TagSettings { general: 0, character: 0, rating: false, whole_folder: false, ..self.clone() }
+        TagSettings {
+            general: 0,
+            character: 0,
+            rating: false,
+            whole_folder: false,
+            sound_threshold: 0,
+            sound_clips: 0,
+            video_step: 0,
+            video_frames: 0,
+            max_file_mb: 0,
+            ..self.clone()
+        }
     }
 }
 
@@ -300,6 +327,12 @@ impl Default for TagSettings {
             gpu: true,
             max_file_mb: 64,
             runtime: PathBuf::new(),
+            sound: true,
+            sound_model: crate::sound::DEFAULT_SOUND_MODEL.into(),
+            sound_threshold: 10,
+            sound_clips: 3,
+            video_step: 10,
+            video_frames: 16,
         }
     }
 }
@@ -401,6 +434,10 @@ pub struct Preview {
     pub inspector_folder_size: bool,
     /// Громкость быстрого просмотра 0..1 — какой её оставили в прошлый раз.
     pub volume: f32,
+    /// Звук выключен кнопкой.
+    pub muted: bool,
+    /// Скорость воспроизведения (1 — обычная).
+    pub rate: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -504,6 +541,8 @@ impl Default for Preview {
             media: true,
             inspector_folder_size: true,
             volume: 1.0,
+            muted: false,
+            rate: 1.0,
         }
     }
 }
