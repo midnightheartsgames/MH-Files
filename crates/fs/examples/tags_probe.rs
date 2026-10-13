@@ -30,6 +30,7 @@ fn main() {
         enabled: true,
         runtime: PathBuf::from(&args[1]),
         model: std::env::var("MH_TAGS_MODEL").unwrap_or_else(|_| TagSettings::default().model),
+        gpu: std::env::var("MH_TAGS_GPU").is_ok_and(|v| v == "1"),
         ..TagSettings::default()
     };
     let (workers, _events) = Workers::new(mh_files_platform::no_waker());
@@ -40,7 +41,14 @@ fn main() {
     let mut last = String::new();
     loop {
         let status = tagger.status();
-        let line = status.describe();
+        let mut line = status.describe();
+        if status.loaded {
+            line.push_str(if status.gpu {
+                " · видеокарта"
+            } else {
+                " · процессор"
+            });
+        }
         if line != last {
             eprintln!("[{:>5.1} с] {line}", started.elapsed().as_secs_f32());
             last = line;

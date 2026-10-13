@@ -1100,7 +1100,7 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
             ui,
             "Включить",
             Some(
-                "При включении скачиваются модель с Hugging Face (0,4–1,3 ГБ) и ONNX Runtime с GitHub (80 МБ). Нужны библиотеки Microsoft Visual C++ (x64) — обычно они уже стоят. Модель выгружается из памяти через пять минут без дела.",
+                "При включении скачиваются модель с Hugging Face (0,4–1,3 ГБ) и ONNX Runtime с DirectML из NuGet (15 МБ). Нужны библиотеки Microsoft Visual C++ (x64) — обычно они уже стоят. Модель выгружается из памяти через пять минут без дела.",
             ),
             &mut t.enabled,
         );
@@ -1112,6 +1112,14 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
             ),
             &mut t.whole_folder,
         );
+        switch_row(
+            ui,
+            "Видеокарта",
+            Some(
+                "Считать на видеокарте через DirectML — подходит любая с DirectX 12: NVIDIA, AMD, Intel. Обычно во много раз быстрее процессора. Не запустилась — модель сама переходит на процессор.",
+            ),
+            &mut t.gpu,
+        );
         row(ui, "Состояние", |ui| {
             let status = info.status;
             let mut text = format!(
@@ -1120,7 +1128,11 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
                 mh_files_core::format::items(status.tagged)
             );
             if status.loaded {
-                text.push_str(" · модель в памяти");
+                text.push_str(if status.gpu {
+                    " · модель на видеокарте"
+                } else {
+                    " · модель на процессоре"
+                });
             }
             if let Some(last) = status.last {
                 text.push_str(&format!(" · {:.1} с на файл", last.as_secs_f32()));
@@ -1152,6 +1164,12 @@ fn tags(ui: &mut Ui, s: &mut Settings, info: &TagsInfo) -> Option<TagsAction> {
         });
         if let mh_files_fs::TagState::Failed(error) = &info.status.state {
             ui.add(egui::Label::new(RichText::new(error).color(theme::WARN)).wrap());
+        }
+        if info.status.gpu_fallback {
+            widgets::hint(
+                ui,
+                "Видеокарта не подошла (нет DirectX 12 или драйвер отказал) — модель работает на процессоре. Причина — в журнале.",
+            );
         }
         if info.status.skipped > 0 {
             widgets::hint(ui, &format!("Модель отказалась от файлов: {}.", info.status.skipped));

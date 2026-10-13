@@ -63,6 +63,10 @@ pub struct TagStatus {
     pub last: Option<Duration>,
     /// Файлов, от которых модель отказалась.
     pub skipped: usize,
+    /// Модель считает на видеокарте.
+    pub gpu: bool,
+    /// Видеокарту просили, но она не подошла — считается на процессоре.
+    pub gpu_fallback: bool,
 }
 
 impl Default for TagStatus {
@@ -75,6 +79,8 @@ impl Default for TagStatus {
             model: None,
             last: None,
             skipped: 0,
+            gpu: false,
+            gpu_fallback: false,
         }
     }
 }
@@ -160,16 +166,17 @@ impl Engine for Host {
     }
 }
 
-/// Как запустить модель: пути файлов и журнал.
+/// Как запустить модель: пути файлов, журнал и просить ли видеокарту.
 pub type Launcher =
-    Arc<dyn Fn(&setup::Paths, &Path) -> Result<Box<dyn Engine>, String> + Send + Sync>;
+    Arc<dyn Fn(&setup::Paths, &Path, bool) -> Result<Box<dyn Engine>, String> + Send + Sync>;
 
 /// Помощник — этот же exe с [`HOST_FLAG`].
 pub fn host_launcher(command: HostCommand) -> Launcher {
-    Arc::new(move |paths, log| {
+    Arc::new(move |paths, log, gpu| {
         // Все ядра, кроме одного: процесс и так с пониженным приоритетом.
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
-        Host::start(&command, &paths.runtime, &paths.model, threads.saturating_sub(1).max(1), log)
+        let threads = threads.saturating_sub(1).max(1);
+        Host::start(&command, &paths.runtime, &paths.model, threads, gpu, log)
             .map(|host| Box::new(host) as Box<dyn Engine>)
     })
 }
@@ -589,10 +596,9 @@ fn activate(shared: &Arc<Shared>) {
             .unwrap_or_else(|| TagStore::new(&key));
         *shared.store.write() = store;
     }
-    if shared.paths.lock().as_ref() != Some(&paths) {
-        shared.unload();
-        *shared.paths.lock() = Some(paths);
-    }
+    // Сменилась модель, ONNX Runtime или видеокарта — помощник запустится заново.
+    shared.unload();
+    *shared.paths.lock() = Some(paths);
     *shared.vocabulary.write() = Some(vocabulary);
     shared.views.lock().clear();
     let tagged = shared.store.read().len();
@@ -620,10 +626,16 @@ fn engine<'a>(
     }
     if guard.is_none() {
         let paths = shared.paths.lock().clone().ok_or("модель ещё не готова")?;
-        let engine = (shared.launcher)(&paths, &shared.dir.join("tagger.log"))?;
+        let wanted = shared.settings().is_some_and(|s| s.gpu);
+        let engine = (shared.launcher)(&paths, &shared.dir.join("tagger.log"), wanted)?;
+        let gpu = engine.spec().gpu;
         *guard = Some(engine);
         drop(guard);
-        shared.update(|s| s.loaded = true);
+        shared.update(|s| {
+            s.loaded = true;
+            s.gpu = gpu;
+            s.gpu_fallback = wanted && !gpu;
+        });
         guard = shared.engine.lock();
     }
     Ok(guard)
@@ -706,7 +718,7 @@ mod tests {
 
     impl Engine for Fake {
         fn spec(&self) -> Spec {
-            Spec { side: 8, outputs: 5 }
+            Spec { side: 8, outputs: 5, gpu: false }
         }
 
         fn run(&mut self, input: &[f32]) -> Result<Vec<f32>, RunError> {
@@ -751,7 +763,7 @@ mod tests {
         let launches = Arc::new(AtomicUsize::new(0));
         let launcher: Launcher = {
             let (calls, die_once, launches) = (calls.clone(), die_once.clone(), launches.clone());
-            Arc::new(move |_, _| {
+            Arc::new(move |_, _, _| {
                 launches.fetch_add(1, Ordering::SeqCst);
                 Ok(Box::new(Fake { calls: calls.clone(), die_once: die_once.clone() })
                     as Box<dyn Engine>)
@@ -856,7 +868,7 @@ mod tests {
     fn disabled_tags_ask_nothing() {
         let (workers, _events) = Workers::new(mh_files_platform::no_waker());
         let dir = tempfile::tempdir().unwrap();
-        let launcher: Launcher = Arc::new(|_, _| Err("не должна запускаться".into()));
+        let launcher: Launcher = Arc::new(|_, _, _| Err("не должна запускаться".into()));
         let tagger = Tagger::new(workers, dir.path().to_path_buf(), launcher);
         tagger.configure(&TagSettings::default());
         assert_eq!(tagger.lookup(Path::new("a.jpg"), 1, 1), Lookup::None);

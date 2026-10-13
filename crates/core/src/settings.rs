@@ -263,6 +263,8 @@ pub struct TagSettings {
     pub rating: bool,
     /// Считать теги всех картинок открытой папки, а не только видимых.
     pub whole_folder: bool,
+    /// Считать на видеокарте (DirectML), если она подходит; иначе — на процессоре.
+    pub gpu: bool,
     /// Файлы больше, МБ, не смотрятся.
     pub max_file_mb: u32,
     /// Своя библиотека ONNX Runtime; пусто — скачанная MH Files.
@@ -295,6 +297,7 @@ impl Default for TagSettings {
             character: 85,
             rating: true,
             whole_folder: true,
+            gpu: true,
             max_file_mb: 64,
             runtime: PathBuf::new(),
         }

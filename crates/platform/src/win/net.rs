@@ -65,6 +65,8 @@ pub fn fetch(
     let agent = wide(format!("MH-Files/{}", env!("CARGO_PKG_VERSION")));
     let host = wide(host);
     let path = wide(path);
+    // С заголовком Range ответ — кусок (206).
+    let ranged = headers.iter().any(|(name, _)| name.eq_ignore_ascii_case("range"));
     // Заголовки: «Имя: значение» через CRLF, без завершающего нуля.
     let headers: Vec<u16> = headers
         .iter()
@@ -124,7 +126,7 @@ pub fn fetch(
             std::ptr::null_mut(),
         )
         .map_err(|error| format!("непонятный ответ: {error}"))?;
-        if status != 200 {
+        if status != 200 && !(ranged && status == 206) {
             return Err(format!("сервер ответил кодом {status}"));
         }
         // Длина — строкой: числом WinHTTP отдаёт только 32 бита.

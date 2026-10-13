@@ -104,6 +104,22 @@ impl Drop for Background {
     }
 }
 
+/// Загрузить библиотеку по полному пути и не выгружать до конца процесса; её зависимости
+/// ищутся сначала в её папке. Для помощника автотегов: `onnxruntime.dll` подгружает
+/// `DirectML.dll` по имени, а в System32 лежит своя, старая, — загруженная заранее нужная
+/// берётся вместо неё. Вне Windows ничего не делает.
+pub fn preload_library(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        crate::win::process::preload_library(path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Запустить `program` с `args` и дождаться вывода (stdout и stderr вместе) — для коротких
 /// вопросов вроде `--version`. Дольше `timeout` — процесс снимается.
 pub fn capture(
