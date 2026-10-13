@@ -4,7 +4,8 @@
 //! не роняет окно, а гигабайт модели уходит из памяти вместе с процессом.
 //!
 //! Протокол — кадры «вид (байт), длина (u32 LE), данные». Помощник первым шлёт `H` со
-//! стороной картинки и числом тегов (или `E` с причиной и выходит); дальше на каждый `I`
+//! стороной картинки, числом тегов и устройством — `gpu` или `cpu` (или `E` с причиной и
+//! выходит); дальше на каждый `I`
 //! (числа f32 LE: картинка NHWC) отвечает `O` (уверенность каждого тега) или `E`.
 //! Закрытый вход — конец работы.
 
@@ -14,7 +15,8 @@ use std::process::{ChildStdin, ChildStdout};
 
 use mh_files_platform::process::Background;
 
-/// Ключ командной строки помощника: `MH-Files.exe --tagger-host <onnxruntime> <model.onnx> <потоки>`.
+/// Ключ командной строки помощника:
+/// `MH-Files.exe --tagger-host <onnxruntime> <model.onnx> <потоки> <gpu|cpu>`.
 pub const HOST_FLAG: &str = "--tagger-host";
 
 const HELLO: u8 = b'H';
@@ -59,6 +61,8 @@ pub struct Spec {
     pub side: usize,
     /// Оценок на выходе; 0 — модель не сказала заранее.
     pub outputs: usize,
+    /// Модель работает на видеокарте (DirectML).
+    pub gpu: bool,
 }
 
 /// Модель внутри помощника: вход — картинка, выход — уверенность каждого тега.
@@ -76,7 +80,8 @@ pub fn serve(
         Ok(spec) => spec,
         Err(error) => return write_frame(output, FAIL, error.as_bytes()),
     };
-    write_frame(output, HELLO, format!("{} {}", spec.side, spec.outputs).as_bytes())?;
+    let device = if spec.gpu { "gpu" } else { "cpu" };
+    write_frame(output, HELLO, format!("{} {} {device}", spec.side, spec.outputs).as_bytes())?;
     loop {
         let (kind, payload) = match read_frame(input) {
             Ok(frame) => frame,
@@ -96,14 +101,18 @@ pub fn serve(
 
 /// Точка входа помощника (аргументы после [`HOST_FLAG`]). Возвращает код выхода.
 pub fn main(args: &[String]) -> i32 {
-    let [runtime, model, threads] = args else {
-        eprintln!("{HOST_FLAG} <onnxruntime> <model.onnx> <потоки>");
-        return 2;
+    let (runtime, model, threads, gpu) = match args {
+        [runtime, model, threads] => (runtime, model, threads, false),
+        [runtime, model, threads, device] => (runtime, model, threads, device == "gpu"),
+        _ => {
+            eprintln!("{HOST_FLAG} <onnxruntime> <model.onnx> <потоки> <gpu|cpu>");
+            return 2;
+        }
     };
     let threads = threads.parse().unwrap_or(1);
     let mut input = BufReader::new(io::stdin().lock());
     let mut output = BufWriter::new(io::stdout().lock());
-    let result = match load(Path::new(runtime), Path::new(model), threads) {
+    let result = match load(Path::new(runtime), Path::new(model), threads, gpu) {
         Ok((_environment, mut session, spec)) => {
             let mut run = |values: &[f32]| infer(&mut session, spec, values);
             serve(Ok(spec), &mut run, &mut input, &mut output)
@@ -120,21 +129,33 @@ fn load(
     runtime: &Path,
     model: &Path,
     threads: usize,
+    gpu: bool,
 ) -> Result<(ort::environment::Environment, ort::session::Session, Spec), String> {
     use mh_files_core::tags::{explain_runtime_error, input_side};
+    use mh_files_platform::process::preload_library;
+    // DirectML.dll — та, что лежит рядом: ONNX Runtime ищет её по имени, и Windows иначе
+    // взяла бы старую из System32. Затем сам ONNX Runtime — его зависимости тоже из его папки.
+    let directml = runtime.with_file_name("DirectML.dll");
+    if gpu && directml.is_file() {
+        let _ = preload_library(&directml);
+    }
+    preload_library(runtime).map_err(|e| explain_runtime_error(&e))?;
     let environment = ort::init_from(runtime)
         .map_err(|e| explain_runtime_error(&e.to_string()))?
         .with_name("MH Files")
         .build()
         .map_err(|e| explain_runtime_error(&e.to_string()))?;
-    let session = ort::session::Session::builder(&environment)
-        .map_err(|e| e.to_string())?
-        .with_intra_threads(threads.max(1))
-        .map_err(|e| e.to_string())?
-        .with_inter_threads(1)
-        .map_err(|e| e.to_string())?
-        .commit_from_file(model)
-        .map_err(|e| format!("модель {} не загрузилась: {e}", model.display()))?;
+    let fail = |e: ort::Error| format!("модель {} не загрузилась: {e}", model.display());
+    let cpu = || -> Result<ort::session::Session, String> {
+        ort::session::Session::builder(&environment)
+            .map_err(|e| e.to_string())?
+            .with_intra_threads(threads.max(1))
+            .map_err(|e| e.to_string())?
+            .with_inter_threads(1)
+            .map_err(|e| e.to_string())?
+            .commit_from_file(model)
+            .map_err(fail)
+    };
     let shape = |outlets: &[ort::value::Outlet]| -> Vec<i64> {
         outlets
             .first()
@@ -142,9 +163,49 @@ fn load(
             .map(|s| s.to_vec())
             .unwrap_or_default()
     };
-    let side = input_side(&shape(session.inputs()))?;
-    let outputs = shape(session.outputs()).last().copied().filter(|&n| n > 0).unwrap_or(0) as usize;
-    Ok((environment, session, Spec { side, outputs }))
+    let spec_of = |session: &ort::session::Session, gpu: bool| -> Result<Spec, String> {
+        let side = input_side(&shape(session.inputs()))?;
+        let outputs =
+            shape(session.outputs()).last().copied().filter(|&n| n > 0).unwrap_or(0) as usize;
+        Ok(Spec { side, outputs, gpu })
+    };
+    if gpu {
+        // Видеокарта: сессия с DirectML и пробный прогон пустой картинки. Не вышло —
+        // процессор; причина — в журнале.
+        let attempt = directml_session(&environment, model).and_then(|mut session| {
+            let spec = spec_of(&session, true)?;
+            infer(&mut session, spec, &vec![255.0; spec.side * spec.side * 3])?;
+            Ok((session, spec))
+        });
+        match attempt {
+            Ok((session, spec)) => return Ok((environment, session, spec)),
+            Err(error) => eprintln!("видеокарта не подошла, считается на процессоре: {error}"),
+        }
+    }
+    let session = cpu()?;
+    let spec = spec_of(&session, false)?;
+    Ok((environment, session, spec))
+}
+
+/// Сессия на видеокарте. DirectML не умеет шаблоны памяти и параллельное выполнение, а
+/// пакет из одной картинки он считает быстрее, если знает его заранее.
+fn directml_session(
+    environment: &ort::environment::Environment,
+    model: &Path,
+) -> Result<ort::session::Session, String> {
+    let provider = ort::ep::DirectML::default().build().error_on_failure();
+    ort::session::Session::builder(environment)
+        .map_err(|e| e.to_string())?
+        .with_memory_pattern(false)
+        .map_err(|e| e.to_string())?
+        .with_parallel_execution(false)
+        .map_err(|e| e.to_string())?
+        .with_dimension_override("batch_size", 1)
+        .map_err(|e| e.to_string())?
+        .with_execution_providers([provider])
+        .map_err(|e| e.to_string())?
+        .commit_from_file(model)
+        .map_err(|e| e.to_string())
 }
 
 fn infer(
@@ -206,10 +267,13 @@ impl<R: Read, W: Write> Channel<R, W> {
         match read_frame(&mut input) {
             Ok((HELLO, payload)) => {
                 let text = String::from_utf8_lossy(&payload);
-                let mut numbers = text.split_whitespace().map(|n| n.parse::<usize>().ok());
-                match (numbers.next().flatten(), numbers.next().flatten()) {
+                let mut words = text.split_whitespace();
+                let mut number = || words.next().and_then(|n| n.parse::<usize>().ok());
+                let (side, outputs) = (number(), number());
+                let gpu = text.split_whitespace().nth(2) == Some("gpu");
+                match (side, outputs) {
                     (Some(side), Some(outputs)) if side > 0 => {
-                        Ok(Channel { input, output, spec: Spec { side, outputs } })
+                        Ok(Channel { input, output, spec: Spec { side, outputs, gpu } })
                     }
                     _ => Err(RunError::Died(format!("странное приветствие помощника: {text}"))),
                 }
@@ -250,6 +314,7 @@ impl Host {
         runtime: &Path,
         model: &Path,
         threads: usize,
+        gpu: bool,
         log: &Path,
     ) -> Result<Host, String> {
         if let Some(dir) = log.parent() {
@@ -266,6 +331,7 @@ impl Host {
             runtime.display().to_string(),
             model.display().to_string(),
             threads.to_string(),
+            if gpu { "gpu" } else { "cpu" }.to_string(),
         ]);
         let (process, stdin, stdout) = Background::spawn_piped(&command.exe, &args, Some(log))?;
         match Channel::open(BufReader::new(stdout), BufWriter::new(stdin)) {
@@ -324,8 +390,8 @@ mod tests {
 
     #[test]
     fn talks_over_pipes() {
-        let mut channel = connect(Ok(Spec { side: 2, outputs: 2 })).unwrap();
-        assert_eq!(channel.spec, Spec { side: 2, outputs: 2 });
+        let mut channel = connect(Ok(Spec { side: 2, outputs: 2, gpu: true })).unwrap();
+        assert_eq!(channel.spec, Spec { side: 2, outputs: 2, gpu: true });
         assert_eq!(channel.run(&[1.0, 2.0, 3.5]).unwrap(), vec![6.5, 3.0]);
         assert_eq!(
             channel.run(&[-1.0]),

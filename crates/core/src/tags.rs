@@ -36,19 +36,38 @@ pub const DEFAULT_MODEL: &str = MODELS[0].repo;
 pub const MODEL_FILE: &str = "model.onnx";
 pub const TAGS_FILE: &str = "selected_tags.csv";
 
-/// Сборка ONNX Runtime с GitHub (microsoft/onnxruntime): из архива берутся только DLL.
-pub const RUNTIME_VERSION: &str = "1.31.0";
-pub const RUNTIME_HOST: &str = "github.com";
+/// ONNX Runtime со встроенным DirectML (видеокарта; на процессоре считает тоже) — пакеты
+/// NuGet. DirectML у Microsoft на поддержке, его последняя сборка ONNX Runtime — 1.24.4.
+pub const RUNTIME_VERSION: &str = "1.24.4";
+/// Папка скачанных библиотек: другая сборка — другая папка, прежняя удаляется.
+pub const RUNTIME_FOLDER: &str = "1.24.4-directml";
+pub const NUGET_HOST: &str = "api.nuget.org";
 
-/// Путь архива ONNX Runtime для Windows x64 на [`RUNTIME_HOST`].
-pub fn runtime_path() -> String {
-    format!(
-        "/microsoft/onnxruntime/releases/download/v{RUNTIME_VERSION}/onnxruntime-win-x64-{RUNTIME_VERSION}.zip"
-    )
+/// Библиотеки ONNX Runtime в папке сборки; первая — та, что загружается.
+pub const RUNTIME_FILES: [&str; 3] =
+    ["onnxruntime.dll", "onnxruntime_providers_shared.dll", "DirectML.dll"];
+
+/// Откуда берутся [`RUNTIME_FILES`]: пакет NuGet (путь на [`NUGET_HOST`]) и файлы в нём. Пакет
+/// DirectML — 200 МБ сборок под все платформы и Xbox, а нужна одна DLL: файлы достаются из
+/// пакетов кусками (HTTP Range), не скачивая пакет целиком.
+pub fn runtime_packages() -> Vec<(String, &'static [(&'static str, &'static str)])> {
+    let package =
+        |id: &str, version: &str| format!("/v3-flatcontainer/{id}/{version}/{id}.{version}.nupkg");
+    vec![
+        (
+            package("microsoft.ml.onnxruntime.directml", RUNTIME_VERSION),
+            &[
+                ("runtimes/win-x64/native/onnxruntime.dll", RUNTIME_FILES[0]),
+                ("runtimes/win-x64/native/onnxruntime_providers_shared.dll", RUNTIME_FILES[1]),
+            ],
+        ),
+        // Тот DirectML, с которым собран ONNX Runtime (зависимость его пакета).
+        (
+            package("microsoft.ai.directml", "1.15.4"),
+            &[("bin/x64-win/DirectML.dll", RUNTIME_FILES[2])],
+        ),
+    ]
 }
-
-/// Библиотеки из архива ONNX Runtime, которые нужны для работы на процессоре.
-pub const RUNTIME_FILES: [&str; 2] = ["onnxruntime.dll", "onnxruntime_providers_shared.dll"];
 
 /// Где взять библиотеки Visual C++, без которых `onnxruntime.dll` не загружается.
 pub const VC_REDIST: &str = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
@@ -563,7 +582,14 @@ mod tests {
     fn models_and_files() {
         assert_eq!(model_folder(DEFAULT_MODEL), "SmilingWolf--wd-eva02-large-tagger-v3");
         assert!(model_info("smilingwolf/WD-SWINV2-tagger-v3").is_some());
-        assert!(runtime_path().ends_with(&format!("onnxruntime-win-x64-{RUNTIME_VERSION}.zip")));
+        let packages = runtime_packages();
+        assert!(packages[0].0.ends_with("/microsoft.ml.onnxruntime.directml.1.24.4.nupkg"));
+        let files: Vec<&str> =
+            packages.iter().flat_map(|(_, f)| f.iter().map(|(_, d)| *d)).collect();
+        assert!(
+            RUNTIME_FILES.iter().all(|f| files.contains(f)),
+            "все библиотеки откуда-то берутся"
+        );
         assert_eq!(rating_label("explicit"), "откровенный (18+)");
         let missing =
             "failed to load from `C:\\x\\onnxruntime.dll`: LoadLibraryExW failed (os error 126)";

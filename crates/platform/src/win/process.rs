@@ -16,6 +16,16 @@ pub const CREATION_FLAGS: u32 = 0x0800_0000 | 0x0000_4000;
 
 pub struct Job(HANDLE);
 
+pub fn preload_library(path: &std::path::Path) -> Result<(), String> {
+    use windows::Win32::System::LibraryLoader::{LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW};
+    let wide = super::com::wide(path);
+    // SAFETY: строка с нулём на конце живёт до конца вызова; модуль намеренно не
+    // освобождается — он нужен до конца процесса.
+    unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) }
+        .map(|_| ())
+        .map_err(|error| format!("{} не загружается: {error}", path.display()))
+}
+
 // SAFETY: описатель задания можно закрыть из любого потока.
 unsafe impl Send for Job {}
 

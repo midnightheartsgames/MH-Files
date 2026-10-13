@@ -42,6 +42,14 @@ pub fn get(
     }
 }
 
+/// Кусок файла `https://<host><path>` (HTTP Range): `range` — как в заголовке после
+/// `bytes=`: `100-199` или `-65536` (последние байты). Сервер, который кусков не умеет, отдаёт
+/// файл целиком — тогда это ошибка «слишком большой», если файл больше `limit`.
+pub fn get_range(host: &str, path: &str, range: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let header = format!("bytes={range}");
+    get(host, path, &[("Range", header.as_str())], limit)
+}
+
 /// Скачать `https://<host><path>` в файл `dest`: сначала в `dest.part`, по окончании —
 /// переименованием, так что недокачанный файл никогда не выглядит готовым. `progress`
 /// получает (скачано, всего) и может прервать загрузку, вернув `false`. Возвращает размер.
