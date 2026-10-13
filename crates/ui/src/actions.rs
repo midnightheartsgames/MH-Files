@@ -539,6 +539,15 @@ impl FilesApp {
                     view.focus = true;
                 }
             }
+            SearchTags => {
+                if !matches!(self.tab().location, Location::Tags { .. }) {
+                    let query = self.everywhere_query();
+                    self.open_location(Location::Tags { query }, Target::Current);
+                }
+                if let Some(view) = &mut self.tab_mut().index {
+                    view.focus = true;
+                }
+            }
             ReindexMeaning => {
                 if self.settings.semantic.enabled {
                     self.semantic.rescan();
@@ -851,7 +860,9 @@ impl FilesApp {
     /// набранное не теряется.
     fn everywhere_query(&self) -> String {
         match &self.tab().location {
-            Location::Index { query } | Location::Semantic { query } => query.clone(),
+            Location::Index { query } | Location::Semantic { query } | Location::Tags { query } => {
+                query.clone()
+            }
             _ => String::new(),
         }
     }

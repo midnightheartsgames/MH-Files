@@ -79,6 +79,16 @@ pub fn search(painter: &Painter, rect: Rect, color: Color32) {
     polyline(painter, rect, color, &[(0.63, 0.63), (0.9, 0.9)]);
 }
 
+/// Поиск по тегам: бирка с дырочкой, наклонённая острым концом вниз-влево.
+pub fn tag(painter: &Painter, rect: Rect, color: Color32) {
+    let points: Vec<Pos2> = [(0.12, 0.55), (0.45, 0.12), (0.88, 0.12), (0.88, 0.55), (0.45, 0.88)]
+        .iter()
+        .map(|&(x, y)| p(rect, x, y))
+        .collect();
+    painter.add(Shape::closed_line(points, stroke(rect, color)));
+    painter.circle_filled(p(rect, 0.68, 0.32), rect.width() * 0.08, color);
+}
+
 /// Поиск по смыслу: четырёхлучевая звёздочка и маленькая рядом.
 pub fn sparkle(painter: &Painter, rect: Rect, color: Color32) {
     let star = |center: Pos2, r: f32| -> Vec<Pos2> {

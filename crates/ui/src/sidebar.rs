@@ -120,6 +120,13 @@ pub fn show(ui: &mut Ui, app: &mut FilesApp) {
         if response.clicked() {
             app.actions.push(Action::Run(crate::commands::CommandId::SearchMeaning));
         }
+        if app.settings.tags.enabled {
+            let tags = matches!(&app.tab().location, Location::Tags { query } if query.is_empty());
+            let response = row(ui, icons::tag, "Поиск по тегам", None, tags, false);
+            if response.clicked() {
+                app.actions.push(Action::Run(crate::commands::CommandId::SearchTags));
+            }
+        }
         saved_searches(ui, app);
 
         ui.add_space(10.0);

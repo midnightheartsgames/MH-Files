@@ -424,7 +424,34 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
             mh_files_core::tags::rating_label(&rating.name),
             rating.score * 100.0
         );
-        field(ui, "Рейтинг", &text);
+        label(ui, "Рейтинг");
+        let response = ui
+            .add(
+                egui::Label::new(
+                    RichText::new(text).font(theme::regular(14.0)).color(theme::TEXT_PRIMARY),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_text("Щелчок — все файлы с таким рейтингом; правый — скрыть такие в папке")
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let token = format!("rating:{}", rating.name);
+        if response.clicked() {
+            search_tags(app, token.clone());
+        }
+        response.context_menu(|ui| {
+            if ui.button("Все файлы с таким рейтингом").clicked() {
+                search_tags(app, token.clone());
+                ui.close();
+            }
+            if ui.button("Скрыть такие в этой папке").clicked() {
+                let text = app.tab().filter.clone();
+                if !mh_files_core::tags::rating_hidden(&text, &rating.name) {
+                    filter_folder(app, mh_files_core::tags::toggle_rating(&text, &rating.name));
+                }
+                ui.close();
+            }
+        });
+        ui.add_space(4.0);
     }
     ui.horizontal(|ui| {
         label(ui, &format!("Теги · {}", shown.tags.len()));
@@ -454,21 +481,75 @@ fn tags(ui: &mut Ui, app: &mut FilesApp, entry: &Entry) {
                     .fill(theme::FIELD)
                     .stroke(egui::Stroke::new(1.0, theme::CARD_STROKE))
                     .corner_radius(egui::CornerRadius::same(4));
-            let hint = if tag.kind == mh_files_core::tags::TagKind::Character {
-                format!("персонаж · уверенность {:.0}% · щелчок — скопировать", tag.score * 100.0)
+            let kind = if tag.kind == mh_files_core::tags::TagKind::Character {
+                "персонаж · "
             } else {
-                format!("уверенность {:.0}% · щелчок — скопировать", tag.score * 100.0)
+                ""
             };
-            if ui.add(chip).on_hover_text(hint).clicked() {
-                ui.ctx().copy_text(tag.name.clone());
-                app.actions.push(Action::Status(
-                    format!("тег «{}» скопирован", tag.name),
-                    crate::app::Level::Info,
-                ));
+            let hint = format!(
+                "{kind}уверенность {:.0}%\nщелчок — все файлы с этим тегом, правый — ещё",
+                tag.score * 100.0
+            );
+            let token = mh_files_core::tags::query_token(&tag.name);
+            let response =
+                ui.add(chip).on_hover_text(hint).on_hover_cursor(egui::CursorIcon::PointingHand);
+            if response.clicked() {
+                search_tags(app, token.clone());
             }
+            response.context_menu(|ui| {
+                if ui.button("Все файлы с этим тегом").clicked() {
+                    search_tags(app, token.clone());
+                    ui.close();
+                }
+                if ui.button("Только с этим тегом в папке").clicked() {
+                    add_to_filter(app, &format!("tag:{token}"));
+                    ui.close();
+                }
+                if ui.button("Скрыть с этим тегом в папке").clicked() {
+                    add_to_filter(app, &format!("-tag:{token}"));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Копировать").clicked() {
+                    ui.ctx().copy_text(tag.name.clone());
+                    app.actions.push(Action::Status(
+                        format!("тег «{}» скопирован", tag.name),
+                        crate::app::Level::Info,
+                    ));
+                    ui.close();
+                }
+            });
         }
     });
     ui.add_space(8.0);
+}
+
+/// Поиск по тегам в новой вкладке.
+fn search_tags(app: &mut FilesApp, query: String) {
+    app.actions.push(Action::Open {
+        location: Location::Tags { query },
+        target: crate::app::Target::NewTab,
+    });
+}
+
+/// Дописать слово в фильтр текущей папки (если его там нет) и показать строку фильтра.
+fn add_to_filter(app: &mut FilesApp, word: &str) {
+    let text = app.tab().filter.clone();
+    if text.split_whitespace().any(|w| w.eq_ignore_ascii_case(word)) {
+        return;
+    }
+    let text = if text.trim().is_empty() {
+        word.to_string()
+    } else {
+        format!("{} {word}", text.trim_end())
+    };
+    filter_folder(app, text);
+}
+
+fn filter_folder(app: &mut FilesApp, text: String) {
+    let tab = app.tab_mut();
+    tab.filter_open = true;
+    tab.set_filter(text);
 }
 
 fn field(ui: &mut Ui, label: &str, value: &str) {

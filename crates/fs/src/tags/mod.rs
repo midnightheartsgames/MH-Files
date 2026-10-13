@@ -19,11 +19,11 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, unbounded};
 use mh_files_core::entry::extension_of;
 use mh_files_core::settings::TagSettings;
-use mh_files_core::tags::{self as model, FileTags, Record, Shown, TagStore, Vocabulary};
+use mh_files_core::tags::{self as model, FileTags, Record, Shown, TagQuery, TagStore, Vocabulary};
 use parking_lot::{Mutex, RwLock};
 
 pub use self::host::{HOST_FLAG, Host, HostCommand, RunError, Spec};
-use crate::{Event, Workers};
+use crate::{CancelToken, Event, Ticket, Workers};
 
 /// Модель выгружается из памяти после стольких минут без работы.
 const IDLE_UNLOAD: Duration = Duration::from_secs(5 * 60);
@@ -32,6 +32,8 @@ const SAVE_EVERY: Duration = Duration::from_secs(2 * 60);
 /// Очередь опустела — сохранить, если с прошлого раза прошло столько.
 const SAVE_IDLE: Duration = Duration::from_secs(20);
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+/// Найденного по тегам больше не показывается.
+const MAX_RESULTS: usize = 5000;
 /// Готовых строк для списка больше не держится: кэш сбрасывается.
 const MAX_VIEWS: usize = 20_000;
 
@@ -354,6 +356,35 @@ impl Tagger {
         queue.visible = wanted.into();
         drop(queue);
         let _ = self.shared.jobs.send(Job::Wake);
+    }
+
+    /// Теги файла, если они уже посчитаны, — без очереди: для фильтра папки по тегам. Только
+    /// память.
+    pub fn tags_of(&self, path: &Path, size: u64, modified: i64) -> Option<Arc<Shown>> {
+        if !self.enabled() {
+            return None;
+        }
+        if let Some((s, m, shown)) = self.shared.views.lock().get(path)
+            && *s == size
+            && *m == modified
+        {
+            return Some(shown.clone());
+        }
+        self.shared.show(path, size, modified)
+    }
+
+    /// Найти по тегам среди всех посчитанных: `cat outdoors -dog -rating:explicit`.
+    pub fn search(&self, ticket: Ticket, text: String) -> CancelToken {
+        let cancel = CancelToken::default();
+        let token = cancel.clone();
+        let shared = self.shared.clone();
+        self.shared.workers.spawn("tags-search", move |workers| {
+            let result = search(&shared, &text, &token);
+            if !token.is_cancelled() {
+                workers.send(Event::TagResults { ticket, result });
+            }
+        });
+        cancel
     }
 
     /// Остальные картинки и видео открытой папки — после видимого. Заменяет прошлый список.
@@ -696,6 +727,64 @@ fn tag(shared: &Shared, want: &Want) {
     shared.notify(true, true);
 }
 
+/// Итог поиска по тегам.
+#[derive(Debug)]
+pub struct TagResults {
+    /// Лучшие первыми: сумма уверенности нужных тегов.
+    pub entries: Vec<mh_files_core::Entry>,
+    /// Подошло всего (показано не больше [`MAX_RESULTS`]).
+    pub total: usize,
+    pub elapsed: Duration,
+}
+
+fn search(shared: &Shared, text: &str, cancel: &CancelToken) -> Result<TagResults, String> {
+    let started = Instant::now();
+    let empty =
+        |started: Instant| TagResults { entries: Vec::new(), total: 0, elapsed: started.elapsed() };
+    let settings = shared
+        .settings()
+        .filter(|s| s.enabled)
+        .ok_or("Автотеги выключены — включите их в «Настройки › Автотеги»")?;
+    let (query, _) = TagQuery::parse(text, true);
+    if !query.selects() {
+        return Ok(empty(started));
+    }
+    let vocabulary =
+        shared.vocabulary.read().clone().ok_or_else(|| {
+            format!("Автотеги ещё не готовы: {}", shared.status.lock().describe())
+        })?;
+    let thresholds = settings.thresholds();
+    let mut found: Vec<(f32, PathBuf, u64, i64)> = {
+        let store = shared.store.read();
+        store
+            .iter()
+            .filter_map(|(path, record)| {
+                let shown = model::show(&record.tags, &vocabulary, thresholds);
+                query
+                    .matches(Some(&shown))
+                    .then(|| (query.score(&shown), path.clone(), record.size, record.modified))
+            })
+            .collect()
+    };
+    if cancel.is_cancelled() {
+        return Err("отменено".into());
+    }
+    found.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let total = found.len();
+    let mut entries = Vec::new();
+    for (_, path, size, modified) in found {
+        if entries.len() >= MAX_RESULTS || cancel.is_cancelled() {
+            break;
+        }
+        // Удалённое и изменённое с тех пор, как теги посчитаны, не показывается.
+        let Ok(entry) = crate::read::stat(&path) else { continue };
+        if entry.size == size && entry.modified.map_or(0, mh_files_core::index::unix) == modified {
+            entries.push(entry);
+        }
+    }
+    Ok(TagResults { entries, total, elapsed: started.elapsed() })
+}
+
 fn fail(shared: &Shared, error: String) {
     *shared.queue.lock() = Queue::default();
     shared.set_state(TagState::Failed(error));
@@ -838,6 +927,34 @@ mod tests {
         let changed = Want { modified: changed.modified + 1, ..changed };
         assert!(matches!(ask(&f.tagger, &changed), Lookup::Ready(_)));
         assert_eq!(f.calls.load(Ordering::SeqCst), 3);
+        // Поиск по тегам: и по посчитанному, и с рейтингом.
+        let asked = std::cell::Cell::new(0);
+        let found = |text: &str| {
+            asked.set(asked.get() + 1);
+            let ticket = Ticket { owner: 1, generation: asked.get() };
+            f.tagger.search(ticket, text.into());
+            loop {
+                match f.events.recv_timeout(Duration::from_secs(10)).unwrap() {
+                    Event::TagResults { ticket: answer, result } if answer == ticket => {
+                        break result
+                            .unwrap()
+                            .entries
+                            .into_iter()
+                            .map(|e| e.name)
+                            .collect::<Vec<_>>();
+                    }
+                    _ => continue,
+                }
+            }
+        };
+        let relaxed = TagSettings { general: 35, ..f.tagger.shared.settings().unwrap() };
+        f.tagger.configure(&relaxed);
+        assert_eq!(found("green"), vec!["зелёный.jpg"]);
+        assert_eq!(found("tag:green -rating:general"), Vec::<String>::new());
+        // У «красного» теги посчитаны для другого времени изменения — он не показывается.
+        assert_eq!(found("rating:general"), vec!["зелёный.jpg"]);
+        assert!(found("").is_empty(), "пустой запрос — пусто, а не всё подряд");
+        assert!(f.tagger.tags_of(&green.path, green.size, green.modified).is_some());
         f.tagger.shutdown(Duration::from_secs(5));
         let store =
             TagStore::read(&std::fs::read(f.dir.path().join("data/tags.bin")).unwrap()).unwrap();

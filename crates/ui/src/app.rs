@@ -578,6 +578,14 @@ impl FilesApp {
         let options = ViewOptions { sort: session.sort, ..self.view_options() };
         let mut tab = Tab::new(id, session.location.clone(), session.view, options);
         tab.duplicate_options = self.duplicate_options();
+        // Фильтр `tag:` и `rating:` берёт теги у автотегов — только уже посчитанные.
+        let tagger = self.tagger.clone();
+        tab.listing.set_tag_source(Some(mh_files_core::listing::TagSource(std::sync::Arc::new(
+            move |entry: &Entry| {
+                let modified = entry.modified.map_or(0, mh_files_core::index::unix);
+                tagger.tags_of(&entry.path(), entry.size, modified)
+            },
+        ))));
         tab.reload(&self.workers, false);
         tab
     }
@@ -917,8 +925,31 @@ impl FilesApp {
                     }
                 }
             }
-            // Новые теги видны в следующем кадре: событие уже его вызвало.
-            Event::TagsChanged => {}
+            // Новые теги: фильтр папки по тегам и выдача поиска по тегам — заново (не чаще
+            // раза в INDEX_REFRESH_EVERY для выдачи); строки и Инспектор — в следующем кадре.
+            Event::TagsChanged => {
+                for tab in self.panes.iter_mut().flat_map(|pane| pane.tabs.iter_mut()) {
+                    if tab.listing.filters_by_tags() {
+                        tab.listing.refresh();
+                        tab.selection.retain_visible(&tab.listing);
+                    }
+                    if matches!(tab.location, Location::Tags { .. })
+                        && let Some(view) = &mut tab.index
+                    {
+                        view.stale = true;
+                    }
+                }
+            }
+            Event::TagResults { ticket, result } => {
+                if let Some(tab) = self.tab_by_id(ticket.owner) {
+                    let result = result.map(|found| mh_files_fs::SemanticResults {
+                        entries: found.entries,
+                        reasons: HashMap::new(),
+                        elapsed: found.elapsed,
+                    });
+                    tab.on_semantic_results(ticket, result);
+                }
+            }
             Event::ExtractProgress { id, done, total } => self.on_extract_progress(id, done, total),
             Event::SortScanProgress { ticket, files } => self.on_sort_scan_progress(ticket, files),
             Event::SortScanned { ticket, plan } => self.on_sort_scanned(ticket, plan),
@@ -1010,7 +1041,7 @@ impl FilesApp {
                         waiting = true;
                     }
                 }
-                tab.start_index_search(&self.indexer, &self.semantic, show_hidden);
+                tab.start_index_search(&self.indexer, &self.semantic, &self.tagger, show_hidden);
             }
         }
         if waiting {
